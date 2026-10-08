@@ -12,7 +12,7 @@ import { render, screen, cleanup, fireEvent, within } from '@testing-library/rea
 
 import ChatThread from '../ChatThread'
 import ChatRuntimeProvider from '../runtime/ChatRuntimeProvider'
-import { groupLabel, stepIconFor } from '../ActivityGroup'
+import { groupLabel, rowState, stepIconFor } from '../ActivityGroup'
 import type { ChatMessage, MessagePart } from '../../../utils/messageTypes'
 import type { StepItem } from '../../../utils/turnStreamApi'
 
@@ -150,7 +150,9 @@ describe('a sealed group collapses to a count, and opens where it sits', () => {
 
     cleanup()
     // MID-TURN IT IS NOT TINTED: a failure still being recovered from is not yet a problem to report.
-    mount([stepPart(1, 'Working on your app', 'failed'), stepPart(2, 'Working on your app', 'pending')])
+    mount([stepPart(1, 'Working on your app', 'failed'), stepPart(2, 'Working on your app', 'pending')], {
+      isRunning: true,
+    })
     expect(screen.getByTestId('activity-group-container').getAttribute('data-problem')).toBeNull()
     expect(trigger().getAttribute('aria-expanded')).toBe('false')
   })
@@ -193,10 +195,10 @@ describe('a group that hit a problem stays closed until the reader opens it', ()
   })
 
   it('the negative half — the same group WHILE RUNNING stays collapsed', () => {
-    mount([
-      stepPart(1, 'Working on your app', 'failed'),
-      stepPart(2, 'Working on your app', 'pending'),
-    ])
+    mount(
+      [stepPart(1, 'Working on your app', 'failed'), stepPart(2, 'Working on your app', 'pending')],
+      { isRunning: true },
+    )
 
     expect(trigger().getAttribute('aria-expanded')).toBe('false')
     expect(screen.queryByTestId('activity-group-rows')).toBeNull()
@@ -209,11 +211,14 @@ describe('a live group names what is happening NOW and grows in place', () => {
     // the working detail does not belong on screen. So the row is a count with icons in it, and the
     // sentence moves to a line underneath. Mutation receipt: return `facts.currentLabel` from
     // `groupLabel`'s running arm again and the first two assertions go red together.
-    mount([
-      stepPart(1, 'Reading your restaurants screen', 'ok'),
-      stepPart(2, 'Checking what a status can be', 'ok'),
-      stepPart(3, 'Making sure everything fits together', 'pending'),
-    ])
+    mount(
+      [
+        stepPart(1, 'Reading your restaurants screen', 'ok'),
+        stepPart(2, 'Checking what a status can be', 'ok'),
+        stepPart(3, 'Making sure everything fits together', 'pending'),
+      ],
+      { isRunning: true },
+    )
 
     expect(trigger().getAttribute('aria-expanded')).toBe('false')
     expect(trigger().textContent).toContain('3 steps')
@@ -358,6 +363,43 @@ describe('an interrupted turn does not read like a finished one', () => {
     expect(stoppedLabel).toContain('stopped before it finished')
     expect(stoppedLabel).not.toBe(finishedLabel)
     expect(finished).toBeTruthy()
+  })
+
+  it('★ a step still running when the turn was stopped stops spinning and reads as stopped', () => {
+    // The server never resolves the tool call a Stop or a ceiling cut short, so the step stays
+    // pending. Mutation receipt: drop the `streaming` gate from the group's running facts or from
+    // `rowState`, and the spinner and the quiet line outlive the turn.
+    const view = mount([stepPart(1, 'Running the analysis', 'pending')], { isRunning: true })
+    const glyph = () =>
+      screen.getByTestId('activity-glyphs').querySelector('[data-kind="tool-activity"]')
+    expect(screen.getByTestId('activity-group-now').textContent).toBe('Running the analysis')
+    expect(glyph()?.getAttribute('data-state')).toBe('started')
+
+    view.rerender(tree([stepPart(1, 'Running the analysis', 'pending')], { interrupted: true }))
+
+    expect(trigger().textContent).toBe('1 step · stopped before it finished')
+    expect(screen.queryByTestId('activity-group-now')).toBeNull()
+    expect(glyph()?.getAttribute('data-state')).toBe('pending')
+    expect(screen.getByTestId('activity-glyphs').innerHTML).not.toContain('bg-canvas-tilelive')
+    fireEvent.click(trigger())
+    const row = within(screen.getByTestId('activity-group-rows')).getByText('Running the analysis')
+    expect(row.closest('[data-state]')?.getAttribute('data-state')).toBe('pending')
+  })
+})
+
+describe('rowState — a step reads as running only while its message is being written', () => {
+  it('an unresolved step is started while the reply streams, and pending once it is over', () => {
+    expect(rowState('running', true)).toBe('started')
+    expect(rowState(undefined, true)).toBe('started')
+    expect(rowState('running', false)).toBe('pending')
+    expect(rowState(undefined, false)).toBe('pending')
+  })
+
+  it('a resolved step reads the same either way', () => {
+    expect(rowState('ok', true)).toBe('ok')
+    expect(rowState('ok', false)).toBe('ok')
+    expect(rowState('failed', true)).toBe('failed')
+    expect(rowState('failed', false)).toBe('failed')
   })
 })
 

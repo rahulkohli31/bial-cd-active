@@ -16,7 +16,8 @@ gets the runtime's unknown-tool rejection, never a policy check that could be by
 | Generic | —                    | —                 | —      | —                    |
 
 Plan and Build also carry `CONVERSATION_TOOLSET` and `app_state_toolset` (each registered once,
-so the two lists can't drift); a Generic run is handed no toolset at all.
+so the two lists can't drift); a Generic run is handed none, or only the analysis tools when its
+caller passes `analysis_of`.
 `toolsets_for_kind` is the ONLY place permitted to read the chat kind to decide capability —
 see its own docstring. Two more things live here, not the registry: the citizen-facing chat-kind
 CATALOGUE (served on `GET /v1/auth/me`) and the registry read the gating guards ask their
@@ -29,7 +30,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Final, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from pydantic_ai import RunContext
 from pydantic_ai.exceptions import CallDeferred
@@ -42,6 +43,7 @@ from pydantic_ai.usage import RunUsage
 
 from src.core.connectors import ConnectedSystem
 from src.db.models.conversation import ChatKind
+from src.services.agent.analysis_tools import analysis_toolset
 from src.services.agent.attachment_tools import AttachmentReader, attachment_toolset
 from src.services.agent.connector_tools import CONNECTOR_TOOLSET
 from src.services.agent.conversation_tools import CONVERSATION_TOOLSET
@@ -50,6 +52,10 @@ from src.services.orchestrator.constants import APP_CHECK_MAX_POLLS, READINESS_P
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.selfheal import AppState, read_the_app_state
 from src.services.orchestrator.tools import sandbox_toolset
+
+if TYPE_CHECKING:
+    # Placement reaches this package through the attachments module.
+    from src.services.analysis.placement import AnalysisSession
 
 
 @dataclass
@@ -273,6 +279,7 @@ def toolsets_for_kind[DepsT](
     connected_systems: Sequence[ConnectedSystem] = (),
     app_state_of: Callable[[RunContext[DepsT]], SandboxSession | None] = _no_pinned_sandbox,
     app_state_noticed: Callable[[AppState], None] | None = None,
+    analysis_of: Callable[[RunContext[DepsT]], AnalysisSession] | None = None,
 ) -> ToolSurface[DepsT]:
     """The per-run tool surface for a chat kind, over whatever deps type the caller's accessors
     resolve the workspace (and, for Build, the sandbox) from.
@@ -345,11 +352,13 @@ def toolsets_for_kind[DepsT](
                 may_write=True,
             )
         case ChatKind.GENERIC:
-            # NO TOOLSET AT ALL, and no accessor is touched to build it — not the workspace, not
-            # the sandbox, not the reader. That is what makes this arm reachable from a caller
-            # holding none of them, where the Build arm above deliberately raises. A generic run
-            # answers from its transcript and its attachments; there is nothing for it to call.
-            return ToolSurface(toolsets=[], may_write=False)
+            # No accessor is touched to build this — not the workspace, not the sandbox, not the
+            # reader — which is what makes the arm reachable from a caller holding none of them,
+            # where the Build arm above deliberately raises. The analysis tools read and compute
+            # in the chat's own session, so neither can change an app.
+            if analysis_of is None:
+                return ToolSurface(toolsets=[], may_write=False)
+            return ToolSurface(toolsets=[analysis_toolset(analysis_of)], may_write=False)
 
 
 # --- One catalogue of what the kinds ARE, beside the registry of what they -------------
@@ -412,8 +421,8 @@ def _describe(kind: ChatKind) -> ChatKindDescription:
                 value=kind.value,
                 name="BIAL Chat",
                 description=(
-                    "Ask a question, or attach a document or a picture and ask about it. This "
-                    "chat is yours rather than an app's, so nothing you do here changes an app."
+                    "Ask a question, or attach a file and ask about it. This chat is yours rather "
+                    "than an app's, so nothing you do here changes an app."
                 ),
             )
 

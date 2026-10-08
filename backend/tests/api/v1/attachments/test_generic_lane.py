@@ -1,8 +1,9 @@
-"""The generic chat's own lane: model-only, refused in wording it can honour, and every
-model-lane binary reaches the model with its own name.
+"""The generic chat's lanes: code-lane files only when the analysis runtime is configured, refusals
+in wording it can honour, and every model-lane binary reaching the model with its own name.
 
-The upload route already resolves the conversation before admitting a file, so the refusal below
-runs on the conversation's KIND — never a second allowlist. `tests/api/v1/attachments/conftest.py`
+Both doors decide on the conversation's KIND and on whether the runtime is configured — never on a
+second allowlist. The unconfigured posture is a supported deployment, so its tests take no
+analysis fixture at all. `tests/api/v1/attachments/conftest.py`
 supplies `fake_storage`, autoused; the turn-driving fixtures (`_fresh_engine`, `_override_billing`,
 `set_chat_model`) are imported rather than redeclared, exactly as `tests/api/v1/generic_chat/`
 does for the same reason — this directory's own `conftest.py` carries none of them.
@@ -14,22 +15,33 @@ import asyncio
 import base64
 import contextlib
 import io
+import uuid
 
 import pytest
 from openpyxl import Workbook
 from pydantic_ai import BinaryContent
-from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import func, select
 
 from src.api.v1.attachments.router import (
+    ATTACHMENT_LANES_SENTENCE,
     GENERIC_ATTACHMENT_LANES_SENTENCE,
     GENERIC_LANE_REFUSED_CODE,
 )
 from src.db.models.attachment import Attachment
 from src.db.models.conversation import ChatKind
+from src.db.models.message import Message, MessageEntryKind
 from src.services.media import ALLOWED_MEDIA
 from src.services.media.lanes import EXCEL_MEDIA_TYPE, MODEL_LANE_MEDIA
+from src.services.messages.store import append_batch
+from src.services.storage import attachment_key
 from tests.api.v1.conversations.conftest import (
     _fresh_engine as _fresh_engine,
 )
@@ -137,6 +149,62 @@ def _user_prompt_contents(messages: list[ModelMessage]) -> list[object]:
     return items
 
 
+async def _stored_spreadsheet(db_session, fake_storage, user, conversation, attachment_id):
+    """A workbook the chat already holds, written past the upload door: a chat keeps the files it
+    took while the runtime was configured."""
+    data = _xlsx_bytes()
+    key = attachment_key(user.id, uuid.uuid7())
+    await fake_storage.put(key, data, content_type=EXCEL_MEDIA_TYPE)
+    db_session.add(
+        Attachment(
+            user_id=user.id,
+            attachment_id=attachment_id,
+            media_type=EXCEL_MEDIA_TYPE,
+            name="q3.xlsx",
+            size=len(data),
+            storage_key=key,
+            conversation_id=conversation.id,
+        )
+    )
+    await db_session.flush()
+
+
+async def _sent_earlier(db_session, user, conversation, attachment_id) -> None:
+    """An answered earlier turn that carried the file, recorded as the send route records one."""
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[
+            ModelRequest(parts=[UserPromptPart(content="Here are the Q3 numbers.")]),
+            ModelResponse(parts=[TextPart(content="I have them.")]),
+        ],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.GENERIC,
+        file_attachment_ids=[attachment_id],
+    )
+
+
+def _handed(engine, conversation_id) -> list[str]:
+    """The code-lane files the started turn was handed, which its session is filled from."""
+    state = engine.peek(conversation_id)
+    assert state is not None
+    return [file.attachment_id for file in state.attachments.files] if state.attachments else []
+
+
+async def _messages_in(db_session, conversation_id) -> int:
+    return await db_session.scalar(
+        select(func.count()).select_from(Message).where(Message.conversation_id == conversation_id)
+    )
+
+
+def _answering(text: str) -> FunctionModel:
+    async def _stream(_messages: list[ModelMessage], _info: AgentInfo):
+        yield text
+
+    return FunctionModel(stream_function=_stream)
+
+
 # --- the lane constant itself -----------------------------------------------------------
 
 
@@ -177,7 +245,7 @@ async def test_a_pdf_and_an_image_are_accepted_on_a_generic_conversation(
     assert len(fake_storage.objects) == 2
 
 
-async def test_a_spreadsheet_is_refused_on_a_generic_conversation_with_honest_wording(
+async def test_a_spreadsheet_is_refused_on_a_generic_conversation_without_analysis(
     client, db_session, fake_storage
 ) -> None:
     """Refused with wording that names what this chat accepts and does not offer to open it with
@@ -188,7 +256,8 @@ async def test_a_spreadsheet_is_refused_on_a_generic_conversation_with_honest_wo
     `test_a_pdf_and_an_image_are_accepted_on_a_generic_conversation` goes red instead of this
     one — which is why that test exists beside it. Drop the `ChatKind.GENERIC` half instead (refuse
     a spreadsheet everywhere) and
-    `test_a_code_lane_file_is_still_accepted_on_a_plan_or_build_conversation` goes red."""
+    `test_a_code_lane_file_is_still_accepted_on_a_plan_or_build_conversation` goes red. Drop the
+    runtime half and the configured test below goes red."""
     user, conversation = await _conversation(db_session, ChatKind.GENERIC)
 
     resp = await _upload(
@@ -213,6 +282,56 @@ async def test_a_spreadsheet_is_refused_on_a_generic_conversation_with_honest_wo
         select(func.count()).select_from(Attachment).where(Attachment.user_id == user.id)
     )
     assert count == 0
+
+
+async def test_a_spreadsheet_is_accepted_on_a_generic_conversation_with_analysis(
+    client, db_session, fake_storage, fake_analysis
+) -> None:
+    """Stored exactly as Plan and Build store it, and the session is not touched: nothing is
+    copied in until a reply first opens a file."""
+    user, conversation = await _conversation(db_session, ChatKind.GENERIC)
+
+    resp = await _upload(
+        client, user, conversation.id, "att_xlsx", EXCEL_MEDIA_TYPE, _xlsx_bytes(), name="q3.xlsx"
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(fake_storage.objects) == 1
+    linked = await db_session.scalar(
+        select(Attachment.conversation_id).where(Attachment.attachment_id == "att_xlsx")
+    )
+    assert linked == conversation.id
+    assert fake_analysis.calls == []
+
+
+_UNSUPPORTED = [
+    ("text/plain", "That file type is not supported."),
+    ("image/tiff", "Unsupported attachment type: image/tiff."),
+]
+
+
+@pytest.mark.parametrize(("media_type", "opening"), _UNSUPPORTED)
+async def test_an_unsupported_format_on_a_generic_conversation_promises_no_code_without_analysis(
+    client, db_session, fake_storage, media_type: str, opening: str
+) -> None:
+    user, conversation = await _conversation(db_session, ChatKind.GENERIC)
+
+    resp = await _upload(client, user, conversation.id, "att_x", media_type, _PNG)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["message"] == f"{opening} {GENERIC_ATTACHMENT_LANES_SENTENCE}"
+
+
+@pytest.mark.parametrize(("media_type", "opening"), _UNSUPPORTED)
+async def test_an_unsupported_format_on_a_generic_conversation_names_both_lanes_with_analysis(
+    client, db_session, fake_storage, fake_analysis, media_type: str, opening: str
+) -> None:
+    user, conversation = await _conversation(db_session, ChatKind.GENERIC)
+
+    resp = await _upload(client, user, conversation.id, "att_x", media_type, _PNG)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["message"] == f"{opening} {ATTACHMENT_LANES_SENTENCE}"
 
 
 async def test_an_oversize_pdf_on_a_generic_conversation_is_refused_for_size_before_storage(
@@ -246,6 +365,134 @@ async def test_a_code_lane_file_is_still_accepted_on_a_plan_or_build_conversatio
 
     assert resp.status_code == 201, resp.text
     assert len(fake_storage.objects) == 1
+
+
+# --- the send door ----------------------------------------------------------------------
+
+
+async def test_a_message_carrying_a_spreadsheet_is_refused_at_send_without_analysis(
+    client, db_session, fake_storage, set_chat_model, _fresh_engine
+) -> None:
+    """The refusal is the upload door's, so the citizen reads one sentence for one cause, and
+    nothing is recorded: no turn, no message."""
+    user, conversation = await _conversation(db_session, ChatKind.GENERIC)
+    await _stored_spreadsheet(db_session, fake_storage, user, conversation, "att_q3")
+    set_chat_model(_answering("never reached"))
+
+    resp = await _post_turn(
+        client, user, conversation, text="Total the Q3 column.", attachment_ids=["att_q3"]
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"] == {
+        "message": GENERIC_ATTACHMENT_LANES_SENTENCE,
+        "code": GENERIC_LANE_REFUSED_CODE,
+    }
+    assert _fresh_engine.peek(conversation.id) is None
+    assert await _messages_in(db_session, conversation.id) == 0
+
+
+async def test_a_plain_question_in_a_chat_holding_spreadsheets_is_answered_without_analysis(
+    client, db_session, fake_storage, set_chat_model, _fresh_engine
+) -> None:
+    """A reply that opens no file needs no runtime.
+
+    Mutation receipt: refuse whenever the chat holds a code-lane file, rather than only when this
+    message carries one, and this goes red with a 400."""
+    user, conversation = await _conversation(db_session, ChatKind.GENERIC)
+    await _stored_spreadsheet(db_session, fake_storage, user, conversation, "att_q3")
+    await _sent_earlier(db_session, user, conversation, "att_q3")
+    set_chat_model(_answering("I can also help with PDFs and pictures."))
+
+    resp = await _post_turn(client, user, conversation, text="What else can you help with?")
+
+    assert resp.status_code == 202, resp.text
+    # Liveness: the chat really does hold the earlier file, so the refusal had something to see.
+    assert _handed(_fresh_engine, conversation.id) == ["att_q3"]
+    await _settle(_fresh_engine, conversation.id)
+    assert _fresh_engine.peek(conversation.id).status == "completed"
+
+
+async def test_a_generic_turn_is_handed_its_own_sent_spreadsheets_with_analysis(
+    client, db_session, fake_storage, fake_analysis, set_chat_model, _fresh_engine
+) -> None:
+    """The set the reply's session is filled from: the file on the turn that sends it, and the
+    same file on a later turn that carries none."""
+    user, conversation = await _conversation(db_session, ChatKind.GENERIC)
+    set_chat_model(_answering("ok"))
+    up = await _upload(
+        client, user, conversation.id, "att_q3", EXCEL_MEDIA_TYPE, _xlsx_bytes(), name="q3.xlsx"
+    )
+    assert up.status_code == 201, up.text
+
+    first = await _post_turn(
+        client, user, conversation, text="Total the Q3 column.", attachment_ids=["att_q3"]
+    )
+    assert first.status_code == 202, first.text
+    assert _handed(_fresh_engine, conversation.id) == ["att_q3"]
+    await _settle(_fresh_engine, conversation.id)
+
+    second = await _post_turn(client, user, conversation, text="And the average?")
+    assert second.status_code == 202, second.text
+    assert _handed(_fresh_engine, conversation.id) == ["att_q3"]
+    await _settle(_fresh_engine, conversation.id)
+
+
+async def test_a_spreadsheet_from_another_of_the_users_chats_is_refused_at_send(
+    client, db_session, fake_storage, fake_analysis, set_chat_model, _fresh_engine
+) -> None:
+    """A chat's session is named by that chat alone, so a file linked to another chat never joins
+    this chat's set. Named here, it falls through to the model lane, which refuses it.
+
+    Mutation receipt: drop `this_chat_only` from the send route and this turn starts with the
+    other chat's file in its set."""
+    user, here = await _conversation(db_session, ChatKind.GENERIC)
+    elsewhere = await ConversationFactory.create(
+        db_session, user.id, kind=ChatKind.GENERIC, project_id=None
+    )
+    set_chat_model(_answering("never reached"))
+    up = await _upload(
+        client, user, elsewhere.id, "att_elsewhere", EXCEL_MEDIA_TYPE, _xlsx_bytes(), name="p.xlsx"
+    )
+    assert up.status_code == 201, up.text
+
+    resp = await _post_turn(
+        client, user, here, text="Total this.", attachment_ids=["att_elsewhere"]
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["message"] == (
+        "an attached file no longer matches its declared type; attach it again"
+    )
+    assert _fresh_engine.peek(here.id) is None
+    assert await _messages_in(db_session, here.id) == 0
+    assert fake_analysis.calls == []
+
+
+async def test_another_users_spreadsheet_named_in_a_generic_message_is_refused_and_never_placed(
+    client, db_session, fake_storage, fake_analysis, set_chat_model, _fresh_engine
+) -> None:
+    """Two predicates hold this, the owner scope and the chat's own link, so it goes red only
+    with both removed from the code-lane read."""
+    user, conversation = await _conversation(db_session, ChatKind.GENERIC)
+    stranger, theirs = await _conversation(db_session, ChatKind.GENERIC)
+    set_chat_model(_answering("never reached"))
+    up = await _upload(
+        client, stranger, theirs.id, "att_theirs", EXCEL_MEDIA_TYPE, _xlsx_bytes(), name="p.xlsx"
+    )
+    assert up.status_code == 201, up.text
+
+    resp = await _post_turn(
+        client, user, conversation, text="Total this.", attachment_ids=["att_theirs"]
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["message"] == (
+        "an attached file is no longer available; remove it and attach it again"
+    )
+    assert _fresh_engine.peek(conversation.id) is None
+    assert await _messages_in(db_session, conversation.id) == 0
+    assert fake_analysis.calls == []
 
 
 # --- the label: naming a binary to the model --------------------------------------------

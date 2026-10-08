@@ -29,7 +29,7 @@ import asyncio
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncIterable, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterable, Awaitable, Callable, Collection, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -38,7 +38,7 @@ from typing import Any, Final, Literal
 
 import sqlalchemy as sa
 import structlog
-from pydantic_ai import Agent, BinaryContent, RunContext
+from pydantic_ai import Agent, BinaryContent, RunContext, capture_run_messages
 from pydantic_ai._agent_graph import AgentNode
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UsageLimitExceeded
 from pydantic_ai.messages import (
@@ -50,6 +50,7 @@ from pydantic_ai.messages import (
     ModelResponse,
     PartDeltaEvent,
     PartStartEvent,
+    RetryPromptPart,
     SystemPromptPart,
     TextPart,
     TextPartDelta,
@@ -94,6 +95,7 @@ from src.api.v1.conversations.schemas import (
 from src.config import settings
 from src.core.error_signature import error_signature
 from src.core.integrity_types import BaselineIdentity
+from src.core.prompt_blocks import ANALYSIS_RUN_TOOL, ATTACHMENT_READ_TOOL
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.harness_counter import HarnessCounter
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
@@ -102,12 +104,14 @@ from src.db.models.user import User
 from src.services.agent.agent import ChatDeps, chat_agent, static_instruction_parts
 from src.services.agent.attachment_tools import AttachmentReader
 from src.services.agent.capabilities import TurnScopedSystemMessage
-from src.services.agent.mode_prompts import PromptContext
+from src.services.agent.mode_prompts import PromptContext, analysis_listing
 from src.services.agent.read_tools import (
     LiveSandboxWorkspace,
     ReadOnlyWorkspace,
 )
 from src.services.agent.toolsets import toolsets_for_kind
+from src.services.analysis import get_analysis_runtime
+from src.services.analysis.placement import AnalysisSession
 from src.services.attachments.materialize import (
     AttachmentDelivery,
     AttachmentPlacementError,
@@ -166,6 +170,8 @@ from src.services.messages.store import append_batch
 from src.services.orchestrator.client_errors import discard_client_errors
 from src.services.orchestrator.constants import (
     ADAPTIVE_THINKING,
+    ANALYSIS_REQUEST_LIMIT,
+    ANALYSIS_WALL_CLOCK_S,
     BUILD_EFFORT,
     CACHE_TTL,
     CRASH_EDGE_CONSECUTIVE_POLLS,
@@ -198,6 +204,7 @@ from src.services.redis.keys import (
 from src.services.sandbox import SandboxClient, SandboxError
 from src.services.sandbox.base import CompileState
 from src.services.turns.copy import (
+    ANALYSIS_CEILING_TEXT,
     APP_STOPPED_WORKING_TEXT,
     APP_WORKING_AGAIN_TEXT,
     AT_LIMIT_TEXT,
@@ -566,8 +573,10 @@ def plan_from_call(part: ToolCallPart) -> str | None:
     return plan
 
 
-def _without_the_call(messages: list[ModelMessage], tool_call_id: str) -> list[ModelMessage]:
-    """The run's persistable slice with one tool call removed, and any response it emptied.
+def _without_the_calls(
+    messages: list[ModelMessage], tool_call_ids: Collection[str]
+) -> list[ModelMessage]:
+    """The run's persistable slice with these tool calls removed, and any response they emptied.
 
     Removed rather than stored-and-skipped: "no offer is recorded" has to be true at two
     independent readers, `plan_options._scan` (row meta) and the projection (the stored call
@@ -583,7 +592,7 @@ def _without_the_call(messages: list[ModelMessage], tool_call_id: str) -> list[M
         parts = [
             part
             for part in message.parts
-            if not (isinstance(part, ToolCallPart) and part.tool_call_id == tool_call_id)
+            if not (isinstance(part, ToolCallPart) and part.tool_call_id in tool_call_ids)
         ]
         if len(parts) == len(message.parts):
             kept.append(message)
@@ -745,12 +754,13 @@ def _sandbox_unavailable_message(exc: Exception) -> str:
 
 
 class _WriteEndedError(Exception):
-    """A Write turn that stopped for a NAMED reason rather than a crash.
+    """A turn that stopped for a NAMED reason rather than a crash.
 
     Distinct from a bare `Exception` because the four ways a build legitimately runs out —
-    daily quota, self-heal budget, wall clock, model step ceiling — are not bugs, and telling
-    a citizen "the assistant hit a problem" when they simply spent their token budget sends
-    them to support instead of to tomorrow."""
+    daily quota, self-heal budget, wall clock, model step ceiling — and the two ceilings on a
+    BIAL Chat reply that works on files are not bugs, and telling a citizen "the assistant hit a
+    problem" when they simply spent their token budget sends them to support instead of to
+    tomorrow."""
 
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(reason)
@@ -895,6 +905,8 @@ class _TurnState:
     # tell the agent they are there. Carrying the storage HANDLE rather than the bytes is what
     # keeps a detached turn from pinning tens of megabytes for its whole life.
     attachments: AttachmentDelivery | None = None
+    #: BIAL Chat's handle on its file session, when this reply registers the analysis tools.
+    analysis: AnalysisSession | None = None
     write_session: BuildSession | None = None
     preview_task: asyncio.Task[None] | None = None
     # The liveness lease renewal. Started where the container is attached,
@@ -1171,6 +1183,67 @@ def _reader_of(ctx: RunContext[ChatDeps]) -> AttachmentReader:
     if session is None:
         raise RuntimeError("attachment reader resolved on a turn with no attached sandbox")
     return AttachmentReader(session=session)
+
+
+def _analysis_of(ctx: RunContext[ChatDeps]) -> AnalysisSession:
+    """The ChatDeps accessor BIAL Chat's analysis tools resolve through. Fail-first: the tools are
+    registered only when the reply carries a session handle."""
+    analysis = ctx.deps.analysis
+    if analysis is None:
+        raise RuntimeError("analysis tool resolved on a reply with no analysis session")
+    return analysis
+
+
+_ANALYSIS_TOOLS: Final = frozenset({ATTACHMENT_READ_TOOL, ANALYSIS_RUN_TOOL})
+
+
+def _has_called_analysis(history: list[ModelMessage]) -> bool:
+    """Whether the chat already holds an analysis tool call. Such a chat keeps the tools: the
+    model API refuses history carrying tool calls when no tool is defined."""
+    return any(
+        isinstance(part, ToolCallPart) and part.tool_name in _ANALYSIS_TOOLS
+        for message in history
+        if isinstance(message, ModelResponse)
+        for part in message.parts
+    )
+
+
+def _steps_of_the_cut_run(captured: list[ModelMessage]) -> list[ModelMessage]:
+    """What a run ended at a ceiling leaves to store: the messages after its own prompt, without
+    the calls nobody answered, and without a request or response that is left carrying nothing
+    but thinking.
+
+    The run begins at the last request carrying a prompt, never at the history's length:
+    pydantic-ai merges adjacent requests in the history it captures, so that length can land past
+    the run's first steps."""
+    prompts = [
+        index
+        for index, message in enumerate(captured)
+        if isinstance(message, ModelRequest)
+        and any(isinstance(part, UserPromptPart) for part in message.parts)
+    ]
+    if not prompts:
+        return []
+    steps = _persistable_messages(captured[prompts[-1] + 1 :])
+    answered = {
+        part.tool_call_id
+        for message in steps
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, ToolReturnPart | RetryPromptPart)
+    }
+    called = {
+        part.tool_call_id
+        for message in steps
+        if isinstance(message, ModelResponse)
+        for part in message.parts
+        if isinstance(part, ToolCallPart)
+    }
+    return [
+        message
+        for message in _without_the_calls(steps, called - answered)
+        if any(not isinstance(part, ThinkingPart) for part in message.parts)
+    ]
 
 
 def _effort_for(kind: ChatKind) -> AnthropicEffort:
@@ -1572,7 +1645,22 @@ class TurnEngine:
             # THE ATTACHED FILES RIDE THE INSTRUCTION because their paths are a fact about THIS
             # container: a stored transcript naming them would outlive the container it described
             # and name paths a later one may spell differently.
-            if state.attachments is not None:
+            #
+            # BIAL Chat has no container; its files go to a session of their own, and only once a
+            # tool first asks for one.
+            if state.kind is ChatKind.GENERIC and (
+                state.attachments is not None or _has_called_analysis(history)
+            ):
+                state.analysis = AnalysisSession(
+                    conversation_id=state.conversation_id,
+                    files=state.attachments.files if state.attachments is not None else (),
+                    storage=state.attachments.storage if state.attachments is not None else None,
+                    runtime=get_analysis_runtime(),
+                )
+                prompt_context = replace(
+                    prompt_context, analysis_listing=analysis_listing(state.analysis.files)
+                )
+            elif state.attachments is not None:
                 prompt_context = replace(
                     prompt_context, attachment_listing=state.attachments.listing()
                 )
@@ -1646,6 +1734,7 @@ class TurnEngine:
                         # built below is what decides that, and Plan's does not contain a single
                         # tool that writes.
                         sandbox=state.sandbox,
+                        analysis=state.analysis,
                     )
                     # THE CONNECTED-DATA SURFACE RIDES THE PROMPT CONTEXT, and passing it is what
                     # makes the feature exist at all: the argument defaults to none, so a call
@@ -1660,6 +1749,7 @@ class TurnEngine:
                         state.kind,
                         _workspace_of,
                         reader_of=_reader_of if state.attachments is not None else None,
+                        analysis_of=_analysis_of if state.analysis is not None else None,
                         connected_systems=prompt_context.connected_systems,
                         app_state_of=_app_state_of,
                         # WHAT THE TOOL ANSWERED, HEARD BY THE TURN. The change notice and the
@@ -1679,7 +1769,7 @@ class TurnEngine:
                     # deferred call is actually present. `: Any` stays — the heterogeneous list
                     # is what the `run` overloads need to see to type-check.
                     output_type: Any = [str, DeferredToolRequests]
-                    result = await chat_agent.run(
+                    run = chat_agent.run(
                         prompt,
                         deps=deps,
                         message_history=history,
@@ -1731,7 +1821,13 @@ class TurnEngine:
                             anthropic_cache_tool_definitions=CACHE_TTL,
                             anthropic_cache=CACHE_TTL,
                         ),
+                        usage_limits=(
+                            UsageLimits(request_limit=ANALYSIS_REQUEST_LIMIT)
+                            if state.analysis is not None
+                            else None
+                        ),
                     )
+                    result = await self._within_the_analysis_bounds(state, db, run)
                     # PER CALL, not per run: a Plan turn that used tools made several requests,
                     # and a total cannot say which of them read the cache.
                     for message in result.new_messages():
@@ -1763,7 +1859,7 @@ class TurnEngine:
                             conversation_id=str(state.conversation_id),
                             turn_id=str(state.turn_id),
                         )
-                        persistable = _without_the_call(persistable, deferred.tool_call_id)
+                        persistable = _without_the_calls(persistable, {deferred.tool_call_id})
                         deferred = None
                         self._push_text(state, PLAN_NOT_KEPT_TEXT)
                         platform_text = PLAN_NOT_KEPT_TEXT
@@ -1936,6 +2032,15 @@ class TurnEngine:
             await self._write_change_notice(state, session_factory)
             await self._write_turn_terminal(state, session_factory)
             await self._count_the_reading(state)
+            if state.analysis is not None:
+                _log.info(
+                    "analysis_reply",
+                    conversation_id=str(state.conversation_id),
+                    tool_calls=state.analysis.tool_calls,
+                    fresh=state.analysis.fresh,
+                    status=state.status,
+                    reason=state.end_reason,
+                )
             # The watcher dies FIRST, on every terminal arm and in BOTH kinds. The Build
             # loop already stops its own on the way out, but a Plan turn attaches the same
             # live container — `_attach_sandbox` starts the watcher for whoever attaches —
@@ -1972,6 +2077,17 @@ class TurnEngine:
                 if state.write_session is not None:
                     with suppress(Exception):
                         await asyncio.shield(manager.finish_turn_sandbox(state.write_session))
+                # Deleting the session is the only way to stop code still running in it; a reply
+                # that finished leaves it for the next one.
+                if state.analysis is not None and state.analysis.running:
+                    try:
+                        await asyncio.shield(state.analysis.end())
+                    except Exception as exc:
+                        _log.warning(
+                            "analysis_session_end_failed",
+                            conversation_id=str(state.conversation_id),
+                            error=type(exc).__name__,
+                        )
             finally:
                 # AFTER the sandbox work, not before: releasing early would let the next turn in
                 # this conversation start before `finish_turn_sandbox` frees the one-per-user
@@ -1995,6 +2111,46 @@ class TurnEngine:
                 # `_run_turn` is awaitable directly (the tests do exactly that), and an
                 # abandoned binding there would stamp one turn's build id onto the next.
                 structlog.contextvars.reset_contextvars(**log_context)
+
+    async def _within_the_analysis_bounds[T](
+        self,
+        state: _TurnState,
+        db: AsyncSession,
+        run: Awaitable[T],
+    ) -> T:
+        """Await `run`, held to the wall clock when this reply works on files.
+
+        Its request ceiling rides the run's own `usage_limits`. Either ceiling keeps the steps
+        taken so far, then ends the reply in the ceiling sentence; the bill follows on the
+        named-ending arm, from the usage the run already folded in."""
+        if state.analysis is None:
+            return await run
+        deadline = asyncio.timeout(ANALYSIS_WALL_CLOCK_S)
+        with capture_run_messages() as captured:
+            try:
+                async with deadline:
+                    return await run
+            except UsageLimitExceeded:
+                reason = REQUEST_LIMIT_REASON
+            except TimeoutError:
+                if not deadline.expired():
+                    raise
+                reason = WALL_CLOCK_DEADLINE_EXCEEDED_REASON
+            persistable = _steps_of_the_cut_run(captured)
+            try:
+                if persistable:
+                    await append_batch(
+                        db,
+                        user_id=state.user_id,
+                        conversation_id=state.conversation_id,
+                        messages=persistable,
+                        entry_kind=MessageEntryKind.TURN,
+                        kind=state.kind,
+                    )
+                    await db.commit()
+            except Exception as persist_exc:
+                raise _PersistFailedError from persist_exc
+            raise _WriteEndedError(reason, ANALYSIS_CEILING_TEXT)
 
     async def _pin_workspace(
         self,

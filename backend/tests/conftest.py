@@ -317,6 +317,19 @@ def fake_storage():
     _storage_accessor._backend_singleton = None
 
 
+@pytest.fixture
+def fake_analysis():
+    # BIAL Chat's session pool, bound to the runtime accessor. Not autouse: the unconfigured
+    # runtime is a supported posture, and the tests that pin it must take no fixture at all.
+    from src.services.analysis import runtime as _analysis_runtime
+    from tests.fakes import FakeAnalysisRuntime
+
+    fake = FakeAnalysisRuntime()
+    _analysis_runtime._runtime_singleton = fake
+    yield fake
+    _analysis_runtime._runtime_singleton = None
+
+
 @pytest.fixture(autouse=True)
 def fake_directory(monkeypatch: pytest.MonkeyPatch):
     """An empty directory for every test, which a test fills through the fake it is handed. The

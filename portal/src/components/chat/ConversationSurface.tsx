@@ -21,6 +21,7 @@ import { useState, useEffect, useRef, useCallback, useMemo, type FC } from 'reac
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
 import Announcer, { useActivityAnnouncement } from './Announcer'
 import ChatThread from './ChatThread'
+import { appendText, putStep, streamingParts, type LivePart, type LiveTurn } from './liveTurnParts'
 import ChatRuntimeProvider from './runtime/ChatRuntimeProvider'
 import Composer, { type ComposerSubmission } from './Composer'
 import { SendRefusal } from './sendRefusal'
@@ -165,34 +166,13 @@ export interface ConversationSurfaceProps {
  *  spent when it is still pressable. */
 type PlanOverrideValue = 'build' | 'refine'
 
-/** One entry of the live turn's ordered content — see `TurnSink.parts`. */
-type SinkPart = { kind: 'text'; text: string } | { kind: 'step'; toolCallId: string; step: StepItem }
-
-/** The turn-frame reducer's mutable accumulator, carried back out to the caller once the
- * stream settles (`streamAssistant`/`reattachToTurn`/`fireRelayTurn`'s shared shape). */
-interface TurnSink {
-  /**
-   * THE LIVE TURN, PROSE AND STEPS, IN THE ORDER IT PRODUCED THEM. Was a flat `text` string
-   * beside a step map (every step, then one text block); a reload interleaves them in part
-   * order — the two only agreed because prose beside a tool call was thrown away. Steps live
-   * HERE, not only in `turnSteps` state, because the TRANSCRIPT renders them now and the frame
-   * handler (empty dep list) can't read state changing under it; `turnSteps` still exists
-   * alongside for a different question (the pane phase).
-   */
-  parts: SinkPart[]
-  /** Does the model HAVE THE FLOOR right now (the server's `working` flag)?
-   *
-   *  NOT "is it reasoning", which is what this said while the server narrowed it to that. The
-   *  server raises it whenever the model is being ASKED and nothing readable has arrived — which
-   *  now includes the gap after the last tool returns, the window a hung-looking transcript was
-   *  actually sitting in. Reading it as a reasoning signal here would under-render it.
-   *
-   *  IT IS NOT A PART, because the server never sends one and never will: reasoning text is
-   *  stored for the provider's next turn and is never framed. The flag is turned INTO a
-   *  content-free reasoning part at the TAIL of the streaming message by `streamingParts`,
-   *  because the library's status renderer is reached only when a message actually carries a
-   *  part of that kind — a boolean riding the turn renders nothing at all on its own. */
-  working: boolean
+/**
+ * The turn-frame reducer's mutable accumulator, carried back out to the caller once the stream
+ * settles (`streamAssistant`/`reattachToTurn`/`fireRelayTurn`'s shared shape). Steps live here as
+ * well as in `turnSteps` state, because the frame handler (empty dependency list) cannot read
+ * state that changes under it.
+ */
+interface TurnSink extends LiveTurn {
   terminal: 'completed' | 'failed' | 'stopped' | null
   reason: string | null
   snapshotCommitted: boolean | null
@@ -257,86 +237,6 @@ function newSink(): TurnSink {
     snapshotCommitted: null,
     turnId: null,
   }
-}
-
-/**
- * The parts of the STREAMING assistant message, in the order the turn produced them. ORDER
- * IS THE RENDER: `groupPartByType` coalesces ADJACENT steps into one group, so prose between
- * two steps seals the first and opens a second. Hidden steps are DROPPED, not positioned — a
- * gap would break that adjacency; the flag never covers reads or a failed step, both the
- * server's call. A NEW ARRAY EVERY TIME: the runtime caches on OBJECT IDENTITY (`convertMessage`
- * trap 4), so a mutated-in-place list would silently never re-render.
- */
-function streamingParts(sink: TurnSink): MessagePart[] {
-  const parts: MessagePart[] = []
-  for (const part of sink.parts) {
-    if (part.kind === 'text') {
-      // An empty text part renders no element, so an in-flight turn with steps and no prose
-      // yet is just its activity — which is exactly what should be on screen at that moment.
-      parts.push({ type: 'text', text: part.text })
-    } else if (!part.step.hidden) {
-      parts.push({ type: 'step', step: part.step })
-    }
-  }
-  // THE STATUS RIDES AT THE TAIL, and only while the model is actually thinking. It is
-  // synthesised rather than received: the server sends a boolean, never a reasoning part, so
-  // this is where the flag becomes something the thread can group and render. It carries no
-  // text — the shape has no field for any — which is what makes "status only, never the
-  // reasoning" structural rather than a promise.
-  //
-  // AT THE TAIL RATHER THAN THE HEAD, because `working` is not a turn-opening fact. It goes
-  // true again on every reasoning burst, and with adaptive thinking on, a build that loops
-  // through several tool calls thinks again between them — so pinning the row to index 0 put
-  // "Working on your app" ABOVE paragraphs and steps the citizen had already read, and the
-  // whole turn appeared to jump down the screen until the burst ended. ORDER IS THE RENDER,
-  // and the model is thinking HERE, at the end of what it has written so far.
-  //
-  // At the start of a turn `sink.parts` is empty, so this is still the first thing on screen —
-  // the case that mattered when the row was written is unchanged.
-  if (sink.working) parts.push({ type: 'reasoning' })
-  // THE STREAMING MESSAGE ALWAYS ENDS ON A TEXT PART, and the empty one is load-bearing twice
-  // over. It was implicit while this function appended the whole reply as one trailing block;
-  // once the parts became ordered it had to be said, because a turn that has only run steps so
-  // far now genuinely produces a step-only message.
-  //
-  //  1. `hasUpcomingMessage` — the library appends an optimistic assistant message with an id we
-  //     do not control the moment `isRunning` is true and the last message is not an assistant's
-  //     (convertMessage trap 3), and a message whose parts all convert to nothing is what makes
-  //     that reachable.
-  //  2. The transcript's step-only rule — a message made ONLY of steps is a STORED row that the
-  //     live message is re-telling, and it is dropped for the turn in flight. Without this the
-  //     live message matched that rule against itself and vanished mid-build.
-  //
-  // It renders no element either way, so it costs nothing on screen, and it is only appended
-  // when the newest part is not already text — a turn that has just written keeps its own block.
-  if (parts[parts.length - 1]?.type !== 'text') parts.push({ type: 'text', text: '' })
-  return parts
-}
-
-/** Append `text` to the block already open, or open a new one.
- *
- * A delta that arrives when the newest part is a STEP opens a block whatever the frame says:
- * appending to a sealed block would move that prose back above the step it was written after,
- * silently reordering the turn. */
-function appendText(sink: TurnSink, text: string, newBlock: boolean): void {
-  const newest = sink.parts[sink.parts.length - 1]
-  if (!newBlock && newest?.kind === 'text') {
-    newest.text += text
-    return
-  }
-  sink.parts.push({ kind: 'text', text })
-}
-
-/** Record a step at its position, or replace the one already there; `true` when it is new.
- *
- * The `finished` frame carries the same tool-call id as its `started` one and REPLACES it in
- * place: appending would stack a spinner beside its own result, and the activity group's live
- * count would climb while the same step re-rendered. */
-function putStep(sink: TurnSink, toolCallId: string, step: StepItem): boolean {
-  const at = sink.parts.findIndex((part) => part.kind === 'step' && part.toolCallId === toolCallId)
-  if (at === -1) sink.parts.push({ kind: 'step', toolCallId, step })
-  else sink.parts[at] = { kind: 'step', toolCallId, step }
-  return at === -1
 }
 
 export default function ConversationSurface({ chatId: chatIdProp, kind, projectId = null, project = null, onProjectUpdate, projectHasSavedBuild = null, onTitleDerived }: ConversationSurfaceProps) {
@@ -1111,7 +1011,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
           // dropped. Losing them would silently remove the self-heal narrative from a build
           // that reconnected.
           const diagnostics = sink.parts.filter(
-            (part): part is Extract<SinkPart, { kind: 'step' }> =>
+            (part): part is Extract<LivePart, { kind: 'step' }> =>
               part.kind === 'step' && part.toolCallId.startsWith(DIAGNOSTIC_KEY_PREFIX),
           )
           sink.parts = []

@@ -14,11 +14,13 @@ static, the tail dynamic — and composed text is never persisted (pinned by tes
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from src.core.connectors import ConnectedSystem
 from src.core.prompt_blocks import (
+    ANALYSIS_RULES,
     BUILD_THIS_PLAN_LABEL,
     BUILD_WORKING_RULES_HEAD,
     BUILD_WORKING_RULES_TAIL,
@@ -41,6 +43,9 @@ from src.services.deploy.config import DeployConfig
 from src.services.messages.projection import CONNECTOR_SCHEMA_TOOL
 from src.services.sandbox.config import SandboxConfig
 
+if TYPE_CHECKING:
+    from src.services.attachments.materialize import CodeLaneAttachment
+
 
 @dataclass(frozen=True)
 class PromptContext:
@@ -59,6 +64,9 @@ class PromptContext:
     rather than history: an instruction is recomposed per run and is byte-identical across two
     turns of the same conversation, while the tail of `message_history` is not — the citizen's
     next prompt is persisted and takes those bytes.
+
+    `analysis_listing` is BIAL Chat's `analysis_listing()`, or `None` when its analysis tools are
+    not registered.
     """
 
     user_name: str
@@ -69,6 +77,7 @@ class PromptContext:
     project_description: str | None = None
     connected_systems: tuple[ConnectedSystem, ...] = ()
     attachment_listing: str = ""
+    analysis_listing: str | None = None
 
 
 # The sizes a deployment runs at unless an operator overrides them; composing a prompt reads no
@@ -136,8 +145,7 @@ IT IS ITS OWN CONSTANT SO THAT TWO CARRIERS CAN REACH IT. `ATTACHMENT_RULES` bel
 is about reading a file through the container's reader; the generic kind has no container, carries
 none of those rules, and takes the guard from its standing contract instead — that chat is where
 it matters MOST, not least, since its attachments are typically documents written by somebody
-other than the citizen, read by a model this platform deliberately hands no tools and no sandbox
-to constrain."""
+other than the citizen."""
 
 
 ATTACHMENT_RULES = f"""\
@@ -235,8 +243,8 @@ is phrased, and may reword it. It may not drop it."""
 _GENERIC_SEGMENT = """\
 BIAL CHAT — the user is asking for help with their work at BIAL: a question, a document or a \
 picture they have attached, something they need to write or word better, something they want \
-explained. There is no project here, no app, and no workspace: you have no tools, you cannot read \
-or change any file, and you cannot run anything.
+explained. There is no project here, no app, and no workspace: you cannot change their files, and \
+you can open a file or run code only through a tool you have been given.
 
 SAY WHAT YOU DO NOT KNOW. Where an answer would need something you have not been given — a file \
 they have not attached, a system you cannot reach — say so and ask for it, rather than producing \
@@ -357,6 +365,21 @@ def standing_contract(kind: ChatKind) -> tuple[str, ...]:
     )
 
 
+def analysis_listing(files: Sequence[CodeLaneAttachment]) -> str:
+    """BIAL Chat's files for its analysis tools, one line each, named by the one path both tools
+    take. Says so plainly when none is left, since the tools stay registered once used."""
+    # Lazy: materialize imports the agent package, and with it this module.
+    from src.services.attachments.materialize import one_line_name
+
+    if not files:
+        return "No file you can open with your tools is attached to this conversation now."
+    lines = [
+        f"- {one_line_name(file.display_name)} — {file.model_path} ({file.size:,} bytes)"
+        for file in files
+    ]
+    return "\n".join(["Attached files you can open with your tools:", *lines])
+
+
 def this_conversation(context: PromptContext) -> str:
     """The run's one DYNAMIC instruction part: who the assistant is working with, the files this
     conversation holds, and what this project may read from outside the platform.
@@ -371,10 +394,10 @@ def this_conversation(context: PromptContext) -> str:
     THE CONNECTED DATA STUB IS LAST and is absent for every project that reads nothing outside
     the platform, which is nearly all of them.
 
-    A CHAT WITH NO PROJECT TAKES THE OTHER OPENING, and drops the reader instruction with it:
-    there is no container for a reader to run in, so `ATTACHMENT_RULES` would name a path and a
-    command that do not exist. The injection guard those rules embed is not dropped with them:
-    `standing_contract` hands that kind `ATTACHED_CONTENT_IS_DATA` on every turn."""
+    A CHAT WITH NO PROJECT TAKES THE OTHER OPENING and never `ATTACHMENT_RULES`, which name a
+    container path and a command it does not have. When its analysis tools are registered it
+    takes their listing and `ANALYSIS_RULES` instead; either way the injection guard reaches it
+    through `standing_contract`."""
     listing = context.attachment_listing
 
     if context.project_name is None:
@@ -384,7 +407,12 @@ def this_conversation(context: PromptContext) -> str:
             "so there is no app, no code and no workspace here — what you have is this "
             "conversation and whatever they have attached to it."
         )
-        return identity + (f"\n\n{listing}" if listing else "")
+        analysis = (
+            f"\n\n{context.analysis_listing}\n\n{ANALYSIS_RULES}"
+            if context.analysis_listing is not None
+            else ""
+        )
+        return identity + (f"\n\n{listing}" if listing else "") + analysis
 
     stub = _connected_data_stub(context.connected_systems)
     described = f" — {context.project_description}" if context.project_description else ""

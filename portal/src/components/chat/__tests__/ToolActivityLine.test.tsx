@@ -123,8 +123,18 @@ describe('ActivityRow — what a converted part becomes', () => {
   })
 
   it('an unknown state renders as running rather than throwing', () => {
-    render(<Row {...part({ label: 'Something new', state: 'who knows' })} />)
+    render(<Row {...part({ label: 'Something new', state: 'who knows' })} status={{ type: 'running' }} />)
     expect(row().getAttribute('data-state')).toBe('started')
+  })
+
+  it('an unresolved step reads as running only while its reply is still being written', () => {
+    const pending = part({ label: 'Running the analysis', state: 'running' })
+    render(<Row {...pending} status={{ type: 'running' }} />)
+    expect(row().getAttribute('data-state')).toBe('started')
+
+    cleanup()
+    render(<Row {...pending} status={{ type: 'requires-action', reason: 'tool-calls' }} />)
+    expect(row().getAttribute('data-state')).toBe('pending')
   })
 
   it('renders nothing from a part carrying no args at all', () => {

@@ -34,6 +34,12 @@ import {
 import Announcer from '../components/chat/Announcer'
 import ChatThread from '../components/chat/ChatThread'
 import Composer from '../components/chat/Composer'
+import {
+  appendText,
+  putStep,
+  streamingParts,
+  type LiveTurn,
+} from '../components/chat/liveTurnParts'
 import ChatRuntimeProvider from '../components/chat/runtime/ChatRuntimeProvider'
 import { SendRefusal } from '../components/chat/sendRefusal'
 import TurnBanner from '../components/chat/TurnBanner'
@@ -53,13 +59,15 @@ import {
 } from '../utils/conversationApi'
 import { contextState } from '../utils/contextLimits'
 import type { ComposerSubmission } from '../components/chat/Composer'
-import type { ChatMessage, MessagePart } from '../utils/messageTypes'
+import { isCeilingReason, type ChatMessage } from '../utils/messageTypes'
 import {
   isKnownFrame,
   readTurnStream,
   startTurn,
   stopTurn,
   TurnStartError,
+  type StepItem,
+  type TurnEndedFrame,
   type TurnFrame,
 } from '../utils/turnStreamApi'
 
@@ -92,24 +100,29 @@ const ANNOUNCE = {
   loadFailed: 'This conversation could not be loaded. A retry is available.',
 } as const
 
-/**
- * An assistant message built live from the stream — one per reply, matching the reload shape.
- *
- * THE STATUS IS A PART AND NOT A FLAG, because the thread draws one only for a message that
- * carries it, and it rides at the TAIL: the model is thinking after what it has written so far,
- * and a row pinned above the prose pushes read paragraphs down the screen on every burst. It
- * carries no text — the shape has no field for any — so the reasoning itself cannot reach here.
- */
-function replyMessage(id: string, seq: number, text: string, working: boolean): ChatMessage {
-  const parts: MessagePart[] = [{ type: 'text', text }]
-  if (working) parts.push({ type: 'reasoning' })
-  return { id, role: 'assistant', parts, seq }
+/** The tool the platform's opening "Getting started" row rides under. */
+const ACKNOWLEDGEMENT_TOOL = '__ack__'
+
+/** One reply as its stream has told it so far, and how its turn ended. */
+interface LiveReply extends LiveTurn {
+  id: string
+  /** Whether the reply is in the transcript yet; it joins when it first has something to show. */
+  shown: boolean
+  status: TurnEndedFrame['status'] | null
+  reason: string | null
 }
 
-/** The prose of a message, which is the whole of what a reply on this surface accumulates. */
-function textOf(message: ChatMessage): string {
-  return message.parts.map((part) => (part.type === 'text' ? part.text : '')).join('')
+function newReply(id: string): LiveReply {
+  return { id, parts: [], working: false, shown: false, status: null, reason: null }
 }
+
+function putReplyStep(reply: LiveReply, toolCallId: string, step: StepItem): void {
+  // The working line is this page's wait; the opening row would be a second one.
+  if (step.tool !== ACKNOWLEDGEMENT_TOOL) putStep(reply, toolCallId, step)
+}
+
+/** The same question meets the same bound again, so neither offers a retry. */
+const endedAtCeiling = (reply: LiveReply) => isCeilingReason(reply.reason)
 
 export default function AssistantPage() {
   const { chatId: routedId } = useParams()
@@ -138,6 +151,8 @@ export default function AssistantPage() {
     text: string
     attachmentIds: string[]
   } | null>(null)
+  // Replies the citizen stopped, so their steps read as stopped rather than as finished.
+  const [interruptedIds, setInterruptedIds] = useState<ReadonlySet<string>>(() => new Set())
 
   // THE CONVERSATION THIS PAGE HAS ALREADY RESOLVED, which is not the same thing as the one in
   // the address. The first send takes an address for a conversation this page is already holding
@@ -151,9 +166,6 @@ export default function AssistantPage() {
   const transcriptRef = useRef<HTMLDivElement | null>(null)
   const retryRef = useRef<HTMLButtonElement | null>(null)
   const seqRef = useRef(0)
-  // Does the model have the floor? A ref because the frame handler is built once per turn and
-  // cannot see state changing under it, and every delta has to be rebuilt carrying the answer.
-  const workingRef = useRef(false)
 
   useEffect(() => {
     aliveRef.current = true
@@ -185,56 +197,62 @@ export default function AssistantPage() {
   useEffect(() => rememberGreeting(greeting.headline), [greeting])
 
   /**
-   * Raise or lower the model's status on the live reply.
+   * Draw the live reply as it now stands.
    *
-   * A turn that has said nothing yet gets an empty message to carry it: the whole point of the
-   * status is telling a thinking agent from a hung one, and that question is asked hardest before
-   * the first word arrives.
+   * A reply joins the transcript the first time it has something to show — a word, a step, or
+   * the working line, which matters most before the first word arrives. Once in, it is only ever
+   * replaced, so a reply settling after the citizen has left the conversation draws nothing.
    */
-  const showWorking = useCallback((replyId: string, working: boolean) => {
-    workingRef.current = working
-    setMessages((held) => {
-      const last = held[held.length - 1]
-      if (!last || last.id !== replyId) {
-        return working ? [...held, replyMessage(replyId, seqRef.current++, '', true)] : held
-      }
-      return [...held.slice(0, -1), replyMessage(replyId, last.seq ?? 0, textOf(last), working)]
-    })
+  const paint = useCallback((reply: LiveReply) => {
+    const parts = streamingParts(reply)
+    if (reply.shown) {
+      setMessages((held) => held.map((m) => (m.id === reply.id ? { ...m, parts } : m)))
+      return
+    }
+    if (reply.parts.length === 0 && !reply.working) return
+    reply.shown = true
+    const seq = seqRef.current++
+    setMessages((held) => [...held, { id: reply.id, role: 'assistant', parts, seq }])
   }, [])
 
+  /** The stream is over: the working line comes down, and a stopped reply is marked as such. */
+  const settle = useCallback(
+    (reply: LiveReply) => {
+      reply.working = false
+      paint(reply)
+      if (reply.status === 'stopped') setInterruptedIds((held) => new Set(held).add(reply.id))
+    },
+    [paint],
+  )
+
   const pushFrame = useCallback(
-    (frame: TurnFrame, replyId: string) => {
+    (frame: TurnFrame, reply: LiveReply) => {
       // A FRAME THIS PARSER DOES NOT KNOW IS NOT AN ERROR — the stream has to stay
       // forward-extensible — but neither is it something to read fields off.
       if (!isKnownFrame(frame)) return
       if (frame.type === 'text_delta') {
-        setMessages((held) => {
-          const last = held[held.length - 1]
-          if (last && last.id === replyId) {
-            const text = textOf(last) + frame.text
-            return [
-              ...held.slice(0, -1),
-              replyMessage(replyId, last.seq ?? 0, text, workingRef.current),
-            ]
-          }
-          return [
-            ...held,
-            replyMessage(replyId, seqRef.current++, frame.text, workingRef.current),
-          ]
-        })
+        appendText(reply, frame.text, frame.newBlock)
+        paint(reply)
+        return
+      }
+      if (frame.type === 'step') {
+        putReplyStep(reply, frame.toolCallId, frame.item)
+        paint(reply)
         return
       }
       if (frame.type === 'working') {
-        showWorking(replyId, frame.working)
+        reply.working = frame.working
+        paint(reply)
         return
       }
       if (frame.type === 'turn_ended') {
         // THE TERMINAL IS WHERE THE STATUS COMES DOWN. The flag is edge-triggered, so a turn
         // whose last act was thinking sends no falling edge of its own and the row would spin
-        // over a finished reply. Nothing else on this frame has a reader here: what a turn ended
-        // as is already told by the reply itself, by the banner an `error` frame wrote, or by the
-        // stream simply ending.
-        showWorking(replyId, false)
+        // over a finished reply.
+        reply.working = false
+        reply.status = frame.status
+        reply.reason = frame.reason ?? null
+        paint(reply)
         return
       }
       if (frame.type === 'error') {
@@ -248,29 +266,27 @@ export default function AssistantPage() {
         return
       }
       if (frame.type === 'snapshot') {
-        // A REATTACH, not a fresh turn: the catch-up snapshot carries what the turn has produced
-        // so far, and the deltas that follow continue from it — the status it was taken in
-        // included, or a tab that rejoined mid-thought sits on a still screen until the next
-        // frame happens to change something.
-        workingRef.current = frame.working
-        const text = frame.parts.map((part) => (part.type === 'text' ? part.text : '')).join('')
-        if (text) {
-          setMessages((held) => [
-            ...held,
-            replyMessage(replyId, seqRef.current++, text, frame.working),
-          ])
-        } else {
-          showWorking(replyId, frame.working)
+        // A reattach: the snapshot is the server's whole account of the turn so far, working
+        // flag included, so the reply is rebuilt from it rather than merged into.
+        reply.working = frame.working
+        reply.parts = []
+        for (const part of frame.parts) {
+          if (part.type === 'text') appendText(reply, part.text, true)
+          else putReplyStep(reply, part.toolCallId, part.item)
+        }
+        if (frame.turnStatus !== 'idle' && frame.turnStatus !== 'running') {
+          reply.status = frame.turnStatus
         }
         if (frame.errorMessage) setBanner(frame.errorMessage)
+        paint(reply)
         return
       }
-      // EVERY REMAINING FRAME NARRATES WORK ON AN APP, and this surface builds none: `step`,
+      // EVERY REMAINING FRAME NARRATES WORK ON AN APP, and this surface builds none:
       // `plan_options`, `workspace`, `preview`, `diagnostic` and `compile` describe a sandbox and
       // a build a generic chat never has. They are dropped deliberately rather than by falling
       // off the end of the list.
     },
-    [showWorking],
+    [paint],
   )
 
   /**
@@ -286,7 +302,6 @@ export default function AssistantPage() {
     async (id: string, activeTurn: ActiveTurn) => {
       const controller = new AbortController()
       abortRef.current = controller
-      workingRef.current = false
       setTurnId(activeTurn.turnId)
       setIsRunning(true)
       setBanner(null)
@@ -294,13 +309,13 @@ export default function AssistantPage() {
       // rather than at an earlier instant nobody measured.
       setTurnStartedAt(Date.now())
       setAnnouncement(ANNOUNCE.started)
-      const replyId = `live-${id}-${activeTurn.turnId}`
+      const reply = newReply(`live-${id}-${activeTurn.turnId}`)
       try {
         await readTurnStream({
           conversationId: id,
           turnId: activeTurn.turnId,
           signal: controller.signal,
-          onFrame: (frame) => pushFrame(frame, replyId),
+          onFrame: (frame) => pushFrame(frame, reply),
         })
         if (!aliveRef.current) return
         setAnnouncement(ANNOUNCE.finished)
@@ -310,14 +325,14 @@ export default function AssistantPage() {
         setAnnouncement(ANNOUNCE.turnFailed)
       } finally {
         if (aliveRef.current) {
-          showWorking(replyId, false)
+          settle(reply)
           setIsRunning(false)
           setTurnId(null)
         }
         abortRef.current = null
       }
     },
-    [pushFrame, showWorking],
+    [pushFrame, settle],
   )
 
   const applyLoaded = useCallback(
@@ -401,12 +416,11 @@ export default function AssistantPage() {
     ) => {
       const controller = new AbortController()
       abortRef.current = controller
-      workingRef.current = false
       setIsRunning(true)
       setBanner(null)
       setTurnStartedAt(Date.now())
       setAnnouncement(ANNOUNCE.started)
-      const replyId = `live-${id}-${Date.now()}`
+      const reply = newReply(`live-${id}-${Date.now()}`)
       // DID THE SERVER ACCEPT THE TURN? A 202 means the citizen's message is persisted and the
       // reply runs detached whatever this tab does next, so everything past it is subscription
       // plumbing — and a subscription that breaks must not take back a message the database holds.
@@ -430,9 +444,10 @@ export default function AssistantPage() {
           conversationId: id,
           turnId: started.turnId,
           signal: controller.signal,
-          onFrame: (frame) => pushFrame(frame, replyId),
+          onFrame: (frame) => pushFrame(frame, reply),
         })
         if (!aliveRef.current) return
+        if (endedAtCeiling(reply)) setLastSend(null)
         setAnnouncement(ANNOUNCE.finished)
       } catch (err) {
         // BEFORE THE LIVENESS GUARD, because taking back what a refusal orphaned is not a paint
@@ -446,14 +461,14 @@ export default function AssistantPage() {
         setAnnouncement(ANNOUNCE.turnFailed)
       } finally {
         if (aliveRef.current) {
-          showWorking(replyId, false)
+          settle(reply)
           setIsRunning(false)
           setTurnId(null)
         }
         abortRef.current = null
       }
     },
-    [pushFrame, showWorking],
+    [pushFrame, settle],
   )
 
   const handleSubmit = useCallback(
@@ -543,9 +558,9 @@ export default function AssistantPage() {
     void runTurn(chatId, lastSend.text, lastSend.attachmentIds)
   }, [chatId, lastSend, runTurn])
 
+  // No abort: the server closes the stream after `turn_ended`, the frame that marks a reply stopped.
   const handleCancel = useCallback(async () => {
     if (turnId) await stopTurn(chatId, turnId)
-    abortRef.current?.abort()
   }, [chatId, turnId])
 
   // WHAT A NEW CONVERSATION STARTS FROM: a fresh id, an empty transcript, nothing carried over.
@@ -556,7 +571,6 @@ export default function AssistantPage() {
     // what must not happen is its deltas landing in the transcript that replaced it.
     abortRef.current?.abort()
     resolvedIdRef.current = null
-    workingRef.current = false
     setMintedId(uuidv7())
     setMessages([])
     setBanner(null)
@@ -739,7 +753,11 @@ export default function AssistantPage() {
                 <div className="h-full">
                   {/* The turn's own start, so the working line's count measures the reply rather
                       than the row drawing it — the row is rebuilt on every burst. */}
-                  <ChatThread turnStartedAt={turnStartedAt} />
+                  <ChatThread
+                    turnStartedAt={turnStartedAt}
+                    interruptedMessageIds={interruptedIds}
+                    workingLabel="Working on it"
+                  />
                 </div>
               )}
             </div>

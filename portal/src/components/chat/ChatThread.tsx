@@ -35,7 +35,13 @@ export interface ChatThreadProps {
   /** When the running turn began (`Date.now()`), so the working line's elapsed count measures the
    *  TURN. The row itself is torn down and rebuilt between bursts and cannot time itself. */
   turnStartedAt?: number | null
+  /** What the working line says. A chat with no app names its own words. */
+  workingLabel?: string
 }
+
+const APP_WORKING_LABEL = 'Working on your app'
+
+const WorkingLabelContext = createContext(APP_WORKING_LABEL)
 
 /**
  * The running turn's start, held here because this component outlives the row that reads it.
@@ -78,9 +84,10 @@ const TextPart: ThreadComponents['TextPart'] = ({ text }) => <MessageContent par
  */
 const ReasoningGroup: ThreadComponents['ReasoningGroup'] = () => {
   const turnStartedAt = useContext(TurnStartedAtContext)
+  const label = useContext(WorkingLabelContext)
   return (
     <p data-testid="working-status" className="my-1 text-xs text-status-grey-fg">
-      <WaitingLine label="Working on your app" active since={turnStartedAt} />
+      <WaitingLine label={label} active since={turnStartedAt} />
     </p>
   )
 }
@@ -92,6 +99,7 @@ const ChatThread: FC<ChatThreadProps> = ({
   footer,
   onGroupSealed,
   turnStartedAt = null,
+  workingLabel = APP_WORKING_LABEL,
 }) => {
   const components = useMemo<ThreadComponents>(
     () => ({
@@ -118,7 +126,9 @@ const ChatThread: FC<ChatThreadProps> = ({
     <InterruptedMessagesContext.Provider value={interrupted}>
       <GroupSealedContext.Provider value={announceSealed}>
         <TurnStartedAtContext.Provider value={turnStartedAt}>
-          <Thread components={components} />
+          <WorkingLabelContext.Provider value={workingLabel}>
+            <Thread components={components} />
+          </WorkingLabelContext.Provider>
         </TurnStartedAtContext.Provider>
       </GroupSealedContext.Provider>
     </InterruptedMessagesContext.Provider>

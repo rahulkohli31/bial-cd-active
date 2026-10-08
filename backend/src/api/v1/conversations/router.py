@@ -20,11 +20,12 @@ import uuid
 from typing import Annotated, Any
 
 import sqlalchemy as sa
+import structlog
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 
-from src.api.deps import CurrentUser, DbSession
+from src.api.deps import CurrentUser, DbSession, OptionalAnalysis
 from src.api.deps_csrf import RequireCsrf
 from src.api.v1.attachments.router import storage_dependency
 from src.api.v1.conversations.schemas import (
@@ -37,6 +38,12 @@ from src.core.errors import AppApiError
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.project import MAX_PROJECT_NAME
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
+from src.services.analysis import (
+    AnalysisRuntime,
+    AnalysisTimedOutError,
+    AnalysisUnavailableError,
+)
+from src.services.analysis.placement import end_session
 from src.services.conversations import gather_and_delete_conversation
 from src.services.messages.projection import measured_context_tokens, project_conversation
 from src.services.messages.store import load_rows
@@ -50,6 +57,7 @@ from src.services.turns.guard import (
 )
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
+_log = structlog.get_logger()
 
 # All conversations routes are cookie-authed (`current_user`, 401 DetailBody); their own
 # raises are `AppApiError` -> ErrorEnvelope. The shared 401 spec (`AUTH_401`) is reused across
@@ -364,7 +372,11 @@ async def patch_conversation(
     ),
 )
 async def delete_conversation(
-    conversation_id: str, user: CurrentUser, db: DbSession, storage: StorageDep
+    conversation_id: str,
+    user: CurrentUser,
+    db: DbSession,
+    storage: StorageDep,
+    analysis: OptionalAnalysis,
 ) -> JSONResponse:
     """Delete the chat, its messages and the attachments it sent. A chat that is still
     running is refused until it is stopped."""
@@ -386,4 +398,19 @@ async def delete_conversation(
     finally:
         release_conversation(owned.id)
     await sweep_blobs(storage, blob_keys)
+    if analysis is not None:
+        await _delete_analysis_session(analysis, owned.id)
     return JSONResponse(content={"ok": True})
+
+
+async def _delete_analysis_session(runtime: AnalysisRuntime, conversation_id: uuid.UUID) -> None:
+    """Take the chat's working copies out of Azure now rather than at the pool's cool-down,
+    which stays the backstop: a failure here is logged and never fails the delete."""
+    try:
+        await end_session(runtime, conversation_id)
+    except (AnalysisUnavailableError, AnalysisTimedOutError, TimeoutError) as exc:
+        _log.warning(
+            "analysis_session_delete_failed",
+            conversation_id=str(conversation_id),
+            error=type(exc).__name__,
+        )

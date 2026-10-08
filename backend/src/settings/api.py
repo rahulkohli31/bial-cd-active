@@ -19,6 +19,7 @@ from typing import Annotated, Self
 from pydantic import Field, PositiveInt, SecretStr, field_validator, model_validator
 from pydantic_settings import NoDecode
 
+from src.services.analysis.config import AnalysisConfig
 from src.services.appdb.config import AppDatabaseSettings
 from src.services.auth.config import AuthConfig
 from src.services.deploy.config import DeployConfig
@@ -108,6 +109,10 @@ class ApiSettings(CoreSettings):
     # capability nobody has enabled. Add the gate in the same commit that makes the portal show a
     # Deploy control unconditionally.
     deploy: DeployConfig | None = None
+
+    # The session pool BIAL Chat runs file analysis in. Unset, BIAL Chat refuses Office and CSV
+    # files at its doors and answers everything else as before.
+    analysis: AnalysisConfig | None = None
 
     # Azure AI Foundry access. Genuinely optional: dev/test exercise the agent harness with
     # Pydantic AI's TestModel and make no live call, and None means "AI chat not configured".

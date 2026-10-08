@@ -80,6 +80,27 @@ describe('every ending the server can store has a sentence of its own', () => {
 })
 
 /**
+ * BIAL Chat builds nothing, so its endings never say "build". A ceiling reads on reload exactly as
+ * the live banner read when the reply ended.
+ */
+describe('a chat that builds nothing', () => {
+  it.each([['request_limit'], ['wall_clock_deadline_exceeded']])(
+    'a reply that reached the %s ceiling says what to do next, in one sentence',
+    (reason) => {
+      expect(outcomeSummary({ status: 'failed', reason, buildless: true })).toBe(
+        'This question needed more steps than one reply allows. Try asking about one part at a time.',
+      )
+    },
+  )
+
+  it('a reply that failed for no named reason keeps its own sentence', () => {
+    expect(outcomeSummary({ status: 'failed', reason: null, buildless: true })).toBe(
+      'That reply did not finish.',
+    )
+  })
+})
+
+/**
  * The generic arm, which is a deliberate member of the design rather than a leftover.
  */
 describe('an ending that recorded no reason', () => {

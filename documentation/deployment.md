@@ -18,6 +18,7 @@ value is needed, the prose names the file that owns it.
 | **Database for PostgreSQL** | The platform's own record, and a separate database per project for generated applications. |
 | **Cache for Redis** | Build slots, live-session state and background-job scheduling. Nothing durable. |
 | **Blob storage** | Workspace snapshots and uploaded files. |
+| **Container Apps session pool** | Optional. Runs BIAL Chat's file analysis: one Microsoft-managed Python session per chat that holds a spreadsheet, document or deck. Without it, BIAL Chat refuses those files. |
 
 Two divisions are deliberate and worth stating, because they look like duplication.
 
@@ -113,6 +114,13 @@ have, so they are the ones to start first.
   data layer is dead while the rest of the platform looks healthy.
 - **A DNS name and certificate** for the portal, and for the hostname generated applications are
   served on.
+- **For BIAL Chat to open Office and CSV files: a session pool of the Python code-interpreter
+  kind**, dedicated to the platform, in the same region, with internet access off, its idle
+  cool-down set, and its API-key access switched off. The platform's own identity needs the
+  session-executor role on it and nothing else; with the key on, anyone who can read the pool's
+  settings can call it. The pool's endpoint is public and has no private path, so the control
+  plane must be able to reach it over HTTPS. `backend/.env.example` names the setting, and it stays
+  unset until the acceptance check below has passed.
 
 **Platform side:** the database server and its administrative access, the cache, the storage
 account, the registry, the container apps environment, and the build host.
@@ -134,7 +142,8 @@ This is a binding constraint, not a tuning preference, and nothing enforces it a
 process cannot see its own siblings. Three things assume it: the pass that reaps abandoned builds
 would reap builds running on another instance; the guard that stops one person running two
 concurrent builds would stop nothing; and the request-rate ceilings are held per process, so two
-instances mean twice the intended limit.
+instances mean twice the intended limit. The record of what each BIAL Chat's analysis session
+holds is in process too, but losing it costs only a fresh copy of the chat's files.
 
 Check it before and after every deployment. Scaling out is possible but is a piece of work, not a
 setting: it needs a shared view of liveness and a shared store for the limiters.
@@ -275,6 +284,14 @@ report as having claimed a ready sandbox, its create stage shrunk to the time of
 made with none ready appears with the reason it created one. Through a working day that includes a
 sandbox image deploy, the below-size alarm is quiet, or the worker's log explains each one by a
 refused create, a new sandbox that never answered, or a create a restart interrupted.
+
+**10. BIAL Chat's analysis sessions cannot reach anything, before they are switched on.** As an
+identity holding the session-executor role, run code in a session of the pool that tries a public
+address, a name lookup, a private address and the instance-metadata address. Every attempt must
+fail. Record the result, and only then set the pool's endpoint for the control plane. Then, in a
+browser, attach a workbook to a BIAL Chat, ask for a total, and watch the analysis steps appear
+and the answer arrive; ask a follow-up; delete the chat, and confirm the pool no longer lists its
+session.
 
 ## When previews load for you but not for the people who need them
 

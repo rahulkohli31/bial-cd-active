@@ -17,11 +17,14 @@ import { ToolActivityLine } from './ToolActivityLine'
 import { UNRECOGNISED_STEP, rowState } from './ActivityGroup'
 
 const ActivityRow: ToolCallMessagePartComponent = (part) => {
+  // A tool call with no result carries its message's status, so this is "the reply is still
+  // being written" — the same fact the group reads.
+  const streaming = part.status?.type === 'running'
   const args = (part.args ?? {}) as Partial<ActivityArgs>
   // An absent or empty label renders the unrecognised-tool phrase — never an empty row, and never
   // the tool's own name.
   const label = args.label?.trim() || UNRECOGNISED_STEP
-  return <ToolActivityLine label={label} state={rowState(args.state)} />
+  return <ToolActivityLine label={label} state={rowState(args.state, streaming)} />
 }
 
 export default ActivityRow

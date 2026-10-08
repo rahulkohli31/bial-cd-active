@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.2] - 2026-10-08
+
+BIAL Chat can now answer questions about Word, Excel, PowerPoint, CSV and TSV files. A person
+attaches a file and asks; the assistant reads it with the same reader Plan chats use and works the
+numbers out by running Python in a Microsoft-managed session that belongs to that chat alone, with
+no internet access. The session is kept for the chat's follow-ups and is re-created, with every
+file copied back, after it idles out. Answers are text, tables included. Every step shows in the
+reply as it runs, and a reply that needs more steps than one reply allows ends in a sentence that
+says so. All of it is off until the session pool's endpoint is set: until then BIAL Chat refuses
+these files exactly as before.
+
+### Added
+
+- **BIAL Chat reads and analyses Office and CSV files** in a per-chat Azure Container Apps session,
+  with two tools: one describes a file, one runs Python over it. Follow-ups reuse what earlier
+  replies found rather than reading the file again.
+- **Deleting a chat deletes its session**, and Stop or a calculation past its time limit ends the
+  code still running in it.
+- **Fixed sentences for every failure** a person can meet: unreachable, too slow, too large,
+  unreadable.
+
+### Fixed
+
+- **The attachment reader names a file that fills its memory limit as too large** instead of
+  printing nothing, which read as a damaged file. Plan chats get this with the next sandbox image.
+- **BIAL Chat's working line says "Working on it"** instead of "Working on your app".
+
+### Deploying this release
+
+- **Nothing changes until it is switched on.** With `ANALYSIS__POOL_ENDPOINT` unset, this release
+  deploys like any other: no migration, and the backend and portal behave as before for every chat.
+- **To switch file analysis on**, in this order:
+  - **A session pool of the Python code-interpreter kind**, dedicated to the platform, in the same
+    region, with internet access off, its idle cool-down set to 20 minutes, and API-key access
+    switched off (`mcpServerSettings.isMCPServerApiKeyDisabled: true`).
+  - **The backend's identity holds the session-executor role on that pool,** and nothing else does.
+  - **Run the network check in `documentation/deployment.md` (step 10) against that pool** and
+    record that every attempt fails, before the endpoint is set.
+  - **Set `ANALYSIS__POOL_ENDPOINT`** to the pool's management endpoint, and deploy the backend and
+    the portal together.
+- **The control plane stays a single instance;** the record of what each chat's session holds is
+  kept in process.
+
 ## [1.9.1] - 2026-10-08
 
 Opening an app saved under an older sandbox image no longer reinstalls its libraries every time.

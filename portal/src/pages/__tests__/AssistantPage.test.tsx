@@ -14,7 +14,7 @@
  * line pin the clock and the source of chance instead of hoping.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
+import { act, render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom'
 import { MotionGlobalConfig } from 'motion/react'
 
@@ -53,6 +53,7 @@ vi.mock('../../utils/attachmentStore', async (importOriginal) => ({
 
 import AssistantPage from '../AssistantPage'
 import { GREETINGS, headlineParts } from '../../components/assistant/greetings'
+import { messagesFromProjection } from '../../utils/conversationApi'
 import { TurnStartError } from '../../utils/turnStreamApi'
 
 MotionGlobalConfig.skipAnimations = true
@@ -982,5 +983,327 @@ describe('the thinking-versus-hung status', () => {
     expect(await screen.findByTestId('working-status')).toBeTruthy()
     releaseStream('completed')
     await waitFor(() => expect(screen.queryByTestId('working-status')).toBeNull())
+  })
+})
+
+const CEILING_SENTENCE =
+  'This question needed more steps than one reply allows. Try asking about one part at a time.'
+
+/** A step frame as the engine sends it. Live steps carry no row seq, so every one is `0`. */
+const stepFrame = (
+  toolCallId: string,
+  label: string,
+  state: 'pending' | 'ok' | 'failed' = 'pending',
+  { tool = 'run_python', hidden = false }: { tool?: string; hidden?: boolean } = {},
+) => ({
+  type: 'step',
+  seq: 1,
+  toolCallId,
+  phase: state === 'pending' ? 'started' : 'finished',
+  item: { type: 'step', seq: 0, tool, label, state, hidden },
+})
+
+/** A turn whose frames the test hands over one at a time, ending when the test says so — or, as
+ *  the real reader does, the moment its signal aborts, after which no frame reaches the page. */
+function scriptTurn() {
+  let push: (frame: unknown) => void = () => {}
+  let finish: (outcome: string) => void = () => {}
+  h.readTurnStream.mockImplementation(
+    ({ onFrame, signal }: { onFrame: (f: unknown) => void; signal: AbortSignal }) => {
+      push = (frame) => {
+        if (!signal.aborted) onFrame(frame)
+      }
+      return new Promise((resolve) => {
+        finish = resolve
+        signal.addEventListener('abort', () => resolve('aborted'), { once: true })
+      })
+    },
+  )
+  return {
+    opened: () => waitFor(() => expect(h.readTurnStream).toHaveBeenCalled()),
+    frame: (frame: unknown) => act(() => push(frame)),
+    end: (outcome = 'completed') => act(async () => finish(outcome)),
+  }
+}
+
+const groupLabel = () => screen.getByTestId('activity-group-trigger').textContent ?? ''
+const glyphState = () =>
+  screen
+    .getByTestId('activity-glyphs')
+    .querySelector('[data-kind="tool-activity"]')
+    ?.getAttribute('data-state')
+const groupRows = () => {
+  fireEvent.click(screen.getByTestId('activity-group-trigger'))
+  return [
+    ...screen.getByTestId('activity-group-rows').querySelectorAll('[data-kind="tool-activity"]'),
+  ].map((row) => row.textContent)
+}
+
+/** A stored analysis reply, projected by the real reload path for a generic chat. */
+const storedAnalysis = (terminal: Record<string, unknown>[] = []) =>
+  messagesFromProjection(
+    [
+      { type: 'user_text', seq: 0, text: 'what is the total in column C' },
+      { type: 'step', seq: 1, tool: 'read_attachment', label: 'Reading budget.xlsx', state: 'ok', hidden: false },
+      { type: 'step', seq: 2, tool: 'run_python', label: 'Running the analysis', state: 'ok', hidden: false },
+      { type: 'assistant_text', seq: 3, text: 'Column C totals 4,210.' },
+      ...terminal.map((item) => ({ type: 'turn_terminal', seq: 4, ...item })),
+    ],
+    undefined,
+    true,
+  )
+
+describe('a reply that works through the citizen files', () => {
+  it('★ shows a running analysis as a step in its own words, and the working line keeps its words', async () => {
+    const turn = scriptTurn()
+    mount()
+    type('what is the total in column C')
+    await turn.opened()
+
+    await turn.frame(stepFrame('call-1', 'Running the analysis'))
+    expect(screen.getByTestId('activity-group-now').textContent).toBe('Running the analysis')
+    expect(groupLabel()).toContain('1 step')
+
+    await turn.frame(stepFrame('call-1', 'Running the analysis', 'ok'))
+    await turn.frame({ type: 'working', seq: 3, working: true })
+    // The finished frame replaces the started one in place rather than stacking a second row.
+    expect(groupLabel()).toContain('1 step')
+    expect(screen.getByTestId('working-status').textContent).toContain('Working on it')
+    expect(screen.getByTestId('working-status').textContent).not.toContain('app')
+    await turn.end()
+  })
+
+  it('★ prose written after a step reads below it, in the order the turn happened', async () => {
+    const turn = scriptTurn()
+    mount()
+    type('what is the total in column C')
+    await turn.opened()
+
+    await turn.frame({ type: 'text_delta', seq: 1, text: 'Let me add that up.', newBlock: true })
+    await turn.frame(stepFrame('call-1', 'Running the analysis', 'ok'))
+    await turn.frame({ type: 'text_delta', seq: 3, text: 'Column C totals 4,210.', newBlock: false })
+    await turn.end()
+
+    const reply = screen.getByTestId('assistant-message').textContent ?? ''
+    const group = reply.indexOf('1 step')
+    expect(group).toBeGreaterThan(-1)
+    expect(reply.indexOf('Let me add that up.')).toBeLessThan(group)
+    expect(reply.indexOf('Column C totals 4,210.')).toBeGreaterThan(group)
+  })
+
+  it('★ a tab that rejoins mid-reply draws the steps the snapshot carries, as well as its prose', async () => {
+    h.getConversation.mockResolvedValue(
+      aConversation({
+        messages: [
+          { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'what is the total' }], seq: 0 },
+        ],
+        activeTurn: { turnId: 't9', lastSeq: 6 },
+      }),
+    )
+    const turn = scriptTurn()
+    mount('/assistant/c1')
+    await turn.opened()
+
+    await turn.frame({
+      type: 'snapshot',
+      seq: 6,
+      turnId: 't9',
+      turnStatus: 'running',
+      items: [],
+      parts: [
+        { type: 'text', text: 'Let me add that up.' },
+        { type: 'step', toolCallId: 'call-1', item: stepFrame('call-1', 'Reading budget.xlsx', 'ok').item },
+        { type: 'step', toolCallId: 'call-2', item: stepFrame('call-2', 'Running the analysis').item },
+      ],
+      working: false,
+      errorMessage: null,
+    })
+
+    expect(screen.getByText('Let me add that up.')).toBeTruthy()
+    expect(groupLabel()).toContain('2 steps')
+    expect(screen.getByTestId('activity-group-now').textContent).toBe('Running the analysis')
+
+    // The step still running when the tab rejoined resolves in place, under the same key.
+    await turn.frame(stepFrame('call-2', 'Running the analysis', 'ok'))
+    expect(screen.queryByTestId('activity-group-now')).toBeNull()
+    expect(groupRows()).toEqual(['Reading budget.xlsx', 'Running the analysis'])
+    await turn.end()
+  })
+
+  it('★ a reload draws the stored steps as the same rows the live reply showed', async () => {
+    h.getConversation.mockResolvedValue(aConversation({ messages: storedAnalysis() }))
+    mount('/assistant/c1')
+
+    expect(await screen.findByText('Column C totals 4,210.')).toBeTruthy()
+    expect(groupLabel()).toBe('2 steps')
+    expect(groupRows()).toEqual(['Reading budget.xlsx', 'Running the analysis'])
+    expect(h.readTurnStream).not.toHaveBeenCalled()
+  })
+
+  it('★ a reply the citizen stopped reads as stopped, not as finished', async () => {
+    const turn = scriptTurn()
+    mount()
+    type('what is the total in column C')
+    await turn.opened()
+    await turn.frame(stepFrame('call-1', 'Running the analysis', 'ok'))
+    await turn.frame({ type: 'text_delta', seq: 2, text: 'Half an answer', newBlock: true })
+
+    fireEvent.click(await screen.findByTestId('stop-turn'))
+    await waitFor(() => expect(h.stopTurn).toHaveBeenCalled())
+    await turn.frame({
+      type: 'turn_ended',
+      seq: 3,
+      turnId: 't1',
+      status: 'stopped',
+      reason: 'stopped_by_user',
+    })
+    await turn.end()
+
+    expect(groupLabel()).toContain('stopped before it finished')
+    expect(screen.getByText('Half an answer')).toBeTruthy()
+  })
+
+  it.each([
+    ['the Stop control', async () => fireEvent.click(await screen.findByTestId('stop-turn'))],
+    ['Escape in the box', async () => fireEvent.keyDown(box(), { key: 'Escape' })],
+  ])('★ a step still running at %s stops spinning and reads as stopped', async (_how, stop) => {
+    // The engine never resolves the tool call a Stop cut short, so the step arrives at the end of
+    // the reply still pending.
+    const turn = scriptTurn()
+    mount()
+    type('what is the total in column C')
+    await turn.opened()
+    await turn.frame(stepFrame('call-1', 'Running the analysis'))
+    expect(screen.getByTestId('activity-group-now')).toBeTruthy()
+
+    await stop()
+    await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith(expect.any(String), 't1'))
+    // The server answers the stop before its stream carries `turn_ended`, so the page acts on that
+    // answer first.
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)))
+    await turn.frame({
+      type: 'turn_ended',
+      seq: 2,
+      turnId: 't1',
+      status: 'stopped',
+      reason: 'stopped_by_user',
+    })
+    await turn.end()
+
+    expect(groupLabel()).toBe('1 step · stopped before it finished')
+    expect(screen.queryByTestId('activity-group-now')).toBeNull()
+    expect(glyphState()).toBe('pending')
+  })
+
+  it('★ a step still running when a ceiling ends the reply stops spinning too', async () => {
+    const turn = scriptTurn()
+    mount()
+    type('what is the total in column C')
+    await turn.opened()
+    await turn.frame(stepFrame('call-1', 'Running the analysis'))
+    await turn.frame({ type: 'error', seq: 2, message: CEILING_SENTENCE })
+    await turn.frame({ type: 'turn_ended', seq: 3, turnId: 't1', status: 'failed', reason: 'request_limit' })
+    await turn.end()
+
+    // A ceiling says why in its own sentence, so the group carries no stopped mark of its own.
+    expect(screen.getByTestId('turn-banner').textContent).toBe(CEILING_SENTENCE)
+    expect(groupLabel()).toBe('1 step')
+    expect(screen.queryByTestId('activity-group-now')).toBeNull()
+    expect(glyphState()).toBe('pending')
+  })
+
+  it('a reply that finished is not marked stopped, which is what makes the mark a branch', async () => {
+    const turn = scriptTurn()
+    mount()
+    type('what is the total in column C')
+    await turn.opened()
+    await turn.frame(stepFrame('call-1', 'Running the analysis', 'ok'))
+    await turn.frame({ type: 'turn_ended', seq: 2, turnId: 't1', status: 'completed', reason: null })
+    await turn.end()
+
+    expect(groupLabel()).toBe('1 step')
+  })
+
+  it.each([['request_limit'], ['wall_clock_deadline_exceeded']])(
+    '★ the %s ceiling keeps the partial answer, says why, offers no retry and announces the sentence',
+    async (reason) => {
+      const turn = scriptTurn()
+      mount()
+      type('what is the total in column C')
+      await turn.opened()
+      await turn.frame({ type: 'text_delta', seq: 1, text: 'So far column C totals 4,210.', newBlock: true })
+      await turn.frame(stepFrame('call-1', 'Running the analysis', 'ok'))
+      await turn.frame({ type: 'error', seq: 3, message: CEILING_SENTENCE })
+      await turn.frame({ type: 'turn_ended', seq: 4, turnId: 't1', status: 'failed', reason })
+      await turn.end()
+
+      expect(screen.getByText('So far column C totals 4,210.')).toBeTruthy()
+      expect(screen.getByTestId('turn-banner').textContent).toBe(CEILING_SENTENCE)
+      const announcing = [...document.querySelectorAll('[aria-live]')].filter((region) =>
+        region.textContent?.includes(CEILING_SENTENCE),
+      )
+      expect(announcing).toHaveLength(1)
+      expect(screen.getByTestId('activity-announcer').textContent).toBe('Reply finished.')
+      expect(screen.queryByTestId('assistant-turn-retry')).toBeNull()
+    },
+  )
+
+  it('a failure that is not a ceiling still offers the retry and is announced as before', async () => {
+    const turn = scriptTurn()
+    mount()
+    type('what is the total in column C')
+    await turn.opened()
+    await turn.frame({ type: 'error', seq: 1, message: 'The assistant could not get an answer.' })
+    await turn.frame({
+      type: 'turn_ended',
+      seq: 2,
+      turnId: 't1',
+      status: 'failed',
+      reason: 'model_unavailable',
+    })
+    await turn.end()
+
+    expect(screen.getByTestId('assistant-turn-retry')).toBeTruthy()
+    expect(screen.getByTestId('activity-announcer').textContent).toBe('Reply finished.')
+  })
+
+  it.each([['request_limit'], ['wall_clock_deadline_exceeded']])(
+    '★ after a reload, the %s ceiling reads as the sentence the live banner showed',
+    async (reason) => {
+      h.getConversation.mockResolvedValue(
+        aConversation({ messages: storedAnalysis([{ terminal: 'failed', reason }]) }),
+      )
+      mount('/assistant/c1')
+
+      expect(await screen.findByText(CEILING_SENTENCE)).toBeTruthy()
+      expect(screen.getByText('Column C totals 4,210.')).toBeTruthy()
+    },
+  )
+
+  it('★ a reply with no steps renders as it always has, the opening acknowledgement included', async () => {
+    const turn = scriptTurn()
+    mount()
+    type('how many stands are free tonight')
+    await turn.opened()
+
+    const ack = (hidden: boolean) =>
+      stepFrame('__ack__', 'Getting started on that…', 'pending', { tool: '__ack__', hidden })
+    await turn.frame(ack(false))
+    expect(screen.queryAllByTestId('activity-group')).toHaveLength(0)
+    expect(screen.queryAllByTestId('assistant-message')).toHaveLength(0)
+
+    await turn.frame({ type: 'working', seq: 2, working: true })
+    expect(screen.getByTestId('working-status')).toBeTruthy()
+    await turn.frame(ack(true))
+    await turn.frame({ type: 'text_delta', seq: 4, text: 'Six stands are free.', newBlock: true })
+    await turn.frame({ type: 'turn_ended', seq: 5, turnId: 't1', status: 'completed', reason: null })
+    await turn.end()
+
+    expect(screen.getAllByTestId('assistant-message')).toHaveLength(1)
+    expect(screen.getByTestId('assistant-message').textContent).toContain('Six stands are free.')
+    expect(screen.queryAllByTestId('activity-group')).toHaveLength(0)
+    expect(screen.queryByTestId('working-status')).toBeNull()
+    expect(screen.queryByTestId('turn-banner')).toBeNull()
+    expect(screen.getByTestId('activity-announcer').textContent).toBe('Reply finished.')
   })
 })

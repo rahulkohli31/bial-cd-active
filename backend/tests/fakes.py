@@ -6,6 +6,8 @@ conversation delete-sweeps, and the snapshot round-trip run without Azurite.
 `FakeSandboxClient` is a canned `SandboxClient` (the mock helper) that lets SESSION-API's
 reaper + SessionManager + router tests run without a live container or real ACA.
 
+`FakeAnalysisRuntime` stands in for BIAL Chat's Azure session pool.
+
 `ToolDeps` and `write_legacy_build_started` at the foot of the file are re-hosted from `src/`:
 both were harness-only in production and were deleted with it, and both were the driver for
 tests of code that is still live. See the section comment there.
@@ -34,6 +36,13 @@ from src.core.connectors import CONNECTORS, ConnectedSystem, ResolvedWindow
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.project_connector import ConnectorWindowKind
+from src.services.analysis import (
+    AnalysisTimedOutError,
+    AnalysisUnavailableError,
+    Execution,
+    SessionFile,
+)
+from src.services.analysis.placement import LINK_CODE
 from src.services.build_sessions.locks import read_registry
 from src.services.build_sessions.manager import SessionManager
 from src.services.build_sessions.outcome import (
@@ -272,6 +281,97 @@ class FakeDirectory:
             if user["id"] == wanted:
                 return httpx.Response(200, json=user, request=request)
         return httpx.Response(404, request=request)
+
+
+@dataclass
+class FakeAnalysisRuntime:
+    """An in-memory `AnalysisRuntime`: one dict of files per session identifier.
+
+    A call on an unknown identifier opens an empty session, as the service does. `remove` is
+    Azure deleting an idle session. `unavailable` fails every call; `run_times_out` fails every
+    run with the deadline; `hold_runs` parks each run until it is cleared. `handle_run` decides
+    what a run prints, and its streams are cut at the run's `output_limit` as the service cuts
+    them. `calls` records `(operation, session_id)` in order, `uploads` and `deletions` the
+    `(session_id, name)` of each file call, and `runs` the code. Placement's own link run lands in
+    `links` instead and always succeeds: the knobs above are for model code."""
+
+    files: dict[str, dict[str, bytes]] = field(default_factory=dict)
+    stamps: dict[str, dict[str, str]] = field(default_factory=dict)
+    calls: list[tuple[str, str]] = field(default_factory=list)
+    uploads: list[tuple[str, str]] = field(default_factory=list)
+    deletions: list[tuple[str, str]] = field(default_factory=list)
+    runs: list[tuple[str, str]] = field(default_factory=list)
+    links: list[str] = field(default_factory=list)
+    unavailable: bool = False
+    run_times_out: bool = False
+    hold_runs: asyncio.Event | None = None
+    handle_run: Callable[[str, str], Execution] = field(
+        default=lambda _session_id, _code: Execution(succeeded=True, stdout="", stderr="")
+    )
+    _uploads: int = 0
+
+    def _enter(self, operation: str, session_id: str) -> dict[str, bytes]:
+        self.calls.append((operation, session_id))
+        if self.unavailable:
+            raise AnalysisUnavailableError(f"{operation} refused")
+        self.stamps.setdefault(session_id, {})
+        return self.files.setdefault(session_id, {})
+
+    def operations(self, operation: str) -> list[str]:
+        """The session ids `operation` was called with, in order."""
+        return [session for name, session in self.calls if name == operation]
+
+    def remove(self, session_id: str) -> None:
+        """Azure deleting the session after its cool-down: the next call opens an empty one."""
+        self.files.pop(session_id, None)
+        self.stamps.pop(session_id, None)
+
+    async def list_files(self, session_id: str) -> list[SessionFile]:
+        held = self._enter("list_files", session_id)
+        stamps = self.stamps[session_id]
+        return [
+            SessionFile(name=name, size=len(data), modified=stamps[name])
+            for name, data in held.items()
+        ]
+
+    async def upload_file(self, session_id: str, name: str, data: bytes) -> None:
+        self._enter("upload_file", session_id)[name] = data
+        self.uploads.append((session_id, name))
+        self._uploads += 1
+        self.stamps[session_id][name] = f"stamp-{self._uploads}"
+
+    async def delete_file(self, session_id: str, name: str) -> None:
+        self._enter("delete_file", session_id).pop(name, None)
+        self.deletions.append((session_id, name))
+        self.stamps[session_id].pop(name, None)
+
+    async def run(
+        self, session_id: str, code: str, *, timeout_s: float, output_limit: int
+    ) -> Execution:
+        self._enter("run", session_id)
+        if code == LINK_CODE:
+            self.links.append(session_id)
+            return Execution(succeeded=True, stdout="", stderr="")
+        self.runs.append((session_id, code))
+        if self.hold_runs is not None:
+            await self.hold_runs.wait()
+        if self.run_times_out:
+            raise AnalysisTimedOutError(f"run outlived {timeout_s}s")
+        execution = self.handle_run(session_id, code)
+        return replace(
+            execution,
+            stdout=execution.stdout[: output_limit - 1],
+            stderr=execution.stderr[: output_limit - 1],
+        )
+
+    async def delete_session(self, session_id: str) -> None:
+        self.calls.append(("delete_session", session_id))
+        if self.unavailable:
+            raise AnalysisUnavailableError("delete_session refused")
+        self.remove(session_id)
+
+    async def aclose(self) -> None:
+        return None
 
 
 def _fake_handle(app_name: str) -> SandboxHandle:

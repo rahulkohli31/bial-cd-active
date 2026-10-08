@@ -1,4 +1,4 @@
-"""The Plan chat's one way to read an attached file.
+"""How Plan and BIAL Chat read an attached file: one tool body over a reader per kind.
 
 WHY THIS IS ITS OWN TOOLSET RATHER THAN A WIDER `run_command`. Plan already executes inside the
 container, but only through `check_the_guest_list`: eight read-only binaries, exec-style argv, no
@@ -25,10 +25,10 @@ do better, and would make the reader look opaque at exactly the moment it stops 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 import structlog
 from pydantic_ai import ModelRetry, RunContext
@@ -68,11 +68,11 @@ log the place its payload lives."""
 # and reached the operator as nothing at all — so "attachments are broken" could not be narrowed
 # without reproducing it. Each class now leaves exactly one event naming itself.
 #
-# WHAT THEY BIND, AND WHAT THEY MUST NOT. `app_id` and the file's SUFFIX. Never the display name
-# (citizen-supplied text), never the path, and never `handle` — it carries the live supervisor
-# bearer, which is the rule `SandboxSession` states for itself. Explicit fields rather than
-# `exc_info=True`: the configured chain (`core/log_config.py`) reduces an exception to its class
-# chain and raise site, which names the failure but carries none of these facts.
+# WHAT THEY BIND, AND WHAT THEY MUST NOT. The reader's `log_fields` and the file's SUFFIX. Never
+# the display name (citizen-supplied text), never the path, and never `handle` — it carries the
+# live supervisor bearer, which is the rule `SandboxSession` states for itself. Explicit fields
+# rather than `exc_info=True`: the configured chain (`core/log_config.py`) reduces an exception to
+# its class chain and raise site, which names the failure but carries none of these facts.
 
 
 def _suffix_of(path: str) -> str:
@@ -80,9 +80,20 @@ def _suffix_of(path: str) -> str:
     return PurePosixPath(path).suffix
 
 
+class ReadsAttachments(Protocol):
+    """Runs the shipped reader over one attached file and returns what it printed."""
+
+    @property
+    def log_fields(self) -> Mapping[str, str]:
+        """What a failure log may name this reader's scope by. Never a file name."""
+        ...
+
+    async def read(self, path: str) -> str: ...
+
+
 @dataclass
 class AttachmentReader:
-    """Runs the shipped reader over one attached file, and nothing else.
+    """Runs the shipped reader over one attached file in the app's container, and nothing else.
 
     THE SCOPE IS THE ARGV, which is why this is a class holding a session rather than a general
     exec helper: the command is assembled here from a fixed interpreter, a fixed script path and
@@ -91,6 +102,10 @@ class AttachmentReader:
     """
 
     session: SandboxSession
+
+    @property
+    def log_fields(self) -> dict[str, str]:
+        return {"app_id": str(self.session.app_id)}
 
     async def read(self, path: str) -> str:
         # ★ TRANSLATED, NOT PASSED THROUGH. The model is given `.attachments/<name>` — a token the
@@ -138,19 +153,23 @@ class AttachmentReader:
 
 
 def attachment_toolset[DepsT](
-    reader_of: Callable[[RunContext[DepsT]], AttachmentReader],
+    reader_of: Callable[[RunContext[DepsT]], ReadsAttachments],
+    *,
+    sequential: bool = False,
 ) -> FunctionToolset[DepsT]:
-    """The Plan arm's attachment capability, over whatever deps the caller resolves a reader from.
+    """The attachment capability, over whatever deps the caller resolves a reader from.
 
-    A factory for the same reason `read_only_toolset` is one: WHICH container is a fact about the
-    run, not about the ability. What this toolset allows is written down once, here.
+    A factory for the same reason `read_only_toolset` is one: WHERE the file is read is a fact
+    about the run, not about the ability. `sequential` makes each read run alone.
 
     The inner tool annotates `RunContext[Any]`, matching `read_only_toolset`'s own note and for
     the same reason: pydantic-ai resolves tool annotations with `get_type_hints` at registration,
     and a PEP-695 type param of the ENCLOSING function is not in scope there under deferred
     annotations. The factory signature carries the real typing.
     """
-    toolset: FunctionToolset[DepsT] = FunctionToolset[DepsT](id="attachments")
+    toolset: FunctionToolset[DepsT] = FunctionToolset[DepsT](
+        id="attachments", sequential=sequential
+    )
 
     # THE NAME IS THE CONSTANT, not the spelling of this function, because the transcript's
     # label mapping matches on it from a module that cannot import this one.
@@ -188,7 +207,7 @@ def attachment_toolset[DepsT](
             raise ModelRetry(
                 f"`{file}` is not an attached file. Attachments are named with the "
                 f"`{ATTACHMENTS_PREFIX}` prefix you were given in this turn — pass that path. "
-                "This tool reads attachments only; use `read_file` for the app's own source."
+                "This tool reads attachments only."
             )
         reader = reader_of(ctx)
         try:
@@ -223,7 +242,7 @@ def attachment_toolset[DepsT](
             error = parsed.get("error")
             logger.warning(
                 "attachment_read_named_failure",
-                app_id=str(reader.session.app_id),
+                **reader.log_fields,
                 suffix=_suffix_of(file),
                 code=error.get("code") if isinstance(error, dict) else None,
             )
