@@ -79,6 +79,31 @@ ANALYSIS_RUN_TOOL = "run_python"
 """BIAL Chat's one way to compute over an attached file, named here for the same reason as the
 reader above: the tool registers it, the prompt names it, and the transcript labels its step."""
 
+ANALYSIS_RULES = f"""\
+HOW TO WORK WITH THESE FILES
+- Read a file with `{ATTACHMENT_READ_TOOL}` before computing on it, then compute with \
+`{ANALYSIS_RUN_TOOL}`, opening the file in your code by the same path.
+- Start from what the reader reports, and load only the sheets or columns the question needs.
+- The Python session can be renewed between replies, so values from an earlier reply may be gone: \
+recompute rather than assume.
+- If a file is reported missing, read it again with `{ATTACHMENT_READ_TOOL}`.
+- Answer in text; tables are fine. Asked for a chart or a file to download, say this chat answers \
+in text only.
+- Never state what a file contains unless you have read it.
+- PDFs and pictures are not in the Python session: they reach you directly.
+- The Python session has no internet access, so do not try to install anything.
+- When a tool reports one of these codes, give the person its sentence, word for word:
+  - unavailable: "I can't open your files right now. Please try again in a few minutes."
+  - timeout: "That calculation took too long. Try a narrower question or a smaller part of the \
+file."
+  - too_large: "That file is too large to work through in one go. Try one sheet or a smaller \
+range."
+  - unreadable, unsupported or encrypted: "I couldn't read that file. It may be damaged or in a \
+format I can't open."
+- Never show the person your code, a traceback or a tool's raw output."""
+"""BIAL Chat's rules for its analysis tools, sent after the file listing only when those tools
+are registered. The four quoted sentences are owner-approved and reach the person verbatim."""
+
 APPLY_SCHEMA_CHANGE_TOOL = "apply_schema_change"
 """The ONE sanctioned channel for a schema change, and the ONE spelling of it.
 
