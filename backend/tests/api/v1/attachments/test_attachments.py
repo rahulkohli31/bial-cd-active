@@ -803,6 +803,7 @@ async def test_download_cross_user_denied(client, db_session) -> None:
     headers_b, _, _ = await _auth(db_session)
     resp_b = await client.get("/v1/attachments/att_shared", headers=headers_b)
     assert resp_b.status_code == 404
+    assert resp_b.json() == {"error": {"message": "Attachment not found."}}
 
 
 async def test_delete_removes_object_and_row(client, db_session, fake_storage) -> None:
@@ -830,11 +831,8 @@ async def test_delete_removes_object_and_row(client, db_session, fake_storage) -
     )
     assert row is None
 
-    # A SECOND DELETE OF THE SAME ID IS STILL 200. The composer retries on a dropped response,
-    # and a 404 on the retry would tell the citizen the delete failed when it had succeeded.
     again = await client.delete("/v1/attachments/att_del", headers=headers)
-    assert again.status_code == 200
-    assert again.json() == {"ok": True}
+    assert again.status_code == 404
 
 
 async def test_a_blob_the_sweep_could_not_remove_is_recorded_against_its_id(
@@ -891,18 +889,17 @@ async def test_a_blob_the_sweep_could_not_remove_is_recorded_against_its_id(
     assert survived[0]["key_count"] == 1
 
 
-async def test_delete_missing_is_idempotent(client, db_session) -> None:
-    headers, _, conv = await _auth(db_session)
+async def test_delete_of_an_unknown_id_is_404(client, db_session) -> None:
+    headers, _, _ = await _auth(db_session)
     resp = await client.delete("/v1/attachments/att_ghost", headers=headers)
-    assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"message": "Attachment not found."}}
 
 
-async def test_delete_cross_user_is_noop_and_preserves_owner_data(
+async def test_delete_cross_user_is_404_and_preserves_owner_data(
     client, db_session, fake_storage
 ) -> None:
-    # Destructive-leak guard: B DELETEing A's attachmentId is a 200 no-op AND must NOT
-    # touch A's row or blob — the `_load_owned(db, user.id, …)` scope predicate must hold.
+    # Dropping the `user_id` predicate in `_load_owned` turns this red.
     a_headers, user_a, conv = await _auth(db_session)
     await client.post(
         "/v1/attachments",
@@ -916,10 +913,10 @@ async def test_delete_cross_user_is_noop_and_preserves_owner_data(
     )
     assert len(fake_storage.objects) == 1
 
-    b_headers, _, conv = await _auth(db_session)
+    b_headers, _, _ = await _auth(db_session)
     resp = await client.delete("/v1/attachments/att_shared", headers=b_headers)
-    assert resp.status_code == 200
-    assert resp.json() == {"ok": True}  # idempotent no-op — B owns nothing
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"message": "Attachment not found."}}
 
     assert len(fake_storage.objects) == 1
     row = await db_session.scalar(
@@ -928,6 +925,9 @@ async def test_delete_cross_user_is_noop_and_preserves_owner_data(
         )
     )
     assert row is not None
+    still_there = await client.get("/v1/attachments/att_shared", headers=a_headers)
+    assert still_there.status_code == 200
+    assert still_there.content == _PNG
 
 
 async def test_malformed_base64_rejected(client, db_session) -> None:
@@ -968,7 +968,7 @@ def test_attachments_openapi_documents_codes() -> None:
     dl = set(paths["/v1/attachments/{attachment_id}"]["get"]["responses"])
     assert {"400", "404", "401", "500"} <= dl
     delete = set(paths["/v1/attachments/{attachment_id}"]["delete"]["responses"])
-    assert {"400", "429", "401", "500"} <= delete
+    assert {"400", "404", "429", "401", "500"} <= delete
 
 
 # --- conversation link --------------------------------------------------------

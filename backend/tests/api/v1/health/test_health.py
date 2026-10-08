@@ -1,97 +1,131 @@
-"""Health endpoint: happy path, fail-closed on DB down, the Redis field's three
-states, and security headers.
+"""Health endpoint: one public word, `ok` or `unavailable`, and the reason only in the log.
 
-The Redis half of this file exists to pin an asymmetry that is easy to "simplify"
-away later: Postgres fails the endpoint CLOSED (503) because the API cannot work
-without it, while Redis only DEGRADES the reported status at HTTP 200 because a
-Redis outage breaks build sessions and nothing else. `degraded` therefore no longer
-implies 503 — see the `HealthStatus` docstring.
+The endpoint is reachable without signing in, so its body must not describe the platform's
+dependencies. Every assertion on a body below is an exact equality for that reason: a field that
+names the database or Redis fails it.
 """
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable, Iterator
+
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
+from structlog.testing import capture_logs
+from structlog.typing import EventDict
 
+from src.api.v1.health import router as health_router
 from src.db.session import get_db
 from src.services.redis import client as redis_client
 
 
-async def test_health_returns_not_configured_without_a_redis_fixture(client) -> None:
+class _PingRefuses:
+    async def ping(self) -> bool:
+        raise RedisConnectionError("Error 111 connecting to nope:6379. Connection refused.")
+
+
+class _BoomSession:
+    async def execute(self, *args: object, **kwargs: object) -> object:
+        raise RuntimeError("db down")
+
+
+def _unreachable(logs: list[EventDict]) -> list[tuple[object, object]]:
+    # The class name and nothing else: the exception's message can carry a host and port.
+    return sorted(
+        (e["dependency"], e["error_type"])
+        for e in logs
+        if e["event"] == "health_dependency_unreachable"
+    )
+
+
+@pytest.fixture
+def db_answers_with(app) -> Iterator[Callable[[object], None]]:
+    def _install(session: object) -> None:
+        async def _db():
+            yield session
+
+        app.dependency_overrides[get_db] = _db
+
+    yield _install
+    app.dependency_overrides.pop(get_db, None)
+
+
+async def test_health_is_ok_without_a_redis_fixture(client) -> None:
     """Binds no fixture on purpose — `fake_redis` in `tests/conftest.py` says why.
 
-    With no client bound the endpoint owes the certain answer `not_configured`, and stays
-    `ok` at HTTP 200: a box with no Redis is not a sick API.
+    A deployment with no Redis configured is a supported one outside production, not a sick API.
     """
     response = await client.get("/v1/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "database": "ok", "redis": "not_configured"}
+    assert response.json() == {"status": "ok"}
 
 
-async def test_health_returns_ok_when_redis_is_reachable(client, fake_redis) -> None:
+async def test_health_is_ok_when_redis_is_reachable(client, fake_redis) -> None:
     response = await client.get("/v1/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "database": "ok", "redis": "ok"}
+    assert response.json() == {"status": "ok"}
 
 
-async def test_health_is_degraded_but_200_when_redis_is_unreachable(
+async def test_health_is_unavailable_when_redis_is_unreachable(
     client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """THE case this unit exists for. A Redis outage must NOT 503: build sessions are
-    down, every other route is fine, and draining or restarting this instance would fix
-    nothing while taking working functionality away from users. So: honest `degraded`,
-    healthy HTTP 200, no restart loop.
-    """
-
-    class _PingRefuses:
-        async def ping(self) -> bool:
-            raise RedisConnectionError("Error 111 connecting to nope:6379. Connection refused.")
-
     monkeypatch.setattr(redis_client, "_redis_singleton", _PingRefuses())
-    response = await client.get("/v1/health")
 
-    assert response.status_code == 200
-    assert response.json() == {"status": "degraded", "database": "ok", "redis": "unreachable"}
+    with capture_logs() as logs:
+        response = await client.get("/v1/health")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "unavailable"}
+    assert _unreachable(logs) == [("redis", "ConnectionError")]
 
 
-async def test_health_probes_redis_with_a_real_ping(
-    client, monkeypatch: pytest.MonkeyPatch
+async def test_health_is_unavailable_when_db_down(client, fake_redis, db_answers_with) -> None:
+    db_answers_with(_BoomSession())
+
+    with capture_logs() as logs:
+        response = await client.get("/v1/health")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "unavailable"}
+    assert _unreachable(logs) == [("database", "RuntimeError")]
+
+
+async def test_health_logs_every_dependency_that_is_down(
+    client, monkeypatch: pytest.MonkeyPatch, db_answers_with
 ) -> None:
-    # Constructing the client proves nothing — `redis.asyncio` connects lazily, which is
-    # why a probe that only calls `get_redis()` reports "ok" against a dead server. Pin
-    # that a command is actually issued.
-    pings: list[int] = []
+    db_answers_with(_BoomSession())
+    monkeypatch.setattr(redis_client, "_redis_singleton", _PingRefuses())
 
-    class _CountingPing:
+    with capture_logs() as logs:
+        response = await client.get("/v1/health")
+
+    assert response.status_code == 503
+    assert _unreachable(logs) == [("database", "RuntimeError"), ("redis", "ConnectionError")]
+
+
+async def test_a_probe_that_hangs_is_cut_off_at_the_ceiling(
+    client, monkeypatch: pytest.MonkeyPatch, db_answers_with
+) -> None:
+    class _HangingSession:
+        async def execute(self, *args: object, **kwargs: object) -> object:
+            await asyncio.sleep(30)
+            return None
+
+    class _HangingPing:
         async def ping(self) -> bool:
-            pings.append(1)
+            await asyncio.sleep(30)
             return True
 
-    monkeypatch.setattr(redis_client, "_redis_singleton", _CountingPing())
-    response = await client.get("/v1/health")
+    monkeypatch.setattr(health_router, "_PROBE_TIMEOUT_SECONDS", 0.05)
+    db_answers_with(_HangingSession())
+    monkeypatch.setattr(redis_client, "_redis_singleton", _HangingPing())
 
-    assert response.json()["redis"] == "ok"
-    assert pings == [1]
+    with capture_logs() as logs:
+        response = await asyncio.wait_for(client.get("/v1/health"), timeout=5)
 
-
-async def test_health_503_when_db_down(app, client, fake_redis) -> None:
-    # A DB failure must fail the probe CLOSED (503) so a platform health gate
-    # doesn't route traffic to an API that can't reach its database. Unchanged by the
-    # Redis field: a healthy Redis does not rescue a dead Postgres.
-    class _BoomSession:
-        async def execute(self, *args: object, **kwargs: object) -> object:
-            raise RuntimeError("db down")
-
-    async def _boom_db():
-        yield _BoomSession()
-
-    app.dependency_overrides[get_db] = _boom_db
-    try:
-        response = await client.get("/v1/health")
-    finally:
-        app.dependency_overrides.pop(get_db, None)
     assert response.status_code == 503
-    assert response.json() == {"status": "degraded", "database": "unreachable", "redis": "ok"}
+    assert _unreachable(logs) == [("database", "TimeoutError"), ("redis", "TimeoutError")]
 
 
 async def test_health_sets_security_headers(client) -> None:
