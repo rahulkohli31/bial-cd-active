@@ -210,8 +210,8 @@ describe('nginx.conf — the apps site routes /a/<key>/ by alias lookup or by co
   it('carries NO URI part on any app proxy_pass — a stray slash collapses every request to /', () => {
     // Inside a regex location nginx cannot know which part of the URI the location matched, so a
     // URI on a variable `proxy_pass` REPLACES the request path outright — a total routing collapse,
-    // the same failure the BACKEND_URL boot guard exists to prevent. The lookup's own pass is the one
-    // deliberate exception: it names the backend route in full.
+    // the same failure the BACKEND_URL boot guard exists to prevent. The two backend passes are the
+    // deliberate exception: each names its backend route in full.
     const passes = [...APPS.body.matchAll(/proxy_pass[ \t]+([^;]+);/g)].map((m) => m[1]!.trim())
     expect(passes.length).toBeGreaterThan(0)
     for (const pass of passes.filter((p) => !p.startsWith('${BACKEND_URL}'))) {
@@ -229,14 +229,17 @@ describe('nginx.conf — the apps site routes /a/<key>/ by alias lookup or by co
     expect(directiveValue(level, 'resolver_timeout')).toBe('5s')
   })
 
-  it('reaches the backend only through the internal alias lookup — an app must not reach the control plane', () => {
+  it('reaches the backend only through the alias lookup and the preview entry — an app must not reach the control plane', () => {
     expect(APPS.body).not.toMatch(/backend_upstream/)
     const naming = appsLocations.filter((l) => /BACKEND_URL/.test(l.body))
-    expect(naming).toHaveLength(1)
-    // Unreachable from a browser, and the secret travels in a header the edge itself sets.
-    expect(naming[0]!.header).toBe('= /__bial_route')
-    expect(naming[0]!.body).toMatch(/(?:^|\n)[ \t]*internal[ \t]*;/)
-    expect(naming[0]!.body).toMatch(/proxy_pass_request_headers[ \t]+off[ \t]*;/)
+    expect(naming.map((l) => l.header).sort()).toEqual(['= /__bial_enter', '= /__bial_route'])
+    // Neither forwards a browser header, and the secret travels in a header the edge itself sets.
+    for (const loc of naming) {
+      expect(loc.body).toMatch(/proxy_pass_request_headers[ \t]+off[ \t]*;/)
+    }
+    // The lookup is unreachable from a browser; the entry route is reachable by design.
+    const lookup = naming.find((l) => l.header === '= /__bial_route')
+    expect(lookup?.body).toMatch(/(?:^|\n)[ \t]*internal[ \t]*;/)
     expect(serverLevel(APPS)).not.toMatch(/BACKEND_URL|INTERNAL_ROUTE_TOKEN/)
     // …and the portal site is where the backend is otherwise named, so the above is a boundary
     // rather than an accident of the backend having moved somewhere else entirely.
@@ -401,8 +404,10 @@ describe('nginx.conf — the apps site serves no Next source and no Next dev end
     expect(pattern.test(`/a/sbx-${HEX28}` + '/_next/'.repeat(1100) + 'x')).toBe(false)
   })
 
-  it('hides the two headers that name the software behind an app', () => {
-    expect(hiddenHeaders(serverLevel(APPS))).toEqual(['Via', 'X-Powered-By'])
+  it('hides the headers that name the software behind an app or widen a service worker', () => {
+    expect(hiddenHeaders(serverLevel(APPS))).toEqual(['Service-Worker-Allowed', 'Via', 'X-Powered-By'])
+    // A location that declared its own would drop all three.
+    for (const loc of APPS_LOCATIONS) expect(loc.body).not.toMatch(/proxy_hide_header/)
   })
 })
 

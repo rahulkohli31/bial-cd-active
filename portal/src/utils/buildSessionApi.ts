@@ -261,6 +261,14 @@ export async function refreshSharedPreview(
 }
 
 /**
+ * A preview frame's first hop is the portal's hand-over, which reads the session cookie but cannot
+ * renew it, and a launch can outlast that cookie. Any authenticated read renews it on its 401.
+ */
+export async function renewSessionForPreview(deps: AuthFetchDeps = {}): Promise<void> {
+  await authFetch('/api/v1/auth/me', {}, deps)
+}
+
+/**
  * WHAT A STOP ACHIEVED — THREE NAMED STATES, never a boolean.
  *
  * The boolean this replaced hardcoded success on both branches, so a stop that had NOT

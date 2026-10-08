@@ -15,6 +15,7 @@ Everything Redis holds here is short-lived coordination state, not the system of
 | The per-user build lock | No — it lapses on its own even if nothing clears it |
 | The idle-session heartbeat | No |
 | The sandbox registry (which container is live for which user) | No |
+| Preview passes and the one-time tickets that issue them | No — losing them sends each browser through the portal once more to open its preview |
 
 The durable record of every project, application, conversation, submission and attachment lives
 in PostgreSQL and blob storage, never in Redis. Losing Redis interrupts builds in flight; it does

@@ -64,7 +64,7 @@ flowchart TD
   B -->|"interface"| P
   B -->|"API calls, via the edge"| P
   P --> A
-  P -.->|"resolves a preview's address"| A
+  P -.->|"resolves a preview's address and who may open it"| A
   A --> DB
   A --> R
   A --> O
@@ -77,7 +77,8 @@ flowchart TD
 
 Two edges in that picture matter more than they look. The browser reaches a running preview
 **without passing through the control plane** — the preview is framed from its own origin, and the
-portal edge only asks the control plane which container an address stands for. And a generated
+portal edge only asks the control plane which container an address stands for and whether the
+person asking may open it. And a generated
 application reaches its data **directly**, not through the control plane at all. Both are explained
 below.
 
@@ -220,16 +221,21 @@ alias, new for every container and never reused. The portal edge resolves it to 
 through an internal lookup that only the edge can call. An unknown or retired alias, and any
 address that names a container directly, shows the "app not available" page. A deployed
 application keeps its own permanent address, which is its public link, and its container is
-reachable only through the edge. That lookup is the one thing on the path that serves applications
-that reaches the control plane, and it never does for a deployed application: it sits outside the
-public API, is authenticated by a secret only the edge holds, and is not forwarded from the
-applications site, so an application cannot call the platform's own endpoints by convenience of
-being nearby (ADR-0033).
+reachable only through the edge. That lookup, and the entry route that issues a preview's pass, are
+the only things on the path that serves applications that reach the control plane, and neither does
+for a deployed application: they sit outside the public API, are authenticated by a secret only the
+edge holds, and are not forwarded from the applications site, so an application cannot call the
+platform's own endpoints by convenience of being nearby (ADR-0033).
 
-An alias hides an identifier; it is not a gate. Previews are shareable by design, so anyone holding
-a link opens the preview, and signing in is the application's own business. Code running in a
-container can still read its own Host header, which carries the container's name, and calls
-between containers inside the network do not pass the edge.
+**A preview opens only for the person running it.** The applications site cannot see the portal's
+sign-in, so the portal hands the browser a preview pass of its own through a one-time ticket that
+only the browser which asked for it can redeem. The lookup names the container only when the pass
+belongs to the person whose workspace runs the preview; anyone else, signed in or not, ends on "app
+not available". Signing out and suspension close previews through the revocation that already ends
+a session. The gate stops other people, not other applications: every application shares the
+applications site's origin. Code running in a container can still read its own Host header, which
+carries the container's name, and calls between containers inside the network do not pass the
+edge. A deployed application is not gated by any of this.
 
 **The edge sends a page's security headers once, and a preview's development surface not at
 all.** The portal edge owns the browser-facing security headers: what the control plane sets

@@ -18,6 +18,7 @@ import datetime
 import hashlib
 import ipaddress
 import os
+import secrets
 import socket
 import ssl
 import tempfile
@@ -33,10 +34,19 @@ from cryptography.x509.oid import NameOID
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _MAX_HEAD = 65536
 
-# As the backend's alias lookup: `alias:container` pairs, answered only to the right secret.
+# As the backend's alias lookup: `alias:container` pairs, answered only to the right secret and
+# opened only to the one known pass. Any other pass on a live alias is refused with a binding.
 _ROUTES = dict(pair.split(":") for pair in os.environ.get("STUB_ROUTES", "").split(",") if pair)
 _ROUTE_TOKEN = os.environ.get("STUB_ROUTE_TOKEN", "")
+_PASS = os.environ.get("STUB_PASS", "")
 _LOOKUP_PREFIX = "/internal/app-routes/"
+# As the backend's entry route: a redirect that sets the pass and clears the binding cookie.
+_ENTRY_PATH = "/internal/preview-pass"
+_ENTRY_LOCATION = "https://apps.bial.test/a/entered/"
+_ENTRY_COOKIES = (
+    "__Host-bial_pass=entered-pass; Path=/; Max-Age=43200; Secure; HttpOnly; SameSite=Lax",
+    "__Host-bial_handoff=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax",
+)
 
 
 def _mint_cert() -> tuple[str, str]:
@@ -135,9 +145,25 @@ def _handle(conn: ssl.SSLSocket) -> None:
             )
             # The headers the edge must ignore to cache at all: the real backend sets no-store.
             lines = "Cache-Control: no-store\r\nSet-Cookie: lookup=1\r\nVary: *\r\n"
-            if name:
+            if name and headers.get("x-preview-pass") == _PASS:
                 lines += f"X-App-Container: {name}\r\n"
+            elif name:
+                lines += f"X-Route-Denied: {secrets.token_hex(16)}\r\n"
             conn.sendall(f"HTTP/1.1 200 OK\r\n{lines}Content-Length: 0\r\n\r\n".encode())
+            return
+        if target.startswith(_ENTRY_PATH):
+            token_ok = int(headers.get("x-internal-route-token") == _ROUTE_TOKEN)
+            body = (
+                f"REQ={method}|{target}|HOST={headers.get('host', '')}"
+                f"|CK={headers.get('cookie', '')}|TICKET={headers.get('x-preview-ticket', '')}"
+                f"|BINDING={headers.get('x-preview-binding', '')}|TOKEN_OK={token_ok}\n"
+            ).encode()
+            cookies = "".join(f"Set-Cookie: {c}\r\n" for c in _ENTRY_COOKIES)
+            conn.sendall(
+                f"HTTP/1.1 302 Found\r\nLocation: {_ENTRY_LOCATION}\r\n{cookies}".encode()
+                + f"Content-Type: text/plain\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+                + body
+            )
             return
         status = 200
         extra_app = ""
@@ -145,6 +171,8 @@ def _handle(conn: ssl.SSLSocket) -> None:
             status = int(target.split("/__status/", 1)[1].split("/")[0].split("?")[0])
         if target.endswith("/__accel"):
             extra_app = "X-Accel-Redirect: /__bial_route\r\n"
+        if target.endswith("/sw.js"):
+            extra_app = "Service-Worker-Allowed: /\r\n"
         if target.endswith("/__redirect"):
             prefix = target.removesuffix("/__redirect")
             status = 302
