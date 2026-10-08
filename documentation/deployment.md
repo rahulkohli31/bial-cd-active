@@ -146,8 +146,9 @@ Work outward, and do not stop at the first green result.
 
 **1. The control plane is up and can reach its dependencies.** The health endpoint answers `ok`
 when the database and the cache both respond, and `unavailable` with a 503 when either does not.
-It does not say which one, because anyone can call it; the control plane's log names the failed
-dependency.
+It does not say which one; the control plane's log names the failed dependency. Ask it on the
+control plane's own address: the portal does not route it, and answers that the route does not
+exist.
 
 **2. The schema is current.** The health check cannot detect a missing migration. Confirm the
 database is at the revision this image expects.

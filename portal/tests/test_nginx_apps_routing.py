@@ -1135,3 +1135,12 @@ def test_the_gone_page_never_bounces_and_serves_the_readers_page(
     assert (status, "location" in got, got["__set_cookie_count"]) == (404, False, "0")
     assert words in body.lower()
     assert (PORTAL_ORIGIN in body) is (dest == "document")
+
+
+@pytest.mark.parametrize("target", ["/api/health", "/api/health/", "/api/v1/health"])
+def test_the_portal_does_not_route_the_control_planes_health(router: Router, target: str) -> None:
+    status, got, body = router.request(target, host="portal.bial.test")
+    assert (status, got["content-type"]) == (404, "application/json")
+    assert body == '{"detail":"This route does not exist"}'
+    status, _, body = router.request("/api/projects", host="portal.bial.test")
+    assert body.startswith("REQ=GET|/v1/projects|")
