@@ -41,11 +41,16 @@ async def test_the_right_browser_gets_a_pass_and_goes_where_it_asked(
     assert resp.status_code == 302
     assert resp.headers["location"] == f"{settings.APPS_BASE_URL}{RETURN_PATH}"
     cookies = _set_cookies(resp)
-    pass_line = cookies[PASS_COOKIE]
-    for attribute in ("HttpOnly", "Secure", "SameSite=lax", "Path=/"):
-        assert attribute.lower() in pass_line.lower()
-    assert "domain" not in pass_line.lower()
-    raw_pass = pass_line.split("=", 1)[1].split(";", 1)[0]
+    pass_lines = [
+        line for line in resp.headers.get_list("set-cookie") if line.startswith(f"{PASS_COOKIE}=")
+    ]
+    assert [("partitioned" in line.lower()) for line in pass_lines] == [False, True]
+    for pass_line in pass_lines:
+        for attribute in ("HttpOnly", "Secure", "SameSite=lax", "Path=/"):
+            assert attribute.lower() in pass_line.lower()
+        assert "domain" not in pass_line.lower()
+    raw_pass, other_slot = (line.split("=", 1)[1].split(";", 1)[0] for line in pass_lines)
+    assert raw_pass == other_slot
     record = await read_pass(raw_pass)
     assert record is not None
     assert record.user_id == user.id

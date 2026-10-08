@@ -979,8 +979,8 @@ _TICKET = "tIcKeT_0123456789-abcdefghijklmnopqrstuvwxy"
 def test_a_navigation_without_the_pass_goes_to_the_hand_over_with_one_binding_cookie(
     router: Router, target: str, cookie: str | None, rest: str
 ) -> None:
-    """Exactly one cookie: the routing cookie is never written for an app this person was
-    refused."""
+    """Only the binding, in both of the browser's slots: the routing cookie is never written for
+    an app this person was refused."""
     headers = {**_NAVIGATION, **({"Cookie": cookie} if cookie else {})}
     status, got, _ = router.request(target, headers=headers, preview_pass=None)
     assert status == 302
@@ -988,10 +988,10 @@ def test_a_navigation_without_the_pass_goes_to_the_hand_over_with_one_binding_co
     binding, _, tail = got["location"].removeprefix(_HANDOFF).partition("/")
     assert re.fullmatch(r"[0-9a-f]{32}", binding)
     assert tail == rest
-    assert got["__set_cookie_count"] == "1"
-    assert got["set-cookie"] == (
+    binding_cookie = (
         f"__Host-bial_handoff={binding}; Path=/; Max-Age=600; Secure; HttpOnly; SameSite=Lax"
     )
+    assert got["__set_cookies"].split("\n") == [binding_cookie, f"{binding_cookie}; Partitioned"]
     assert got["cache-control"] == "no-store"
 
 
@@ -1044,6 +1044,17 @@ def test_no_app_is_sent_the_edges_own_cookies_and_each_keeps_its_own(
     )
     assert status == 200
     assert _fields(body)["CK"] == "theme=dark; lang=en"
+
+
+def test_planted_look_alikes_never_carry_the_routing_cookie_through(router: Router) -> None:
+    """An app can plant any number of the unprefixed name, and none of them may spend a strip the
+    real routing cookie needs: it names the last app this browser opened."""
+    cookie = (
+        f"__Host-bial_pass={PASS}; __Host-bial_app={ALIAS}; bial_app=x; bial_app=y; theme=dark"
+    )
+    status, _, body = router.request(f"/a/{ALIAS}/", headers={"Cookie": cookie}, preview_pass=None)
+    assert status == 200
+    assert ALIAS not in _fields(body)["CK"]
 
 
 def test_a_found_answer_is_cached_per_pass_and_never_served_to_another(router: Router) -> None:

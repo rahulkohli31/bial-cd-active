@@ -150,14 +150,18 @@ async def enter_preview(
         _log.error(ENTRY_FAILED_EVENT, exc_info=True)
         return apps_site_redirect(GONE_PATH)
     response = apps_site_redirect(ticket.return_path)
-    response.set_cookie(
-        PASS_COOKIE,
-        raw_pass,
-        max_age=pass_ttl_seconds(),
-        path="/",
-        secure=True,
-        httponly=True,
-        samesite="lax",
-    )
+    # In both of the browser's slots, so a copy an app planted in the partitioned one is never the
+    # one the edge reads.
+    for partitioned in (False, True):
+        response.set_cookie(
+            PASS_COOKIE,
+            raw_pass,
+            max_age=pass_ttl_seconds(),
+            path="/",
+            secure=True,
+            httponly=True,
+            samesite="lax",
+            partitioned=partitioned,
+        )
     response.delete_cookie(HANDOFF_COOKIE, path="/", secure=True, httponly=True, samesite="lax")
     return response
