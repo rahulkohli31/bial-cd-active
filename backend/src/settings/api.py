@@ -74,10 +74,10 @@ class ApiSettings(CoreSettings):
     # weeks later, from the one person least able to escalate it.
     SUPPORT_CONTACT_EMAIL: str
 
-    # WHAT THE PORTAL EDGE PRESENTS to the internal alias lookup, the one route that answers
-    # without a user. The portal carries the same value under the same name, so rotating it is a
-    # coordinated restart of both. No default: a backend with nothing to refuse a caller against
-    # must not start.
+    # WHAT THE PORTAL EDGE PRESENTS to the internal alias lookup and the preview entry route, the
+    # two routes it calls on a browser's behalf. The portal carries the same value under the same
+    # name, so rotating it is a coordinated restart of both. No default: a backend with nothing to
+    # refuse a caller against must not start.
     INTERNAL_ROUTE_TOKEN: SecretStr = Field(min_length=32)
 
     # ============================================================ REQUIRED IN PRODUCTION

@@ -27,8 +27,10 @@ import structlog
 from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import APIRouter, Depends, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from redis.exceptions import RedisError
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DbSession
@@ -65,6 +67,13 @@ from src.services.auth.oidc import (
     identity_from_browser,
     pending_redemption,
 )
+from src.services.auth.preview_pass import (
+    ENTRY_PATH,
+    GONE_PATH,
+    IS_BINDING,
+    apps_site_redirect,
+    mint_ticket,
+)
 from src.services.auth.refresh import (
     hash_refresh_token,
     issue_new_family,
@@ -73,6 +82,8 @@ from src.services.auth.refresh import (
 )
 from src.services.auth.session_jwt import decode_session_jwt, mint_session_jwt
 from src.services.rbac.roles import is_super_duper_admin
+from src.services.redis import RedisNotConfiguredError, get_redis, registry_key
+from src.services.redis.keys import IS_ALIAS, REGISTRY_FIELD_ALIAS
 from src.services.usage.limits import effective_limits_for
 
 logger = structlog.get_logger()
@@ -567,7 +578,7 @@ async def _user_from_session_cookie(
 ) -> User | None:
     """Best-effort identity from the session cookie (returns None instead of
     raising). Used by logout, which must proceed to CLEAR cookies even when there
-    is no live session to identify.
+    is no live session to identify, and by the preview hand-over.
 
     `verify_exp=False` accepts a validly-signed but EXPIRED session cookie so an
     idle-window logout can still resolve the owner FOR REVOCATION ONLY — never to
@@ -626,3 +637,70 @@ async def logout(request: Request, db: DbSession) -> Response:
     response = JSONResponse(LogoutResponse(status="logged_out").model_dump())
     _clear_session_cookies(response)
     return response
+
+
+# --- preview hand-over (ADR-0033) ------------------------------------------------
+
+_FRAMED_DESTINATIONS: Final = frozenset({"iframe", "frame"})
+_RETURN_PATH_CEILING: Final = 2048
+# A path that could leave the preview, and any control character anywhere in the address. A
+# query may carry `//` (a return link of the app's own); the redirect is absolute on the apps site.
+_LEAVES_THE_PREVIEW: Final = re.compile(r"//|\\")
+_CONTROL_CHARACTER: Final = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _preview_return_path(request: Request, binding: str, alias: str) -> str | None:
+    """Where the browser goes back to: always under `/a/<alias>/`, read from the raw request so
+    nothing is decoded on the way, or `None` for anything that could leave the preview. A keyless
+    path is prefixed with its alias, the same address the edge proxies it to."""
+    raw_path: bytes = request.scope.get("raw_path") or request.url.path.encode()
+    path_only = raw_path.decode("latin-1").split("?", 1)[0]
+    _, _, rest = path_only.partition(f"/{binding}/{alias}")
+    base = f"/a/{alias}"
+    path = rest if rest == base or rest.startswith(f"{base}/") else f"{base}{rest or '/'}"
+    query = request.scope.get("query_string", b"").decode("latin-1")
+    target = f"{path}?{query}" if query else path
+    if (
+        len(target) > _RETURN_PATH_CEILING
+        or _LEAVES_THE_PREVIEW.search(path)
+        or _CONTROL_CHARACTER.search(target)
+    ):
+        return None
+    return target
+
+
+@router.get("/preview-handoff/{binding}/{alias}/{rest:path}", include_in_schema=False)
+async def preview_handoff(request: Request, db: DbSession, binding: str, alias: str) -> Response:
+    """The portal-site half of opening a preview: the apps site sends a browser here with no pass
+    it accepts, and this route answers with a one-time ticket only for the person whose workspace
+    runs the preview. It never sends anyone to sign-in itself, so a preview tab reloading after a
+    sign-out cannot start a session on its own, and a frame never meets a sign-in page."""
+    fetch_mode = request.headers.get("sec-fetch-mode")
+    if fetch_mode is not None and fetch_mode != "navigate":
+        return Response(status_code=400)
+    if not IS_BINDING.fullmatch(binding) or not IS_ALIAS.fullmatch(alias):
+        return apps_site_redirect(GONE_PATH)
+    return_path = _preview_return_path(request, binding, alias)
+    if return_path is None:
+        return apps_site_redirect(GONE_PATH)
+    try:
+        user = await _user_from_session_cookie(request, db)
+        if user is None:
+            if request.headers.get("sec-fetch-dest") in _FRAMED_DESTINATIONS:
+                return apps_site_redirect(GONE_PATH)
+            return RedirectResponse(settings.FRONTEND_URL, status_code=302)
+        if user.suspended_at is not None:
+            return apps_site_redirect(GONE_PATH)
+        held_alias = await get_redis().hget(registry_key(user.id), REGISTRY_FIELD_ALIAS)
+        if held_alias != alias:
+            return apps_site_redirect(GONE_PATH)
+        ticket = await mint_ticket(
+            user_id=user.id,
+            token_version=user.token_version,
+            binding=binding,
+            return_path=return_path,
+        )
+    except RedisError, RedisNotConfiguredError, SQLAlchemyError:
+        logger.error("preview_handoff_failed", exc_info=True)
+        return apps_site_redirect(GONE_PATH)
+    return apps_site_redirect(f"{ENTRY_PATH}?ticket={ticket}")

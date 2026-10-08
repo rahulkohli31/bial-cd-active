@@ -22,6 +22,10 @@ reserved for sandbox LIFECYCLE state, a fleet sweep scans it and deletes Azure c
 strength of what it finds, and a family of file blobs sitting in the middle of that would be
 read by a reader who assumed everything below `sandbox:` describes a container.
 
+A THIRD DOMAIN, `bial:{environment}:preview:`, holds the preview pass and the hand-over ticket
+that let one person into their own preview (ADR-0033). They describe a person's access, not a
+container, so they stay out of `sandbox:` for the same reason the lake does.
+
 One more family, taskiq's queue in `src/broker.py`, sits under `bial:` but outside `sandbox:` —
 `bial:{env}:taskiq:stream`, where those braces are a literal Redis hash tag, not a placeholder.
 Only the library-derived `autoclaim:<group>:<stream>` lock has a literal prefix outside `bial:`.
@@ -59,6 +63,9 @@ KEY_DOMAIN: Final = "sandbox:"
 # contents are read as claims about containers.
 KEY_DOMAIN_LAKE: Final = "lake:"
 
+# The preview access domain segment, also a peer of `sandbox:`.
+KEY_DOMAIN_PREVIEW: Final = "preview:"
+
 # The legacy root, from before the environment segment was added to sandbox keys, frozen as
 # HISTORY rather than taste: it is what the live fleet was registered under, so a typo here
 # silently un-reaches every container the dual-read exists to keep visible.
@@ -81,6 +88,9 @@ FAMILY_ALIAS: Final = "alias"
 # sorted set that orders every copied file by when it was copied, and is what the trim walks.
 FAMILY_LAKE_FILE: Final = "file"
 FAMILY_LAKE_INDEX: Final = "index"
+
+FAMILY_PREVIEW_PASS: Final = "pass"
+FAMILY_PREVIEW_TICKET: Final = "ticket"
 
 
 def _environment() -> str:
@@ -270,6 +280,27 @@ def lake_index_key() -> str:
     summing what is actually indexed, rather than kept in a counter that can drift away from the
     thing it counts."""
     return f"{lake_key_prefix()}{FAMILY_LAKE_INDEX}"
+
+
+# --- preview access (domain `preview:`) ---------------------------------------
+
+
+def _preview_key(family: str, digest: str) -> str:
+    """Keyed by the sha256 hex of the raw value, so the value itself is never in a key name."""
+    if not IS_SHA256_HEX.fullmatch(digest):
+        raise ValueError("a preview key is built from a sha256 hex digest, never a raw value")
+    return f"{KEY_ROOT}{_environment()}:{KEY_DOMAIN_PREVIEW}{family}:{digest}"
+
+
+def preview_pass_key(digest: str) -> str:
+    """`bial:{env}:preview:pass:{digest}` — one preview pass's record (TTL mandatory)."""
+    return _preview_key(FAMILY_PREVIEW_PASS, digest)
+
+
+def preview_ticket_key(digest: str) -> str:
+    """`bial:{env}:preview:ticket:{digest}` — one hand-over ticket, consumed on first read
+    (TTL mandatory)."""
+    return _preview_key(FAMILY_PREVIEW_TICKET, digest)
 
 
 def registry_scan_patterns() -> tuple[str, ...]:

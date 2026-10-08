@@ -54,11 +54,15 @@ SHR_ALIAS = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
 GHOST_ALIAS = "deadbeefdeadbeefdeadbeefdeadbeef"
 # Well-formed and known to nobody: what a retired or never-minted alias looks like.
 UNKNOWN_ALIAS = "abcdefabcdefabcdefabcdefabcdefab"
-# The alias whose container is up in DNS but not serving, and one used only by the cache test.
+# The alias whose container is up in DNS but not serving, and two used only by the cache tests.
 DEAD_ALIAS = "11111111111111111111111111111111"
 CACHE_ALIAS = "22222222222222222222222222222222"
+OWNER_CACHE_ALIAS = "33333333333333333333333333333333"
 # The shared secret the stub's lookup answers to.
 ROUTE_TOKEN = "test-internal-route-token-0123456789abcdef"  # noqa: S105 - a test fixture, not a secret
+# The one preview pass the stub's lookup accepts, and a well-formed one it refuses.
+PASS = "0wnerPass_0123456789-abcdefghijklmnopqrstuv"  # noqa: S105 - a test fixture, not a secret
+OTHER_PASS = "otherPass_0123456789-abcdefghijklmnopqrstuv"  # noqa: S105 - a test fixture
 STUB_ROUTES = ",".join(
     f"{alias}:{name}"
     for alias, name in [
@@ -68,6 +72,7 @@ STUB_ROUTES = ",".join(
         (GHOST_ALIAS, GHOST_KEY),
         (DEAD_ALIAS, "sbx-" + "1" * 28),
         (CACHE_ALIAS, OTHER_SBX_KEY),
+        (OWNER_CACHE_ALIAS, OTHER_SBX_KEY),
     ]
 )
 # The stub answers for the portal's backend hop under this name too.
@@ -111,6 +116,15 @@ def _free_port() -> int:
     return port
 
 
+def _with_pass(headers: dict[str, str] | None, preview_pass: str | None) -> dict[str, str]:
+    """The request's headers with the preview pass appended to its Cookie, unless opted out."""
+    out = dict(headers or {})
+    if preview_pass is not None:
+        cookie = f"__Host-bial_pass={preview_pass}"
+        out["Cookie"] = f"{out['Cookie']}; {cookie}" if out.get("Cookie") else cookie
+    return out
+
+
 @dataclass
 class Router:
     """The router under test, addressed from the host over a published port."""
@@ -126,16 +140,17 @@ class Router:
         method: str = "GET",
         headers: dict[str, str] | None = None,
         body: bytes | None = None,
+        preview_pass: str | None = PASS,
     ) -> tuple[int, dict[str, str], str]:
         """One HTTP request. Returns (status, headers-lowercased, body-as-text).
 
         `http.client` is used rather than a higher-level client on purpose: it sends the
         request target BYTE FOR BYTE as given, so a test can drive `/a/<key>/../` and see where
         nginx's own normalization lands it. Most clients would normalize that away first and
-        quietly assert nothing.
+        quietly assert nothing. The known preview pass rides along unless `preview_pass` is None.
         """
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
-        hdrs = {"Host": host, **(headers or {})}
+        hdrs = {"Host": host, **_with_pass(headers, preview_pass)}
         try:
             conn.request(method, target, body=body, headers=hdrs)
             resp = conn.getresponse()
@@ -144,6 +159,7 @@ class Router:
             # getheaders() collapses repeats; keep every Set-Cookie for the "exactly one" test.
             cookies = resp.headers.get_all("Set-Cookie") or []
             got["__set_cookie_count"] = str(len(cookies))
+            got["__set_cookies"] = "\n".join(cookies)
             # And every other header's count, for the "each security header exactly once" tests.
             for name in {k.lower() for k, _ in resp.getheaders()}:
                 got[f"__count:{name}"] = str(len(resp.headers.get_all(name) or []))
@@ -152,7 +168,12 @@ class Router:
             conn.close()
 
     def websocket(
-        self, target: str, *, host: str = APPS_HOSTNAME, headers: dict[str, str] | None = None
+        self,
+        target: str,
+        *,
+        host: str = APPS_HOSTNAME,
+        headers: dict[str, str] | None = None,
+        preview_pass: str | None = PASS,
     ) -> tuple[int, str]:
         """Attempt a real RFC 6455 upgrade. Returns (status, raw response head).
 
@@ -169,7 +190,7 @@ class Router:
             f"Sec-WebSocket-Key: {key}",
             "Sec-WebSocket-Version: 13",
         ]
-        lines += [f"{k}: {v}" for k, v in (headers or {}).items()]
+        lines += [f"{k}: {v}" for k, v in _with_pass(headers, preview_pass).items()]
         raw = ("\r\n".join(lines) + "\r\n\r\n").encode()
         sock = socket.create_connection(("127.0.0.1", self.port), timeout=20)
         try:

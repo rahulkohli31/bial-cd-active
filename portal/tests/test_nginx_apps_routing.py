@@ -11,6 +11,8 @@ all leave `nginx -t` green and all pass a structural assertion.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from _router import (
     ALIAS,
@@ -21,7 +23,10 @@ from _router import (
     DEAD_ALIAS,
     GHOST_ALIAS,
     OTHER_ALIAS,
+    OTHER_PASS,
     OTHER_SBX_KEY,
+    OWNER_CACHE_ALIAS,
+    PASS,
     PORTAL_ORIGIN,
     PUB_KEY,
     ROUTE_TOKEN,
@@ -947,3 +952,206 @@ def test_a_backend_that_cannot_answer_reads_as_app_not_available_and_spares_publ
     )
     assert (status, "REQ=" in body) == (404, False)
     assert router_without_backend.request(f"/a/{PUB_KEY}/")[0] == 200
+
+
+# --------------------------------------------------------------------------------------
+# the preview pass
+# --------------------------------------------------------------------------------------
+
+_NAVIGATION = {
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Site": "none",
+}
+_FETCH = {"Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty", "Sec-Fetch-Site": "same-origin"}
+_HANDOFF = f"{PORTAL_ORIGIN}/api/v1/auth/preview-handoff/"
+_BINDING = "ab" * 16
+_TICKET = "tIcKeT_0123456789-abcdefghijklmnopqrstuvwxy"
+
+
+@pytest.mark.parametrize(
+    ("target", "cookie", "rest"),
+    [
+        (f"/a/{ALIAS}/page?tab=1", None, f"{ALIAS}/a/{ALIAS}/page?tab=1"),
+        ("/reports?tab=1", f"__Host-bial_app={ALIAS}", f"{ALIAS}/reports?tab=1"),
+    ],
+)
+def test_a_navigation_without_the_pass_goes_to_the_hand_over_with_one_binding_cookie(
+    router: Router, target: str, cookie: str | None, rest: str
+) -> None:
+    """Only the binding, in both of the browser's slots: the routing cookie is never written for
+    an app this person was refused."""
+    headers = {**_NAVIGATION, **({"Cookie": cookie} if cookie else {})}
+    status, got, _ = router.request(target, headers=headers, preview_pass=None)
+    assert status == 302
+    assert got["location"].startswith(_HANDOFF)
+    binding, _, tail = got["location"].removeprefix(_HANDOFF).partition("/")
+    assert re.fullmatch(r"[0-9a-f]{32}", binding)
+    assert tail == rest
+    binding_cookie = (
+        f"__Host-bial_handoff={binding}; Path=/; Max-Age=600; Secure; HttpOnly; SameSite=Lax"
+    )
+    assert got["__set_cookies"].split("\n") == [binding_cookie, f"{binding_cookie}; Partitioned"]
+    assert got["cache-control"] == "no-store"
+
+
+def test_a_fetch_without_the_pass_is_not_available_and_never_bounced(router: Router) -> None:
+    """A fetch cannot follow a sign-in, so it gets the page rather than a portal address."""
+    status, got, body = router.request(f"/a/{ALIAS}/api/items", headers=_FETCH, preview_pass=None)
+    assert (status, "REQ=" in body, "not available" in body.lower()) == (404, False, True)
+    assert (got["__set_cookie_count"], "location" in got) == ("0", False)
+    status, _, body = router.request(f"/a/{ALIAS}/api/items", headers=_FETCH)
+    assert (status, _target(body)) == (200, f"/a/{ALIAS}/api/items")
+
+
+def test_a_websocket_without_the_pass_is_refused_and_never_bounced(router: Router) -> None:
+    """Chromium sends no Fetch Metadata on a handshake, so only `Upgrade` keeps it from
+    bouncing."""
+    status, head = router.websocket(f"/a/{ALIAS}/_next/webpack-hmr", preview_pass=None)
+    assert status == 404, head
+    assert "location:" not in head.lower()
+    status, head = router.websocket(f"/a/{ALIAS}/_next/webpack-hmr")
+    assert status == 101, head
+
+
+@pytest.mark.parametrize(
+    "cookie",
+    [
+        f"__Host-bial_pass={PASS}; theme=dark; __Host-bial_handoff={_BINDING}; lang=en; "
+        f"__Host-bial_app={ALIAS}",
+        f"__Host-bial_app={ALIAS}; theme=dark; __Host-bial_handoff={_BINDING}; lang=en; "
+        f"__Host-bial_pass={PASS}",
+        # A second, partitioned copy of each beside the ordinary one.
+        f"__Host-bial_pass={PASS}; __Host-bial_app={ALIAS}; theme=dark; "
+        f"__Host-bial_handoff={_BINDING}; __Host-bial_pass={OTHER_PASS}; lang=en; "
+        f"__Host-bial_handoff={_BINDING}; __Host-bial_app={ALIAS}",
+    ],
+)
+@pytest.mark.parametrize(
+    ("target", "headers"),
+    [
+        (f"/a/{ALIAS}/", {}),
+        (f"/a/{PUB_KEY}/", {}),
+        ("/api/items", {"Referer": f"https://{APPS_HOSTNAME}/a/{ALIAS}/"}),
+    ],
+)
+def test_no_app_is_sent_the_edges_own_cookies_and_each_keeps_its_own(
+    router: Router, cookie: str, target: str, headers: dict[str, str]
+) -> None:
+    """An app that read the pass could open its holder's previews from anywhere."""
+    status, _, body = router.request(
+        target, headers={**headers, "Cookie": cookie}, preview_pass=None
+    )
+    assert status == 200
+    assert _fields(body)["CK"] == "theme=dark; lang=en"
+
+
+def test_planted_look_alikes_never_carry_the_routing_cookie_through(router: Router) -> None:
+    """An app can plant any number of the unprefixed name, and none of them may spend a strip the
+    real routing cookie needs: it names the last app this browser opened."""
+    cookie = (
+        f"__Host-bial_pass={PASS}; __Host-bial_app={ALIAS}; bial_app=x; bial_app=y; theme=dark"
+    )
+    status, _, body = router.request(f"/a/{ALIAS}/", headers={"Cookie": cookie}, preview_pass=None)
+    assert status == 200
+    assert ALIAS not in _fields(body)["CK"]
+
+
+def test_a_found_answer_is_cached_per_pass_and_never_served_to_another(router: Router) -> None:
+    """Cached by the alias alone, the owner's yes would open the preview to anyone for a
+    minute."""
+    assert router.request(f"/a/{OWNER_CACHE_ALIAS}/one", headers=_FETCH)[0] == 200
+    assert router.request(f"/a/{OWNER_CACHE_ALIAS}/two", headers=_FETCH)[0] == 200
+    status, _, body = router.request(
+        f"/a/{OWNER_CACHE_ALIAS}/three",
+        headers={**_FETCH, "Cookie": f"__Host-bial_pass={OTHER_PASS}"},
+        preview_pass=None,
+    )
+    assert (status, "REQ=" in body) == (404, False)
+    one, two, three = _log_lines(router, f"/a/{OWNER_CACHE_ALIAS}/")
+    assert "alias_cache=MISS" in one and "denied=-" in one
+    assert "alias_cache=HIT" in two and "denied=-" in two
+    assert "alias_cache=MISS" in three and "denied=1" in three
+    # The flag, never the binding: the only 32-hex value on the line is the alias.
+    assert set(re.findall(r"[0-9a-f]{32}", three)) == {OWNER_CACHE_ALIAS}
+
+
+def test_the_entry_route_forwards_only_the_ticket_and_binding_and_never_logs_the_ticket(
+    router: Router, router_without_backend: Router
+) -> None:
+    status, got, body = router.request(
+        f"/__bial_enter?ticket={_TICKET}",
+        headers={**_NAVIGATION, "Cookie": f"theme=dark; __Host-bial_handoff={_BINDING}"},
+    )
+    assert status == 302
+    assert got["location"] == "https://apps.bial.test/a/entered/"
+    assert got["__set_cookies"].split("\n") == [
+        "__Host-bial_pass=entered-pass; Path=/; Max-Age=43200; Secure; HttpOnly; SameSite=Lax",
+        "__Host-bial_handoff=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax",
+    ]
+    fields = _fields(body)
+    assert _target(body) == "/internal/preview-pass"
+    assert (fields["TICKET"], fields["BINDING"], fields["TOKEN_OK"]) == (_TICKET, _BINDING, "1")
+    assert (fields["HOST"], fields["CK"]) == (BACKEND_ALIAS, "")
+    lines = _log_lines(router, "/__bial_enter")
+    assert lines
+    assert all("ticket" not in ln and _TICKET not in ln for ln in lines)
+
+    # A backend that cannot answer ends on the gone page, still without the ticket in the log.
+    status, got, _ = router_without_backend.request(f"/__bial_enter?ticket={_TICKET}")
+    assert (status, got.get("location")) == (302, f"https://{APPS_HOSTNAME}/__bial_gone")
+    lines = _log_lines(router_without_backend, "/__bial_enter")
+    assert lines
+    assert all("ticket" not in ln and _TICKET not in ln for ln in lines)
+
+
+@pytest.mark.parametrize(
+    ("target", "headers"),
+    [
+        ("/sw.js", {"Referer": f"https://{APPS_HOSTNAME}/a/{ALIAS}/"}),
+        (f"/a/{ALIAS}", {}),
+        (f"/a%2F{PUB_KEY}%2Fsw.js", {}),
+    ],
+)
+def test_a_worker_script_outside_an_apps_own_address_is_refused(
+    router: Router, target: str, headers: dict[str, str]
+) -> None:
+    """Registered from the root it would see every app and the entry route; from `/a/<key>`,
+    every app."""
+    worker = {"Service-Worker": "script", "Sec-Fetch-Dest": "serviceworker", **headers}
+    status, _, body = router.request(target, headers=worker)
+    assert (status, "REQ=" in body) == (404, False)
+    status, _, body = router.request(target, headers=headers)
+    assert (status, body.startswith("REQ=")) == (200, True)
+
+
+def test_a_worker_script_inside_an_apps_address_is_served_without_a_wider_scope(
+    router: Router,
+) -> None:
+    status, got, body = router.request(f"/a/{ALIAS}/sw.js", headers={"Service-Worker": "script"})
+    assert (status, _target(body)) == (200, f"/a/{ALIAS}/sw.js")
+    assert "service-worker-allowed" not in got
+    # The stub does send it: the portal site, which does not hide it, passes it through.
+    _, got, _ = router.request("/apps/sw.js", host="portal.bial.test")
+    assert got["service-worker-allowed"] == "/"
+
+
+@pytest.mark.parametrize(("dest", "words"), [("document", "not available"), ("iframe", "running")])
+def test_the_gone_page_never_bounces_and_serves_the_readers_page(
+    router: Router, dest: str, words: str
+) -> None:
+    status, got, body = router.request(
+        "/__bial_gone", headers={**_NAVIGATION, "Sec-Fetch-Dest": dest}, preview_pass=None
+    )
+    assert (status, "location" in got, got["__set_cookie_count"]) == (404, False, "0")
+    assert words in body.lower()
+    assert (PORTAL_ORIGIN in body) is (dest == "document")
+
+
+@pytest.mark.parametrize("target", ["/api/health", "/api/health/", "/api/v1/health"])
+def test_the_portal_does_not_route_the_control_planes_health(router: Router, target: str) -> None:
+    status, got, body = router.request(target, host="portal.bial.test")
+    assert (status, got["content-type"]) == (404, "application/json")
+    assert body == '{"detail":"This route does not exist"}'
+    status, _, body = router.request("/api/projects", host="portal.bial.test")
+    assert body.startswith("REQ=GET|/v1/projects|")
