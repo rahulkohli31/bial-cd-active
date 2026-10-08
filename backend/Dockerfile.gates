@@ -52,11 +52,11 @@ RUN test -d tests && test -d alembic || (echo "gate context is missing tests/ or
 
 # WHAT THIS LANE CANNOT COVER, stated so nobody rediscovers it as a mystery failure.
 #
-# The build context is `backend/`, so nothing outside it exists in the image. Twelve test modules
-# reach across: into `sandbox/` (the supervisor's allowlist, the golden template, the workspace
-# git scripts run under the image's exclude file), into `portal/` (copy and fixtures the backend
-# must match word for word), or over the whole repository (the guards that a retired name stays
-# gone). They therefore CANNOT pass here — not because anything is broken, but because the tree
+# The build context is `backend/`, so nothing outside it exists in the image. Fourteen test
+# modules reach across: into `sandbox/` (the supervisor's allowlist, the golden template, the
+# workspace git scripts run under the image's exclude file, the analysis reader's copy), into
+# `portal/` (copy and fixtures the backend must match word for word), or over the whole
+# repository (the guards that a retired name stays gone). They therefore CANNOT pass here — not because anything is broken, but because the tree
 # they inspect was never copied in. They are deselected BY NAME rather than left to fail: a lane
 # that is expected to be red teaches people to ignore red. One reads a portal fixture while it is
 # collected, so it is ignored rather than deselected. They still run in the host lane, which has
@@ -75,6 +75,7 @@ uv run pytest -q \
 --ignore tests/services/deploy/test_gate_decision.py \
 --deselect tests/api/v1/attachments/test_lane_sentences_match_the_portal.py \
 --deselect tests/api/v1/deploy/test_save_at_send_is_gone.py \
+--deselect tests/services/analysis/test_reader_copy_is_identical.py \
 --deselect tests/services/build_sessions/test_appconnector_env.py::test_azures_own_identity_pair_is_on_the_allowlist_too \
 --deselect tests/services/build_sessions/test_appconnector_env.py::test_every_generated_name_is_on_the_supervisors_allowlist \
 --deselect tests/services/build_sessions/test_workspace_scripts.py \
@@ -86,6 +87,7 @@ uv run pytest -q \
 --deselect tests/services/orchestrator/test_tools.py::test_the_migrate_failure_markers_match_the_script_that_prints_them \
 --deselect tests/services/sandbox/test_client.py::test_configure_names_exactly_what_the_supervisor_takes \
 --deselect tests/services/turns/test_end_reasons.py::test_the_copy_table_is_total_over_the_union \
+--deselect tests/services/turns/test_ceiling_sentence_matches_the_portal.py \
 --deselect tests/services/turns/test_end_reasons.py::test_the_portal_names_every_ending_the_server_can_store \
 --deselect tests/test_connector_naming_is_generic.py \
 --deselect tests/test_manual_go_live_is_gone.py \

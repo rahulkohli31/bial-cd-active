@@ -793,3 +793,39 @@ def test_sample_env_redis_keys_all_map_to_a_declared_field(sample: str) -> None:
     assert referenced <= declared, (
         f"{sample} names REDIS__* keys with no RedisConfig field: {referenced - declared}"
     )
+
+
+_ANALYSIS = {
+    "pool_endpoint": "https://centralindia.dynamicsessions.io/subscriptions/s/resourceGroups/rg/"
+    "sessionPools/p"
+}
+
+
+def test_analysis_is_optional_in_production_too() -> None:
+    assert Settings.model_fields["analysis"].default is None
+    assert _prod_settings(analysis=None).analysis is None
+
+
+def test_an_analysis_block_validates_when_present() -> None:
+    analysis = _settings(analysis=_ANALYSIS).analysis
+    assert analysis is not None
+    assert analysis.pool_endpoint == _ANALYSIS["pool_endpoint"]
+
+
+def test_an_analysis_block_without_an_endpoint_fails_at_startup() -> None:
+    with pytest.raises(ValidationError):
+        _settings(analysis={})
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["http://centralindia.dynamicsessions.io/x", "https://centralindia.dynamicsessions.io", "p"],
+)
+def test_an_analysis_endpoint_that_is_not_a_pool_url_fails_at_startup(endpoint: str) -> None:
+    with pytest.raises(ValidationError):
+        _settings(analysis={"pool_endpoint": endpoint})
+
+
+def test_analysis_rejects_unknown_nested_key() -> None:
+    with pytest.raises(ValidationError):
+        _settings(analysis={**_ANALYSIS, "cooldown": "1200"})

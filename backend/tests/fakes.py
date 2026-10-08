@@ -289,11 +289,14 @@ class FakeAnalysisRuntime:
     A call on an unknown identifier opens an empty session, as the service does. `remove` is
     Azure deleting an idle session. `unavailable` fails every call; `run_times_out` fails every
     run with the deadline; `hold_runs` parks each run until it is cleared. `handle_run` decides
-    what a run prints. `calls` records `(operation, session_id)` in order and `runs` the code."""
+    what a run prints. `calls` records `(operation, session_id)` in order, `uploads` and
+    `deletions` the `(session_id, name)` of each file call, and `runs` the code."""
 
     files: dict[str, dict[str, bytes]] = field(default_factory=dict)
     stamps: dict[str, dict[str, str]] = field(default_factory=dict)
     calls: list[tuple[str, str]] = field(default_factory=list)
+    uploads: list[tuple[str, str]] = field(default_factory=list)
+    deletions: list[tuple[str, str]] = field(default_factory=list)
     runs: list[tuple[str, str]] = field(default_factory=list)
     unavailable: bool = False
     run_times_out: bool = False
@@ -330,11 +333,13 @@ class FakeAnalysisRuntime:
 
     async def upload_file(self, session_id: str, name: str, data: bytes) -> None:
         self._enter("upload_file", session_id)[name] = data
+        self.uploads.append((session_id, name))
         self._uploads += 1
         self.stamps[session_id][name] = f"stamp-{self._uploads}"
 
     async def delete_file(self, session_id: str, name: str) -> None:
         self._enter("delete_file", session_id).pop(name, None)
+        self.deletions.append((session_id, name))
         self.stamps[session_id].pop(name, None)
 
     async def run(self, session_id: str, code: str, *, timeout_s: float) -> Execution:

@@ -79,6 +79,8 @@ class DynamicSessionsRuntime:
         started = time.monotonic()
         status: int | None = None
         try:
+            if self._http.is_closed:
+                raise AnalysisUnavailableError(f"{operation}: client closed")
             try:
                 bearer = await self._token()
             except Exception as exc:
