@@ -17,6 +17,10 @@ from typing import Protocol
 SESSION_FILES_DIR = "/mnt/data"
 """Where an uploaded file lands inside a session, and the interpreter's working directory."""
 
+READER_NAME = "read_attachment.py"
+"""The reader's name in the session. Uploaded on every placement, so a copy that code in the
+session altered is replaced before the reply reads anything."""
+
 
 class AnalysisUnavailableError(RuntimeError):
     """The session could not be reached or refused the call: any non-2xx, a transport error, or a
@@ -39,11 +43,13 @@ class SessionFile:
 
 @dataclass(frozen=True, slots=True)
 class Execution:
-    """What one run of code produced. `succeeded` is false when the code raised."""
+    """What one run of code produced. `succeeded` is false when the code raised;
+    `out_of_memory` when it ran out, and the session lost its variables with it."""
 
     succeeded: bool
     stdout: str
     stderr: str
+    out_of_memory: bool = False
 
 
 class AnalysisRuntime(Protocol):

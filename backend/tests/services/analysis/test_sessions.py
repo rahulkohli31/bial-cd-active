@@ -53,8 +53,15 @@ def test_a_conversation_is_named_by_its_id_in_hex() -> None:
 async def test_listing_sends_the_identifier_and_reads_name_size_and_time() -> None:
     body = {
         "value": [
-            {"properties": {"filename": "q3.xlsx", "size": 1234, "lastModifiedTime": "t1"}},
-            {"properties": {"filename": "read_attachment.py", "size": 99}},
+            {
+                "name": "q3.xlsx",
+                "directory": ".",
+                "type": "file",
+                "sizeInBytes": 1234,
+                "lastModifiedAt": "t1",
+            },
+            {"name": "read_attachment.py", "directory": ".", "type": "file", "sizeInBytes": 99},
+            {"name": "out", "directory": ".", "type": "directory", "sizeInBytes": 0},
         ]
     }
     runtime, seen = _client(lambda _r: httpx.Response(200, json=body))
@@ -81,7 +88,7 @@ async def test_an_upload_carries_the_file_as_multipart() -> None:
     await runtime.upload_file(_SESSION, "q3.xlsx", b"workbook bytes")
 
     request = seen[0]
-    assert (request.method, request.url.path.rsplit("/", 2)[-2:]) == ("POST", ["files", "upload"])
+    assert (request.method, request.url.path.rsplit("/", 1)[-1]) == ("POST", "files")
     assert b'filename="q3.xlsx"' in request.content
     assert b"workbook bytes" in request.content
 
@@ -96,23 +103,34 @@ async def test_a_file_name_is_escaped_into_its_delete_path() -> None:
 
 
 async def test_a_run_sends_the_code_and_reads_what_it_printed() -> None:
-    answer = {"properties": {"status": "Success", "stdout": "42\n", "stderr": ""}}
+    answer = {"status": "Succeeded", "result": {"stdout": "42\n", "stderr": ""}}
     runtime, seen = _client(lambda _r: httpx.Response(200, json=answer))
 
-    result = await runtime.run(_SESSION, "print(6 * 7)", timeout_s=5)
+    result = await runtime.run(_SESSION, "print(6 * 7)", timeout_s=120)
 
     assert (result.succeeded, result.stdout, result.stderr) == (True, "42\n", "")
+    assert seen[0].url.path.endswith("/executions")
     sent = json.loads(seen[0].content)
-    assert sent["properties"]["code"] == "print(6 * 7)"
+    assert sent == {
+        "codeInputType": "Inline",
+        "executionType": "Synchronous",
+        "code": "print(6 * 7)",
+        "timeoutInSeconds": 120,
+        "outputStreamsMaxLength": 20_000,
+    }
 
 
 async def test_code_that_raised_is_a_run_that_did_not_succeed() -> None:
-    answer = {"properties": {"status": "Failure", "stdout": "", "stderr": "ZeroDivisionError"}}
+    answer = {"status": "Failed", "result": {"stdout": "", "stderr": "ZeroDivisionError"}}
     runtime, _ = _client(lambda _r: httpx.Response(200, json=answer))
 
     result = await runtime.run(_SESSION, "1/0", timeout_s=5)
 
-    assert (result.succeeded, result.stderr) == (False, "ZeroDivisionError")
+    assert (result.succeeded, result.stderr, result.out_of_memory) == (
+        False,
+        "ZeroDivisionError",
+        False,
+    )
 
 
 async def test_deleting_a_session_names_it() -> None:
@@ -177,7 +195,7 @@ async def test_a_failed_token_is_unavailable_and_logs_only_the_class() -> None:
 
 async def test_what_code_printed_never_reaches_a_log() -> None:
     printed = "q3.xlsx row 7: SALARY 1,234,567"
-    answer = {"properties": {"status": "Failure", "stdout": printed, "stderr": printed}}
+    answer = {"status": "Failed", "result": {"stdout": printed, "stderr": printed}}
     runtime, _ = _client(lambda _r: httpx.Response(200, json=answer))
 
     with structlog.testing.capture_logs() as logs:
@@ -193,6 +211,56 @@ async def test_closing_closes_the_pool() -> None:
     runtime, _ = _client(lambda _r: httpx.Response(200, json={}))
 
     await runtime.aclose()
+
+    with pytest.raises(AnalysisUnavailableError):
+        await runtime.list_files(_SESSION)
+
+
+def _failed(stderr: str) -> Callable[[httpx.Request], httpx.Response]:
+    return lambda _r: httpx.Response(
+        200, json={"status": "Failed", "result": {"stdout": "", "stderr": stderr}}
+    )
+
+
+async def test_the_services_own_deadline_is_timed_out() -> None:
+    runtime, _ = _client(
+        _failed("Request timed out waiting for code execution to complete after 120 seconds")
+    )
+
+    with pytest.raises(AnalysisTimedOutError):
+        await runtime.run(_SESSION, "import time; time.sleep(999)", timeout_s=120)
+
+
+async def test_a_run_aborted_behind_a_timeout_is_unavailable() -> None:
+    runtime, _ = _client(_failed("Execution aborted"))
+
+    with pytest.raises(AnalysisUnavailableError):
+        await runtime.run(_SESSION, "print(1)", timeout_s=5)
+
+
+@pytest.mark.parametrize(
+    "stderr", ["Kernel restarted", "Traceback ... MemoryError: cannot allocate"]
+)
+async def test_running_out_of_memory_is_named(stderr: str) -> None:
+    runtime, _ = _client(_failed(stderr))
+
+    result = await runtime.run(_SESSION, "x = bytearray(2**33)", timeout_s=5)
+
+    assert (result.succeeded, result.out_of_memory) == (False, True)
+
+
+async def test_deleting_a_file_that_is_already_gone_is_done() -> None:
+    runtime, _ = _client(
+        lambda _r: httpx.Response(404, json={"error": {"code": "DeleteFileError"}})
+    )
+
+    await runtime.delete_file(_SESSION, "q3.xlsx")
+
+
+async def test_a_list_that_cannot_be_read_is_unavailable() -> None:
+    runtime, _ = _client(
+        lambda _r: httpx.Response(200, json={"value": [{"name": "x", "type": "file"}]})
+    )
 
     with pytest.raises(AnalysisUnavailableError):
         await runtime.list_files(_SESSION)

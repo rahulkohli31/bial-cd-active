@@ -25,7 +25,10 @@ from typing import Final
 
 import structlog
 
+from src.services.agent.read_tools import ATTACHMENTS_PREFIX
+from src.services.analysis.runtime import READER_NAME as READER_NAME
 from src.services.analysis.runtime import (
+    SESSION_FILES_DIR,
     AnalysisRuntime,
     AnalysisUnavailableError,
     Execution,
@@ -38,15 +41,21 @@ from src.services.storage.errors import StorageError, StorageNotFoundError
 
 _log = structlog.get_logger()
 
-READER_NAME: Final = "read_attachment.py"
-"""The reader's name in the session. Uploaded on every placement, so a copy that code in the
-session altered is replaced before the reply reads anything."""
-
 READER: Final = (Path(__file__).parent / "assets" / "read_attachment.py.txt").read_bytes()
 """Byte-identical to `sandbox/scripts/read_attachment.py`; a test holds the two equal."""
 
 RECORD_TTL_S: Final = 20 * 60.0
 """The pool's idle cool-down. A record older than this describes a session Azure has deleted."""
+
+_LINK: Final = ATTACHMENTS_PREFIX.rstrip("/")
+# Files land in the working directory, and the service refuses a folder named with a dot, so
+# the one path the model is given resolves through a link to that directory.
+LINK_CODE: Final = (
+    "import os\n"
+    f"os.chdir({SESSION_FILES_DIR!r})\n"
+    f"os.path.islink({_LINK!r}) or os.symlink('.', {_LINK!r})\n"
+)
+_LINK_TIMEOUT_S: Final = 30.0
 
 
 class FileGoneError(RuntimeError):
@@ -128,6 +137,9 @@ async def place(
         await runtime.upload_file(session_id, file.file_name, data)
         copied_bytes += len(data)
     await runtime.upload_file(session_id, READER_NAME, READER)
+    linked = await runtime.run(session_id, LINK_CODE, timeout_s=_LINK_TIMEOUT_S)
+    if not linked.succeeded:
+        raise AnalysisUnavailableError("the attachments link could not be made")
 
     now_listed = (
         {file.name: file for file in await runtime.list_files(session_id)}
@@ -172,8 +184,9 @@ class AnalysisSession:
     """One reply's handle on its chat's session.
 
     Placement runs on the reply's first file access and not again unless asked; the lock makes
-    two tool calls issued together place once. `running` is true while code executes, which is
-    what tells a Stop that the session must be deleted to end it."""
+    two tool calls issued together place once. `running` is set while code executes and stays set
+    if the run never came back (cancelled, timed out, unreachable): that is what tells a Stop or a
+    timeout that the session must be deleted to end it."""
 
     conversation_id: uuid.UUID
     files: tuple[CodeLaneAttachment, ...]
@@ -214,14 +227,14 @@ class AnalysisSession:
         """Run `code` in the chat's session, after placement."""
         runtime = await self.ensure_placed()
         self.running = True
-        try:
-            return await runtime.run(self.session_id, code, timeout_s=timeout_s)
-        finally:
-            self.running = False
+        result = await runtime.run(self.session_id, code, timeout_s=timeout_s)
+        self.running = False
+        return result
 
     async def end(self) -> None:
         """Delete the chat's session and its record: the only way to stop code that is running.
         The next file access re-creates it and copies everything back in."""
         forget(self.conversation_id)
         self.placed = False
+        self.running = False
         await self._runtime().delete_session(self.session_id)

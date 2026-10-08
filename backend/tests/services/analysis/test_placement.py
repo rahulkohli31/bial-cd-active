@@ -10,8 +10,9 @@ import pytest
 import structlog.testing
 
 from src.db.models.attachment import Attachment
-from src.services.analysis import AnalysisUnavailableError, placement
+from src.services.analysis import AnalysisUnavailableError, Execution, placement
 from src.services.analysis.placement import (
+    LINK_CODE,
     READER,
     READER_NAME,
     AnalysisSession,
@@ -328,6 +329,7 @@ async def test_ending_deletes_the_session_and_the_next_access_refills_it(runtime
 
 async def test_running_marks_the_reply_busy_only_while_code_runs(runtime, storage) -> None:
     reply = _reply(runtime, storage, [_file(storage, "q3.xlsx")], uuid.uuid4())
+    await reply.ensure_placed()
     runtime.hold_runs = asyncio.Event()
 
     running = asyncio.create_task(reply.run("print(1)", timeout_s=5))
@@ -338,3 +340,52 @@ async def test_running_marks_the_reply_busy_only_while_code_runs(runtime, storag
     await running
 
     assert reply.running is False
+
+
+async def test_a_run_cut_off_mid_flight_stays_marked_until_the_session_is_ended(
+    runtime, storage
+) -> None:
+    """A Stop cancels the tool while the code still runs in Azure; the teardown must see it."""
+    reply = _reply(runtime, storage, [_file(storage, "q3.xlsx")], uuid.uuid4())
+    await reply.ensure_placed()
+    runtime.hold_runs = asyncio.Event()
+    running = asyncio.create_task(reply.run("while True: pass", timeout_s=5))
+    while not runtime.runs:
+        await asyncio.sleep(0)
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    assert reply.running is True
+    await reply.end()
+    assert reply.running is False
+
+
+async def test_placement_links_the_attachments_path_to_where_files_land(runtime, storage) -> None:
+    chat = uuid.uuid4()
+
+    await _reply(runtime, storage, [_file(storage, "q3.xlsx")], chat).ensure_placed()
+
+    assert runtime.links == [chat.hex]
+    assert runtime.runs == []
+    assert LINK_CODE == (
+        "import os\nos.chdir('/mnt/data')\n"
+        "os.path.islink('.attachments') or os.symlink('.', '.attachments')\n"
+    )
+
+
+async def test_a_link_that_cannot_be_made_is_unavailable_and_records_nothing(
+    runtime, storage, monkeypatch
+) -> None:
+    chat = uuid.uuid4()
+
+    async def _refused(_session_id: str, _code: str, *, timeout_s: float) -> Execution:
+        return Execution(succeeded=False, stdout="", stderr="denied")
+
+    monkeypatch.setattr(runtime, "run", _refused)
+
+    with pytest.raises(AnalysisUnavailableError):
+        await _reply(runtime, storage, [_file(storage, "q3.xlsx")], chat).ensure_placed()
+
+    assert chat not in placement._records

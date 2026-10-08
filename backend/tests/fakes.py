@@ -42,6 +42,7 @@ from src.services.analysis import (
     Execution,
     SessionFile,
 )
+from src.services.analysis.placement import LINK_CODE
 from src.services.build_sessions.locks import read_registry
 from src.services.build_sessions.manager import SessionManager
 from src.services.build_sessions.outcome import (
@@ -290,7 +291,8 @@ class FakeAnalysisRuntime:
     Azure deleting an idle session. `unavailable` fails every call; `run_times_out` fails every
     run with the deadline; `hold_runs` parks each run until it is cleared. `handle_run` decides
     what a run prints. `calls` records `(operation, session_id)` in order, `uploads` and
-    `deletions` the `(session_id, name)` of each file call, and `runs` the code."""
+    `deletions` the `(session_id, name)` of each file call, and `runs` the code. Placement's own
+    link run lands in `links` instead and always succeeds: the knobs above are for model code."""
 
     files: dict[str, dict[str, bytes]] = field(default_factory=dict)
     stamps: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -298,6 +300,7 @@ class FakeAnalysisRuntime:
     uploads: list[tuple[str, str]] = field(default_factory=list)
     deletions: list[tuple[str, str]] = field(default_factory=list)
     runs: list[tuple[str, str]] = field(default_factory=list)
+    links: list[str] = field(default_factory=list)
     unavailable: bool = False
     run_times_out: bool = False
     hold_runs: asyncio.Event | None = None
@@ -344,6 +347,9 @@ class FakeAnalysisRuntime:
 
     async def run(self, session_id: str, code: str, *, timeout_s: float) -> Execution:
         self._enter("run", session_id)
+        if code == LINK_CODE:
+            self.links.append(session_id)
+            return Execution(succeeded=True, stdout="", stderr="")
         self.runs.append((session_id, code))
         if self.hold_runs is not None:
             await self.hold_runs.wait()
