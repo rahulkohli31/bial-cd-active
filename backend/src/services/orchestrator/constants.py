@@ -300,6 +300,30 @@ is exactly the shape that benefits from some reasoning, the quality cost has not
 and the paragraph above names what goes wrong silently when thinking is off. A measurable change
 follows a measurement; it does not precede one."""
 
+# --- BIAL Chat file analysis: the bounds on one reply ------------------------------------
+
+ANALYSIS_REQUEST_LIMIT: Final = 20
+"""Model requests one analysis reply may make. Ending on it shows the ceiling sentence."""
+
+ANALYSIS_WALL_CLOCK_S: Final = 600.0
+"""Wall clock on one analysis reply, under the same sentence as the request ceiling."""
+
+ANALYSIS_EXECUTION_TIMEOUT_S: Final = 120.0
+"""One `run_python` execution. Past it the chat's session is deleted, which is the only way the
+service offers to end running code."""
+
+ANALYSIS_READ_TIMEOUT_S: Final = 45.0
+"""One reader run: long enough for the reader's own 30-second alarm to answer first."""
+
+ANALYSIS_DELETE_DEADLINE_S: Final = 5.0
+"""A session delete on a teardown path. The pool's idle cool-down is the backstop past it."""
+
+ANALYSIS_OUTPUT_CAP: Final = 16_000
+"""Characters of one execution's output handed back to the model."""
+
+ANALYSIS_CODE_LIMIT: Final = 100_000
+"""Characters of code one `run_python` call may send."""
+
 PLAN_EFFORT: Final[AnthropicEffort] = "medium"
 """How hard the model thinks in a planning turn (owner's ruling)."""
 

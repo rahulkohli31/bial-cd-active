@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.user import User
 from src.db.session import get_db
+from src.services.analysis import AnalysisRuntime, get_analysis_runtime
 from src.services.auth.cookies import session_cookie_name
 from src.services.auth.errors import AuthError
 from src.services.auth.session_jwt import SessionClaims, decode_session_jwt
@@ -153,3 +154,12 @@ def container_store_dependency() -> AppContainerStore | None:
 
 
 ContainerStore = Annotated[AppContainerStore | None, Depends(container_store_dependency)]
+
+
+def analysis_runtime_dependency() -> AnalysisRuntime | None:
+    """BIAL Chat's analysis runtime, or **`None` when it is not configured** — a supported posture
+    in every environment, in which BIAL Chat refuses Office and CSV files at its doors."""
+    return get_analysis_runtime()
+
+
+OptionalAnalysis = Annotated[AnalysisRuntime | None, Depends(analysis_runtime_dependency)]

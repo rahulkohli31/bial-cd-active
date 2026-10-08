@@ -127,6 +127,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
     # Shutdown: close every client so no aiohttp session / connection pool leaks. Each is
     # a no-op when its resource was never opened.
+    from src.services.analysis import aclose_analysis
     from src.services.appdb import aclose_maintenance_engine
     from src.services.deploy.aca_publish import aclose_published_apps
     from src.services.deploy.images import aclose_image_builder
@@ -159,6 +160,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         aclose_image_builder,
         aclose_lake,
         aclose_directory,
+        aclose_analysis,
     ):
         try:
             await close()

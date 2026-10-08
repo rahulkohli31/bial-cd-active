@@ -75,6 +75,10 @@ friendly mapping exists to prevent — and a name repeated as a literal in two f
 happens quietly, the day one of them is renamed.
 """
 
+ANALYSIS_RUN_TOOL = "run_python"
+"""BIAL Chat's one way to compute over an attached file, named here for the same reason as the
+reader above: the tool registers it, the prompt names it, and the transcript labels its step."""
+
 APPLY_SCHEMA_CHANGE_TOOL = "apply_schema_change"
 """The ONE sanctioned channel for a schema change, and the ONE spelling of it.
 
