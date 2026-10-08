@@ -10,11 +10,13 @@ build context, so the image a sandbox runs carries none.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -30,6 +32,7 @@ from src.services.sandbox.client import (
     _BUNDLE_B64_NAME,
     _DISCARD_SCRIPT,
     _INIT_REPO_SCRIPT,
+    _LIBRARIES_LEFT_AS_SAVED,
     _REINSTALLED_MARKER,
     _RESTORE_SCRIPT,
 )
@@ -171,8 +174,8 @@ class _Sandbox:
     def restore(self, bundle: bytes) -> subprocess.CompletedProcess[str]:
         return self._over_a_pushed_bundle(bundle, _RESTORE_SCRIPT)
 
-    def discard(self, bundle: bytes) -> None:
-        self._over_a_pushed_bundle(bundle, _DISCARD_SCRIPT)
+    def discard(self, bundle: bytes) -> subprocess.CompletedProcess[str]:
+        return self._over_a_pushed_bundle(bundle, _DISCARD_SCRIPT)
 
     def _over_a_pushed_bundle(
         self, bundle: bytes, script: str
@@ -594,3 +597,352 @@ def test_a_discard_in_a_container_born_from_this_image_puts_the_saved_copy_back(
     sandbox.discard(saved)
 
     assert (sandbox.ws / "next.config.ts").read_text(encoding="utf-8") == _IMAGE_NEXT_CONFIG
+
+
+#: The image's manifest, and the same app saved under an older image: an older Next and an older
+#: security override.
+_IMAGE_PACKAGE: dict[str, Any] = {
+    "name": "app",
+    "dependencies": {
+        "next": "16.3.8",
+        "react": "19.2.7",
+        "drizzle-orm": "0.45.2",
+        "zod": "4.4.3",
+        "nanoid": "0.0.5",
+    },
+    "devDependencies": {"typescript": "5.9.3"},
+    "overrides": {"postcss": "8.5.23"},
+}
+_OLDER_PACKAGE: dict[str, Any] = {
+    **_IMAGE_PACKAGE,
+    "dependencies": {**_IMAGE_PACKAGE["dependencies"], "next": "16.3.1"},
+    "overrides": {"postcss": "8.5.19"},
+}
+#: A package the older Next depended on and the image's no longer does.
+_DROPPED_BY_THE_IMAGE = {"node_modules/busboy": {"version": "1.6.0"}}
+#: A library of the app's own, with one of its dependencies.
+_OWN_LIBRARY = {
+    "node_modules/recharts": {"version": "3.0.0"},
+    "node_modules/d3-array": {"version": "3.2.4"},
+}
+
+
+def _manifest(package: dict[str, Any]) -> str:
+    return json.dumps(package, indent=2) + "\n"
+
+
+def _lockfile(package: dict[str, Any], extra: dict[str, Any] | None = None) -> str:
+    root = {key: value for key, value in package.items() if key != "overrides"}
+    declared = {
+        **package.get("dependencies", {}),
+        **package.get("devDependencies", {}),
+        **package.get("overrides", {}),
+    }
+    entries = {f"node_modules/{name}": {"version": spec} for name, spec in declared.items()}
+    packages = {"": root, **entries, **(extra or {})}
+    return json.dumps({"name": "app", "lockfileVersion": 3, "packages": packages}, indent=2) + "\n"
+
+
+_IMAGE_LOCKFILE = _lockfile(_IMAGE_PACKAGE)
+_OLDER_LOCKFILE = _lockfile(_OLDER_PACKAGE, _DROPPED_BY_THE_IMAGE)
+_IMAGE_STARTER = {
+    **_STARTER,
+    "package.json": _manifest(_IMAGE_PACKAGE),
+    "package-lock.json": _IMAGE_LOCKFILE,
+}
+
+
+def _saved(sandbox: _Sandbox, package: dict[str, Any] | str, lockfile: str) -> bytes:
+    manifest = package if isinstance(package, str) else _manifest(package)
+    sandbox.write({**_STARTER, "package.json": manifest, "package-lock.json": lockfile})
+    sandbox.ok(_INIT_REPO_SCRIPT)
+    sandbox.write({"app/page.tsx": "the app\n"})
+    sandbox.ok(_COMMIT_SCRIPT)
+    return sandbox.bundle()
+
+
+def _restored(
+    sandbox: _Sandbox, saved: bytes
+) -> tuple[_Sandbox, subprocess.CompletedProcess[str]]:
+    fresh = sandbox.fresh_container()
+    fresh.write(_IMAGE_STARTER)
+    return fresh, fresh.restore(saved)
+
+
+def _read_json(sandbox: _Sandbox, relative: str) -> dict[str, Any]:
+    loaded: dict[str, Any] = json.loads((sandbox.ws / relative).read_text(encoding="utf-8"))
+    return loaded
+
+
+def _reinstalled(result: subprocess.CompletedProcess[str]) -> bool:
+    return _REINSTALLED_MARKER in result.stdout.splitlines()
+
+
+def test_an_app_saved_on_an_older_image_opens_on_the_images_libraries(sandbox: _Sandbox) -> None:
+    """★ The app's libraries move up to the image's, so the image's installed copies serve it and
+    nothing is reinstalled. The move is a workspace change, and the next save records it."""
+    saved = _saved(sandbox, _OLDER_PACKAGE, _OLDER_LOCKFILE)
+    saved_head = sandbox.head()
+
+    fresh, restored = _restored(sandbox, saved)
+
+    assert _read_json(fresh, "package.json") == _IMAGE_PACKAGE
+    assert (fresh.ws / "package-lock.json").read_text(encoding="utf-8") == _IMAGE_LOCKFILE
+    assert not _reinstalled(restored)
+    assert fresh.head() == saved_head
+    fresh.ok(_COMMIT_SCRIPT)
+    assert fresh.changed_by_head() == {"package.json", "package-lock.json"}
+
+
+def test_an_older_apps_own_library_is_kept_and_only_it_is_installed(sandbox: _Sandbox) -> None:
+    """The image's libraries take the image's versions and lockfile entries, and the app's own keep
+    the versions it was saved with, so the install has only those to fetch."""
+    package = {
+        **_OLDER_PACKAGE,
+        "dependencies": {
+            **_OLDER_PACKAGE["dependencies"],
+            "react": "~19.2.0",
+            "recharts": "^3.0.0",
+        },
+    }
+    saved = _saved(sandbox, package, _lockfile(package, _OWN_LIBRARY))
+
+    fresh, restored = _restored(sandbox, saved)
+
+    manifest = _read_json(fresh, "package.json")
+    assert manifest["dependencies"] == {**_IMAGE_PACKAGE["dependencies"], "recharts": "^3.0.0"}
+    assert manifest["overrides"] == _IMAGE_PACKAGE["overrides"]
+    entries = _read_json(fresh, "package-lock.json")["packages"]
+    image_entries = json.loads(_IMAGE_LOCKFILE)["packages"]
+    assert {path: entries[path] for path in image_entries if path} == {
+        path: entry for path, entry in image_entries.items() if path
+    }
+    assert entries["node_modules/recharts"] == {"version": "3.0.0"}
+    assert entries["node_modules/d3-array"] == {"version": "3.2.4"}
+    assert entries[""]["dependencies"]["recharts"] == "^3.0.0"
+    assert _reinstalled(restored)
+
+
+def test_a_version_the_app_chose_over_the_images_stays(sandbox: _Sandbox) -> None:
+    """A newer release, another major (counted from the first non-zero part), an alias and a range
+    can each break the app's code if replaced. Its older patch-level pins still move."""
+    package = {
+        **_OLDER_PACKAGE,
+        "dependencies": {
+            "next": "16.4.0",
+            "react": "npm:@acme/react@19.2.0",
+            "drizzle-orm": "0.44.7",
+            "zod": "4.1.0 - 4.2.0",
+            "nanoid": "0.0.3",
+        },
+        "devDependencies": {"typescript": "4.9.5"},
+    }
+    saved = _saved(sandbox, package, _lockfile(package))
+
+    fresh, _ = _restored(sandbox, saved)
+
+    manifest = _read_json(fresh, "package.json")
+    assert manifest["dependencies"] == package["dependencies"]
+    assert manifest["devDependencies"] == package["devDependencies"]
+    assert manifest["overrides"] == _IMAGE_PACKAGE["overrides"]
+
+
+def test_an_overridden_package_the_app_declares_itself_moves_with_the_override(
+    sandbox: _Sandbox,
+) -> None:
+    """npm refuses an override that disagrees with a direct dependency on the same package, so the
+    two move together, and an app that predates the override gains it."""
+    package = {key: value for key, value in _OLDER_PACKAGE.items() if key != "overrides"} | {
+        "devDependencies": {"typescript": "5.9.3", "postcss": "^8.4.0"}
+    }
+    saved = _saved(sandbox, package, _lockfile(package))
+
+    fresh, _ = _restored(sandbox, saved)
+
+    manifest = _read_json(fresh, "package.json")
+    assert manifest["devDependencies"]["postcss"] == "8.5.23"
+    assert manifest["overrides"] == {"postcss": "8.5.23"}
+    entries = _read_json(fresh, "package-lock.json")["packages"]
+    assert entries["node_modules/postcss"] == {"version": "8.5.23"}
+
+
+def test_a_declaration_that_stays_holds_back_the_packages_other_declarations(
+    sandbox: _Sandbox,
+) -> None:
+    """Moving the dependency under an override the app moved ahead would make npm refuse both."""
+    package = {**_OLDER_PACKAGE, "overrides": {"next": "16.4.0", "postcss": "8.5.19"}}
+    saved = _saved(sandbox, package, _lockfile(package))
+
+    fresh, _ = _restored(sandbox, saved)
+
+    manifest = _read_json(fresh, "package.json")
+    assert manifest["dependencies"]["next"] == "16.3.1"
+    assert manifest["overrides"] == {"next": "16.4.0", "postcss": "8.5.23"}
+
+
+def test_an_install_that_refuses_the_moved_versions_falls_back_to_the_saved_ones(
+    sandbox: _Sandbox,
+) -> None:
+    """Whatever npm makes of the moved versions, the app opens on the ones it was saved with rather
+    than not at all."""
+    calls = sandbox.root / "npm-calls"
+    (sandbox.root / "shims" / "npm").write_text(
+        f"#!/bin/sh\necho call >> {calls}\n! grep -q '\"16.3.8\"' package.json\n",
+        encoding="utf-8",
+    )
+    package = {
+        **_OLDER_PACKAGE,
+        "dependencies": {**_OLDER_PACKAGE["dependencies"], "recharts": "^3.0.0"},
+    }
+    saved_lockfile = _lockfile(package, _OWN_LIBRARY)
+    saved = _saved(sandbox, package, saved_lockfile)
+
+    fresh, restored = _restored(sandbox, saved)
+
+    assert (fresh.ws / "package.json").read_text(encoding="utf-8") == _manifest(package)
+    assert (fresh.ws / "package-lock.json").read_text(encoding="utf-8") == saved_lockfile
+    assert calls.read_text(encoding="utf-8").splitlines() == ["call", "call"]
+    assert _LIBRARIES_LEFT_AS_SAVED in restored.stderr.splitlines()
+
+
+@pytest.mark.parametrize("section", ["optionalDependencies", "peerDependencies"])
+def test_an_optional_or_peer_dependency_of_the_apps_own_is_still_installed(
+    sandbox: _Sandbox, section: str
+) -> None:
+    package = {**_OLDER_PACKAGE, section: {"sharp": "0.35.5"}}
+    saved = _saved(
+        sandbox, package, _lockfile(package, {"node_modules/sharp": {"version": "0.35.5"}})
+    )
+
+    fresh, restored = _restored(sandbox, saved)
+
+    assert _reinstalled(restored)
+    assert _read_json(fresh, "package-lock.json")["packages"][""][section] == {"sharp": "0.35.5"}
+
+
+def test_a_package_the_app_pins_its_own_way_keeps_its_lockfile_entry(sandbox: _Sandbox) -> None:
+    """The image's entry would put the app on a version its manifest does not ask for, and could
+    leave the lockfile identical to the image's so that nothing installs at all."""
+    package = {**_OLDER_PACKAGE, "overrides": {"postcss": "8.5.30"}}
+    own_entry = {"node_modules/postcss": {"version": "8.5.30"}}
+    saved = _saved(sandbox, package, _lockfile(package, own_entry))
+
+    fresh, restored = _restored(sandbox, saved)
+
+    assert _read_json(fresh, "package.json")["overrides"] == {"postcss": "8.5.30"}
+    entries = _read_json(fresh, "package-lock.json")["packages"]
+    assert entries["node_modules/postcss"] == {"version": "8.5.30"}
+    assert entries["node_modules/next"] == {"version": "16.3.8"}
+    assert _reinstalled(restored)
+
+
+def test_an_override_waits_for_a_direct_declaration_that_stays(sandbox: _Sandbox) -> None:
+    """npm refuses an override that disagrees with a direct dependency on the same package."""
+    package = {key: value for key, value in _OLDER_PACKAGE.items() if key != "overrides"} | {
+        "devDependencies": {"typescript": "5.9.3", "postcss": "8.5.30"}
+    }
+    saved = _saved(sandbox, package, _lockfile(package))
+
+    fresh, _ = _restored(sandbox, saved)
+
+    manifest = _read_json(fresh, "package.json")
+    assert manifest["dependencies"]["next"] == "16.3.8"
+    assert manifest["devDependencies"]["postcss"] == "8.5.30"
+    assert "overrides" not in manifest
+
+
+def test_the_lockfile_declares_only_what_the_app_declares(sandbox: _Sandbox) -> None:
+    """A lockfile that disagrees with its manifest is refused by the clean install publishing
+    runs."""
+    package = {key: value for key, value in _OLDER_PACKAGE.items() if key != "devDependencies"}
+    saved = _saved(sandbox, package, _lockfile(package))
+
+    fresh, restored = _restored(sandbox, saved)
+
+    assert "devDependencies" not in _read_json(fresh, "package-lock.json")["packages"][""]
+    assert _reinstalled(restored)
+
+
+def test_an_app_already_on_the_images_libraries_restores_untouched(sandbox: _Sandbox) -> None:
+    saved = _saved(sandbox, _IMAGE_PACKAGE, _IMAGE_LOCKFILE)
+
+    fresh, restored = _restored(sandbox, saved)
+
+    assert parse_state(fresh.ok(state_script(None)).stdout).changed_paths == ()
+    assert not _reinstalled(restored)
+
+
+def test_a_discard_after_a_restore_keeps_the_images_libraries(sandbox: _Sandbox) -> None:
+    """A discard resets to the saved commit, older pins included; left there, the install would put
+    the older Next back over the image's."""
+    saved = _saved(sandbox, _OLDER_PACKAGE, _OLDER_LOCKFILE)
+    fresh, _ = _restored(sandbox, saved)
+    fresh.write({"app/page.tsx": "unsaved work\n"})
+
+    discarded = fresh.discard(saved)
+
+    assert (fresh.ws / "app/page.tsx").read_text(encoding="utf-8") == "the app\n"
+    assert _read_json(fresh, "package.json") == _IMAGE_PACKAGE
+    assert (fresh.ws / "package-lock.json").read_text(encoding="utf-8") == _IMAGE_LOCKFILE
+    assert not _reinstalled(discarded)
+
+
+def test_an_app_saved_with_an_unreadable_manifest_still_opens_as_saved(sandbox: _Sandbox) -> None:
+    """The agent may write the manifest, and a save can catch it half-edited. Refusing the restore
+    would lock the citizen out of the app the agent could otherwise repair."""
+    broken = '{ "name": "app", "dependencies": { "next": "16.3.1", }\n'
+    saved = _saved(sandbox, broken, _IMAGE_LOCKFILE)
+
+    fresh, restored = _restored(sandbox, saved)
+
+    assert (fresh.ws / "package.json").read_text(encoding="utf-8") == broken
+    assert _LIBRARIES_LEFT_AS_SAVED in restored.stderr.splitlines()
+    assert not _reinstalled(restored)
+
+
+def test_an_install_that_fails_on_the_saved_versions_still_fails_the_restore(
+    sandbox: _Sandbox,
+) -> None:
+    (sandbox.root / "shims" / "npm").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    package = {
+        **_IMAGE_PACKAGE,
+        "dependencies": {**_IMAGE_PACKAGE["dependencies"], "recharts": "^3.0.0"},
+    }
+    saved = _saved(sandbox, package, _lockfile(package, _OWN_LIBRARY))
+    fresh = sandbox.fresh_container()
+    fresh.write(_IMAGE_STARTER)
+    (fresh.ws / _BUNDLE_B64_NAME).write_text(
+        base64.b64encode(saved).decode("ascii"), encoding="ascii"
+    )
+
+    result = fresh.run(_RESTORE_SCRIPT)
+
+    assert result.returncode != 0
+    assert _reinstalled(result), "guard the premise: the install ran and failed"
+    assert _LIBRARIES_LEFT_AS_SAVED not in result.stderr.splitlines()
+
+
+def test_an_app_saved_without_a_lockfile_falls_back_without_naming_one(sandbox: _Sandbox) -> None:
+    """The agent may delete the lockfile. The catch-up then builds one from the image's, and a
+    fallback restores only what the saved commit tracks."""
+    calls = sandbox.root / "npm-calls"
+    (sandbox.root / "shims" / "npm").write_text(
+        f"#!/bin/sh\necho call >> {calls}\n! grep -q '\"16.3.8\"' package.json\n",
+        encoding="utf-8",
+    )
+    package = {
+        **_OLDER_PACKAGE,
+        "dependencies": {**_OLDER_PACKAGE["dependencies"], "recharts": "^3.0.0"},
+    }
+    sandbox.write(
+        {**_STARTER, "package.json": _manifest(package), "package-lock.json": _lockfile(package)}
+    )
+    sandbox.ok(_INIT_REPO_SCRIPT)
+    sandbox.git("rm", "-q", "package-lock.json")
+    sandbox.ok(_COMMIT_SCRIPT)
+
+    fresh, restored = _restored(sandbox, sandbox.bundle())
+
+    assert (fresh.ws / "package.json").read_text(encoding="utf-8") == _manifest(package)
+    assert calls.read_text(encoding="utf-8").splitlines() == ["call", "call"]
+    assert _LIBRARIES_LEFT_AS_SAVED in restored.stderr.splitlines()

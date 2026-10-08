@@ -39,7 +39,8 @@ deliberately no demonstration data model to work around or delete.
 The design goal is **a fast, predictable starting point**, not a fixed one. The container plumbing,
 the error-capture shim and the pinned base ARE fixed, and that is what makes two sessions start
 alike. What the agent may do inside is NOT: `run_command` is unrestricted in a Build chat, it may
-`npm install` on demand, and the restore path reconciles whatever lockfile the snapshot carries.
+`npm install` on demand, and the restore path installs whatever the snapshot added on top of the
+baked base.
 
 ## Layout
 
@@ -81,9 +82,12 @@ Resolved to the newest stable at authoring and pinned into `package.json` + a re
 | Forms            | `react-hook-form` 7.81.0, `@hookform/resolvers` 5.4.0, `zod` 4.4.3 |
 
 `node_modules` is **baked into the image** as a SPEED BASE, not a frozen set: a build agent may
-`npm install` more at runtime and the restore path reconciles the snapshotted lockfile. Regenerate
-the lockfile with `npm install --package-lock-only` in `template/` only when intentionally
-bumping versions.
+`npm install` more at runtime and the restore path installs only what the snapshot added. A restore
+also moves an older app's pins for the template's own packages up to this image's versions, never
+down and never across a major, so a patch or minor bump here reaches every saved app on its next
+open and is kept by its next save. After a major bump, older apps keep their versions and reinstall
+them on every open. Regenerate the lockfile with `npm install --package-lock-only` in `template/`
+only when intentionally bumping versions.
 
 ## The injected runtime env-vars
 

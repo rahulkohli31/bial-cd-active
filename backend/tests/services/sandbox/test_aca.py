@@ -20,6 +20,7 @@ import pytest
 import redis.asyncio as aioredis
 from pydantic import SecretStr
 from redis.exceptions import RedisError
+from structlog.testing import capture_logs
 
 from src.services.build_sessions.locks import stay_of_execution_is_current
 from src.services.redis import REGISTRY_STATE_ENDING, REGISTRY_STATE_READY, registry_key
@@ -43,7 +44,11 @@ from src.services.sandbox.base import (
     SandboxNotReadyError,
     identity_from_tags,
 )
-from src.services.sandbox.client import _RESTORE_TIMEOUT_SECONDS, AcaSandboxClient
+from src.services.sandbox.client import (
+    _LIBRARIES_LEFT_AS_SAVED,
+    _RESTORE_TIMEOUT_SECONDS,
+    AcaSandboxClient,
+)
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from src.services.storage.errors import StorageNotFoundError
@@ -594,6 +599,29 @@ async def test_a_discard_resets_the_tree_in_place_and_reinstalls_only_for_a_new_
     assert script.index('[ "$baked_lock" = "$snap_lock" ]') < script.index("npm install")
     assert "git checkout" not in script
     assert "-x" not in script.split("git clean", 1)[1].split(";", 1)[0]
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("stderr", "logged"), [(f"{_LIBRARIES_LEFT_AS_SAVED}\n", True), ("", False)]
+)
+async def test_an_app_left_on_its_saved_libraries_is_logged(
+    fake_redis: aioredis.Redis, stderr: str, logged: bool
+) -> None:
+    """A restore or discard leaves those libraries alone so the app still opens; nobody would know
+    it missed the image's versions without this line."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/files":
+            return httpx.Response(200, json={"ok": True, "created": "app.bundle.b64"})
+        return httpx.Response(200, json={"stdout": "", "stderr": stderr, "exit": 0})
+
+    client = _client(FakeAca(), handler)
+
+    with capture_logs() as captured:
+        await client.reset_to_bundle(_live_handle(), a_git_bundle())
+
+    assert ("libraries_left_as_saved" in [entry["event"] for entry in captured]) is logged
     await client.aclose()
 
 
