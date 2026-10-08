@@ -99,9 +99,10 @@ def _not_attached(path: str) -> str:
             "file": PurePosixPath(path).name,
             "error": {
                 "code": "not_attached",
-                "message": "That is not one of the files listed for this chat's analysis.",
-                "next": "Use a path from that list. A PDF or picture reaches you directly; a file "
-                "that is no longer attached has to be attached again.",
+                "message": "No file at that path is attached to this chat now.",
+                "next": "If it was attached earlier, the person has since removed it: what you "
+                "found in it then still stands, and they can attach it again for you to open "
+                "it. A PDF or picture is not opened with this tool; it reaches you directly.",
             },
         }
     )

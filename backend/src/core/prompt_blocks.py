@@ -87,6 +87,8 @@ HOW TO WORK WITH THESE FILES
 - The Python session can be renewed between replies, so values from an earlier reply may be gone: \
 recompute rather than assume.
 - If a file is reported missing, read it again with `{ATTACHMENT_READ_TOOL}`.
+- The list above shows the files attached now. One the person removed is not in it and cannot be \
+opened, but what you found in it earlier still stands.
 - Answer in text; tables are fine. Asked for a chart or a file to download, say this chat answers \
 in text only.
 - Never state what a file contains unless you have read it.
