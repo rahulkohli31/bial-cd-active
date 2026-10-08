@@ -289,6 +289,9 @@ function buildlessEnding(status: BuildOutcomeStatus, reason: string | null): str
   if (reason === 'model_unavailable') {
     return 'The assistant could not get an answer from its service, so this reply stopped.'
   }
+  if (reason === 'request_limit' || reason === 'wall_clock_deadline_exceeded') {
+    return 'This question needed more steps than one reply allows. Try asking about one part at a time.'
+  }
   switch (status) {
     case 'failed':
       return 'That reply did not finish.'
