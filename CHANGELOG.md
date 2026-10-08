@@ -14,7 +14,24 @@ from 5 to 3. None of the remaining ones has a released fix. busybox has no patch
 images' Alpine release. The four Python findings are fixed only in Python 3.15, and the code they
 sit in is not used in production.
 
+A preview now opens only for the person whose workspace runs it. Until now anyone with a preview's
+address could open it, signed in or not.
+
+> **Before deploying:** deploy the sandbox image first, then the portal, then the control plane
+> and the worker, back to back; roll back the control plane first. An older portal in front of a
+> newer control plane shows every preview as unavailable. The gateway's health probe for the
+> portal must not use `/api/health`, which now answers 404; point it at `/`. The portal's
+> `PORTAL_ORIGIN` must be exactly the backend's `FRONTEND_URL`, or no preview opens for anyone.
+
 ### Security
+
+- **A preview opens only for the person running it.** The same address in a private window goes to
+  the portal instead of the app, and another signed-in person gets the "app not available" page.
+  The owner sees it as before, in the workspace and in a new tab, and a shared view opens for the
+  colleague it was shared with. Signing out closes previews within a minute. Published apps are
+  unchanged and open for anyone.
+- **The portal no longer routes the health check.** Asked through the portal, it answers that the
+  route does not exist. The platform's own checks reach the control plane directly.
 
 - **Deleting an attachment you do not own now answers "not found".** It never deleted another
   person's file, because each person reaches only their own. But it answered with success, which
