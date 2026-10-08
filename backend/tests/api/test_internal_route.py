@@ -197,13 +197,14 @@ async def test_a_dead_alias_is_never_a_denial_even_with_a_good_pass(
 
 
 async def test_a_hit_renews_the_aliass_lifetime(
-    client: httpx.AsyncClient, fake_redis: aioredis.Redis
+    client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session
 ) -> None:
-    alias = await _a_live_alias(fake_redis)
+    alias, holders_browser = await _holding(db_session, fake_redis)
     await fake_redis.expire(alias_key(alias), 60)
 
-    await client.get(_path(alias), headers=EDGE)
+    resp = await client.get(_path(alias), headers=holders_browser)
 
+    assert resp.headers[CONTAINER_HEADER] == CONTAINER
     assert await fake_redis.ttl(alias_key(alias)) > ALIAS_TTL_SECONDS - 60
 
 

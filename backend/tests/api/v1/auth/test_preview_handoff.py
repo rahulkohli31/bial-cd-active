@@ -93,6 +93,18 @@ async def test_someone_elses_preview_gets_no_ticket(
     assert resp.headers["location"] == GONE
 
 
+@pytest.mark.parametrize("mode", ["cors", "no-cors", "same-origin"])
+async def test_a_request_that_is_not_a_navigation_gets_no_ticket(
+    client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session, mode: str
+) -> None:
+    user, alias = await _holding(db_session, fake_redis)
+
+    resp = await client.get(_handoff(alias), headers={**_session(user), "Sec-Fetch-Mode": mode})
+
+    assert resp.status_code == 400
+    assert "location" not in resp.headers
+
+
 async def test_without_a_session_a_tab_goes_to_the_portal_and_a_frame_never_does(
     client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session
 ) -> None:
