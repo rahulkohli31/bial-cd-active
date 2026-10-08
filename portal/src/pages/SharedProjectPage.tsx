@@ -27,6 +27,7 @@ import {
   handOverWorkspace,
   launchSharedPreview,
   refreshSharedPreview,
+  renewSessionForPreview,
   type HandoverStep,
   type ReclaimBlocked,
 } from '../utils/buildSessionApi'
@@ -112,7 +113,8 @@ export default function SharedProjectPage(): React.JSX.Element {
     setLaunching(true)
     setLaunchError(null)
     launchSharedPreview(projectId)
-      .then((res) => {
+      .then(async (res) => {
+        await renewSessionForPreview()
         setPreview(res)
         setFrameNonce((n) => n + 1)
       })
@@ -149,7 +151,8 @@ export default function SharedProjectPage(): React.JSX.Element {
     setRefreshing(true)
     setLaunchError(null)
     refreshSharedPreview(projectId)
-      .then((res) => {
+      .then(async (res) => {
+        await renewSessionForPreview()
         setPreview(res)
         setFrameNonce((n) => n + 1)
       })

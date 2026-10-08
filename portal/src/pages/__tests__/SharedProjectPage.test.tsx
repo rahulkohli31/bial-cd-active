@@ -19,6 +19,7 @@ const h = vi.hoisted(() => ({
   launchSharedPreview: vi.fn(),
   refreshSharedPreview: vi.fn(),
   handOverWorkspace: vi.fn(),
+  renewSessionForPreview: vi.fn(),
 }))
 
 vi.mock('../../utils/projectApi', async (importOriginal) => ({
@@ -30,6 +31,7 @@ vi.mock('../../utils/buildSessionApi', async (importOriginal) => ({
   launchSharedPreview: h.launchSharedPreview,
   refreshSharedPreview: h.refreshSharedPreview,
   handOverWorkspace: h.handOverWorkspace,
+  renewSessionForPreview: h.renewSessionForPreview,
 }))
 
 /** The exact shape `asReclaimBlocked` reads off a thrown error — a real `sandbox_reclaim_
@@ -74,6 +76,7 @@ function renderAt(projectId = 'p1') {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  h.renewSessionForPreview.mockResolvedValue(undefined)
 })
 afterEach(() => cleanup())
 
@@ -100,6 +103,25 @@ it('launches normally when a saved snapshot exists', async () => {
 
   await waitFor(() => expect(h.launchSharedPreview).toHaveBeenCalledWith('p1'))
   expect(await screen.findByTitle('Visitor Log')).toBeTruthy() // the iframe
+})
+
+it('mounts the frame only once the session has been renewed', async () => {
+  let renewed = (): void => undefined
+  h.renewSessionForPreview.mockReturnValue(new Promise<void>((resolve) => (renewed = resolve)))
+  h.getProject.mockResolvedValue(makeProject({ hasSavedSnapshot: true }))
+  h.launchSharedPreview.mockResolvedValue({
+    appId: 'app-1',
+    previewUrl: 'https://app-1.example/',
+    ready: true,
+    snapshotTakenAt: null,
+  })
+
+  renderAt()
+
+  await waitFor(() => expect(h.renewSessionForPreview).toHaveBeenCalled())
+  expect(screen.queryByTitle('Visitor Log')).toBeNull()
+  renewed()
+  expect(await screen.findByTitle('Visitor Log')).toBeTruthy()
 })
 
 it('still attempts Launch when the snapshot presence is unknown (null)', async () => {
