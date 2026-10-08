@@ -159,16 +159,16 @@ class CoreSettings(BaseSettings):
         """
         return urlsplit(self.APPS_BASE_URL).hostname or ""
 
-    def app_url(self, app_name: str) -> str:
-        """The browser-facing address of the app whose container is called `app_name`.
+    def app_url(self, key: str) -> str:
+        """The browser-facing address of the app addressed by `key`: a preview's or shared
+        view's alias, or a published app's `pub-` + 28 hex name.
 
-        `app_name` (`sbx-`/`pub-` + 28 hex, the container app's own name) makes this a string
-        composition, not a lookup — no registry needed.
+        A string composition, not a lookup — the edge does the resolving.
 
         NO TRAILING SLASH, measured not chosen: against a real Next 16 dev server, `/<base>/`
         redirects (308) to `/<base>`, only the unslashed form answers 200. A slash here would
         put a redirect in front of every framed preview and published link."""
-        return f"{self.APPS_BASE_URL}{base_path_for(app_name)}"
+        return f"{self.APPS_BASE_URL}{base_path_for(key)}"
 
 
 def require_an_https_portal_in_production(is_production: bool, frontend_url: str) -> None:

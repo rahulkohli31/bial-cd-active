@@ -56,6 +56,7 @@ from src.services.sandbox.base import (
     SandboxGoneError,
     SandboxHandle,
     a_fresh_sandbox_name,
+    new_alias,
 )
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
@@ -400,7 +401,11 @@ class RecordingAca(AcaControlPlane):
 
     def made_for_the_pool(self, name: str) -> str:
         """A container a pool fill made, as Azure knows it. Returns its address."""
-        self.created[name] = {"SUPERVISOR_TOKEN": "pool-bearer", "BIAL_POOL_MEMBER": "1"}
+        self.created[name] = {
+            "SUPERVISOR_TOKEN": "pool-bearer",
+            "BIAL_POOL_MEMBER": "1",
+            "BIAL_BASE_PATH": f"/a/{new_alias()}",
+        }
         self.fqdns[name] = f"{name}.pool.westeurope.azurecontainerapps.io"
         return self.fqdns[name]
 

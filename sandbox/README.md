@@ -98,7 +98,7 @@ the `BIAL_*` ones for a reader inside the app.
 | `BIAL_BLOB_CONTAINER_URL` | the app's own per-app Blob container URL                               |
 | `BIAL_BLOB_SAS`           | the container-scoped SAS (secret — server-only, redacted from output)  |
 | `BIAL_DATABASE_URL`       | the project's own PostgreSQL connection string (secret, server-only)   |
-| `BIAL_BASE_PATH`          | the path this app is served under, e.g. `/a/sbx-<28 hex>` — read by `next.config.ts` |
+| `BIAL_BASE_PATH`          | the path this app is served under, e.g. `/a/<32 hex>` — read by `next.config.ts` |
 | `BIAL_APPS_HOSTNAME`      | the public hostname every generated app is served from (Server Actions origin) |
 | `BIAL_DICE_URL`           | the flight-data lake: account, container and folder in one URL — **only when the connector is approved and switched on for this project** |
 | `BIAL_DICE_CLIENT_ID`     | the managed identity's **client** id, for `ManagedIdentityCredential` — same condition |
@@ -107,10 +107,10 @@ the `BIAL_*` ones for a reader inside the app.
 
 `BIAL_BASE_PATH` and `BIAL_APPS_HOSTNAME` are set by the control plane at the provision seam and
 by the pool's fill (`_provision_container` and `fill_one`, both in
-`backend/src/services/sandbox/client.py`), the base path from the container's own name. The fill
+`backend/src/services/sandbox/client.py`), the base path from a random alias minted there. The fill
 sets `BIAL_PORTAL_ORIGIN` too, from `FRONTEND_URL`, since a pool member gets nothing from
 `build_app_env`. The first two are never in `build_app_env` — a base path added there would ship
-an `sbx-` value into a `pub-` published container.
+a preview's alias into a `pub-` published container.
 
 A pool member is created with `BIAL_POOL_MEMBER=1`, which no child sees, and without the six
 per-project names: `BIAL_APP_ID`, the two Blob values, the database URL and the two `BIAL_DICE_*`.

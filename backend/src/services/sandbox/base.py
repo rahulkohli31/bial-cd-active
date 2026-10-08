@@ -6,9 +6,10 @@ An `abc.ABC`, not a `Protocol` (mirrors `ObjectStorage`): an incomplete implemen
 at instantiation. No vendor type crosses this port; every call goes to
 `https://{handle.fqdn}/_sup/<endpoint>` with `Authorization: Bearer {handle.token}`.
 TWO ADDRESSES, NOT INTERCHANGEABLE: `preview_url` is PUBLIC — the router address a browser
-gets, carrying the key (per-app subdomains would need a wildcard cert BIAL refused).
-`app_root_url`/`fqdn` are PRIVATE, direct to the container — BIAL's ACA has no public DNS.
-The control plane always uses the private pair; `preview_url` would leave the VNet.
+gets, carrying a random alias rather than the container's name (per-app subdomains would need a
+wildcard cert BIAL refused). `app_root_url`/`fqdn` are PRIVATE, direct to the container — BIAL's
+ACA has no public DNS. The control plane always uses the private pair; `preview_url` would leave
+the VNet.
 """
 
 from __future__ import annotations
@@ -97,16 +98,23 @@ def a_fresh_sandbox_name() -> str:
     return f"{SANDBOX_NAME_PREFIX}{secrets.token_hex(14)}"
 
 
-def base_path_for(app_name: str) -> str:
-    """The path a generated app is served under, e.g. `/a/sbx-<28 hex>`.
+def new_alias() -> str:
+    """A preview's or shared view's public address key: 32 lowercase hex from a secure random
+    generator (ADR-0006), new for every container and never reused. Its shape differs from every
+    container-name shape, so the edge and the supervisor tell the two apart."""
+    return secrets.token_hex(16)
 
-    THE KEY IS THE CONTAINER'S NAME: the router holds no registry, so an unknown key fails
-    as a DNS miss, not a lookup miss.
+
+def base_path_for(key: str) -> str:
+    """The path a generated app is served under, e.g. `/a/<32 hex alias>`.
+
+    THE KEY IS THE ALIAS for a preview or shared view and the container's name for a published
+    app; the edge resolves an alias privately and routes a `pub-` name by composition.
 
     NO TRAILING SLASH — measured, not stylistic: Next 308-redirects `/<base>/` to `/<base>`,
     so a slashed value reads as a redirect, not the app, and is rejected as a `basePath`.
     """
-    return f"/a/{app_name}"
+    return f"/a/{key}"
 
 
 # --- ARM identity tags -------------------------------------------------------
@@ -367,8 +375,8 @@ class SandboxHandle:
     app_name: str
     """The app/container identifier (one-app-per-project); == the registry's `app_name`."""
     preview_url: str
-    """THE PUBLIC ADDRESS — `https://<apps-host>/a/<app_name>/`, the browsable preview the portal
-    frames cross-origin. Never carries the bearer token.
+    """THE PUBLIC ADDRESS — `https://<apps-host>/a/<alias>`, the browsable preview the portal
+    frames cross-origin. Never carries the bearer token or the container's name.
 
     Use `app_root_url` for anything the CONTROL PLANE does — a probe pointed here would leave
     the VNet and traverse the public gateway."""
@@ -387,6 +395,9 @@ class SandboxHandle:
     project's settings. False only for a pool container not configured since it booted, which
     Azure restarting a claimed one also produces; it refuses to start the app until `configure`.
     A supervisor that does not say was given its settings when it was created."""
+    base_path: str = ""
+    """The path the container serves under, `/a/<alias>` for a preview or shared view. Empty means
+    the container's own name, which is all a handle built only to tear a container down knows."""
 
     @property
     def app_root_url(self) -> str:
@@ -398,7 +409,7 @@ class SandboxHandle:
         that into "make sure `app/page.tsx` exists" and the model burns metered tokens repairing
         a file that was never wrong.
         """
-        return f"https://{self.fqdn}{base_path_for(self.app_name)}"
+        return f"https://{self.fqdn}{self.base_path or base_path_for(self.app_name)}"
 
 
 @dataclass(frozen=True)

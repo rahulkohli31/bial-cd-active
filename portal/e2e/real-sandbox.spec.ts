@@ -19,13 +19,13 @@ const REAL_SANDBOX = process.env.E2E_REAL_SANDBOX === '1'
 
 /**
  * The address a live preview is served at. Generated apps share ONE hostname with the app key in
- * the path (`/a/sbx-<28 hex>`) rather than a per-app `*.azurecontainerapps.io` one — BIAL refused
+ * the path (`/a/<32 hex alias>`) rather than a per-app `*.azurecontainerapps.io` one — BIAL refused
  * a wildcard certificate and its Container Apps environment publishes no public DNS. Matched by
  * SHAPE, not a literal host: the hostname is deployment config (`APPS_BASE_URL`), and pinning one
  * here is what made the previous assertion go stale silently. `apps-domain.spec.ts` proves the
  * base path itself works; this only needs the shape to stay right.
  */
-const PREVIEW_ADDRESS = /^https?:\/\/[^/]+\/a\/sbx-[0-9a-f]{28}\/?$/
+const PREVIEW_ADDRESS = /^https?:\/\/[^/]+\/a\/[0-9a-f]{32}\/?$/
 
 // A description that clears the 15-120 word bound (#191) — required on every create.
 const VALID_DESCRIPTION =

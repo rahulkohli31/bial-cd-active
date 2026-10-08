@@ -40,6 +40,7 @@ from src.services.redis import (
     registry_key,
 )
 from src.services.redis.keys import (
+    REGISTRY_FIELD_ALIAS,
     REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
@@ -61,6 +62,7 @@ from src.services.sandbox.base import (
     DevStatus,
     ServedCount,
     app_name_for,
+    new_alias,
     shr_name_for,
 )
 from src.services.sandbox.config import SandboxConfig
@@ -115,11 +117,15 @@ async def _seed(
     app_name: str = SBX,
     with_lock: bool = True,
     with_heartbeat: bool = True,
+    with_alias: bool = True,
     serving_since: str | None = None,
     created_at: str = "2026-07-14T00:00:00+00:00",
     state: str = REGISTRY_STATE_READY,
 ) -> None:
-    """`serving_since` is a TRI-STATE and the default is the quiet one:
+    """`with_alias=False` is a record from before aliases, which the sweep drains whatever else
+    claims it.
+
+    `serving_since` is a TRI-STATE and the default is the quiet one:
 
       None     -> the field is not written at all: PRE-CUTOVER, read as proven, never probed.
       ""       -> the container exists and has never served.
@@ -139,6 +145,7 @@ async def _seed(
             REGISTRY_FIELD_TOKEN_REF: "ref-123",
             REGISTRY_FIELD_CREATED_AT: created_at,
             REGISTRY_FIELD_STATE: state,
+            **({REGISTRY_FIELD_ALIAS: new_alias()} if with_alias else {}),
         },
     )
     if serving_since is not None:
@@ -448,6 +455,54 @@ async def test_sweep_spares_a_preview_inside_its_stay(fake_redis: aioredis.Redis
     assert (await reaper.sweep_all(fake_redis, client)).reaped == 0
     assert client.torn_down == []
     assert await locks.read_registry(fake_redis, USER) is not None
+
+
+@pytest.mark.parametrize(
+    "claim",
+    ["a_current_stay", "a_held_lease", "a_start_in_flight"],
+)
+async def test_a_record_with_no_alias_is_drained_whatever_else_claims_it(
+    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch, claim: str
+) -> None:
+    """A container from before aliases cannot be framed at an address the edge accepts, so no
+    claim spares it: it is reaped through `reap_user` with its owning app id, which is the
+    write-back, and the owner's next start brings it back with an alias."""
+    await _seed_preview(fake_redis, USER, stay=_in(600))
+    if claim == "a_held_lease":
+        await _hold_a_lease(fake_redis, USER)
+    if claim == "a_start_in_flight":
+        await fake_redis.set(starting_key(USER), str(uuid.uuid4()), ex=300)
+    await fake_redis.hdel(registry_key(USER), REGISTRY_FIELD_ALIAS)
+    app_id = uuid.uuid4()
+    reaped_with: list[uuid.UUID | None] = []
+
+    async def _spy_reap(redis, user, client, *, strict=False, app_id=None):  # noqa: ANN001
+        reaped_with.append(app_id)
+        return True
+
+    monkeypatch.setattr(reaper, "reap_user", _spy_reap)
+
+    result = await reaper.sweep_all(
+        fake_redis,
+        FakeSandboxClient(),
+        app_ids_by_name={a_sandbox_name("preview"): OwnedApp(app_id, USER)},
+    )
+
+    assert result.reaped == 1
+    assert reaped_with == [app_id]
+
+
+async def test_the_same_record_with_an_alias_is_spared_by_the_same_claims(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The pair of the test above: liveness for the claim, so the drain is the alias's absence
+    and not something the claims stopped doing."""
+    await _seed_preview(fake_redis, USER, stay=_in(600))
+    assert await fake_redis.hexists(registry_key(USER), REGISTRY_FIELD_ALIAS) == 1
+    client = FakeSandboxClient()
+
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 0
+    assert client.torn_down == []
 
 
 async def test_sweep_reaps_a_preview_once_its_stay_lapses(fake_redis: aioredis.Redis) -> None:
@@ -1255,6 +1310,7 @@ async def _a_newer_container_registers(redis: aioredis.Redis, user: uuid.UUID) -
         registry_key(user),
         mapping={
             REGISTRY_FIELD_APP_NAME: NEWER,
+            REGISTRY_FIELD_ALIAS: new_alias(),
             REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
             REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
         },
@@ -1876,6 +1932,7 @@ def _a_proven_record() -> dict[str, str]:
     return {
         REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
         REGISTRY_FIELD_APP_NAME: SBX,
+        REGISTRY_FIELD_ALIAS: new_alias(),
         REGISTRY_FIELD_CREATED_AT: "2026-09-10T09:00:00+00:00",
         REGISTRY_FIELD_SERVING_SINCE: "2026-09-10T09:41:04+00:00",
     }

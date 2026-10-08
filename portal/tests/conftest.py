@@ -19,10 +19,12 @@ from _router import (
     OTHER_SBX_KEY,
     PORTAL_ORIGIN,
     PUB_KEY,
+    ROUTE_TOKEN,
     ROUTER_IMAGE,
     SBX_KEY,
     SHR_KEY,
     STUB_IMAGE,
+    STUB_ROUTES,
     Router,
     _build,
     _free_port,
@@ -62,6 +64,7 @@ def stub_apps(images: None, docker_network: str) -> Iterator[None]:
     for key in (SBX_KEY, PUB_KEY, OTHER_SBX_KEY, SHR_KEY):
         args += ["--network-alias", f"{key}.{APPS_DOMAIN}"]
     args += ["--network-alias", BACKEND_ALIAS]
+    args += ["-e", f"STUB_ROUTES={STUB_ROUTES}", "-e", f"STUB_ROUTE_TOKEN={ROUTE_TOKEN}"]
     args += [STUB_IMAGE]
     proc = _run(args, timeout=120)
     if proc.returncode != 0:
@@ -99,15 +102,16 @@ def _wait_for_tls(network: str, host: str, timeout: float = 45.0) -> None:
 
 @pytest.fixture(scope="session")
 def router(stub_apps: None, docker_network: str) -> Iterator[Router]:
-    # No backend answers here, deliberately: the body-ceiling test reads the unreachable upstream.
-    yield from _start_router(docker_network, "http://backend-not-used:8000")
+    """The router with its backend hop answered by the stub: the alias lookup, and the four
+    security headers the real backend sets, so the edge's single ownership of them can be
+    observed."""
+    yield from _start_router(docker_network, f"https://{BACKEND_ALIAS}")
 
 
 @pytest.fixture(scope="session")
-def router_with_backend(stub_apps: None, docker_network: str) -> Iterator[Router]:
-    """The same router with its backend hop answered by the stub, which sends the four security
-    headers the real backend sets, so the edge's single ownership of them can be observed."""
-    yield from _start_router(docker_network, f"https://{BACKEND_ALIAS}")
+def router_without_backend(stub_apps: None, docker_network: str) -> Iterator[Router]:
+    """No backend answers here, deliberately: the body-ceiling test reads the unreachable one."""
+    yield from _start_router(docker_network, "http://backend-not-used:8000")
 
 
 def _start_router(docker_network: str, backend_url: str) -> Iterator[Router]:
@@ -136,6 +140,8 @@ def _start_router(docker_network: str, backend_url: str) -> Iterator[Router]:
             f"APPS_HOSTNAME={APPS_HOSTNAME}",
             "-e",
             f"PORTAL_ORIGIN={PORTAL_ORIGIN}",
+            "-e",
+            f"INTERNAL_ROUTE_TOKEN={ROUTE_TOKEN}",
             ROUTER_IMAGE,
         ],
         timeout=120,

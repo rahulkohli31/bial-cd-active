@@ -83,7 +83,7 @@ import type { NextConfig } from "next";
 // absent on a plain local dev loop, and the app then serves at `/` exactly as an ordinary Next
 // app does — so nothing here changes how this template behaves outside a BIAL sandbox.
 //
-// `BIAL_BASE_PATH` is the app's own address, e.g. `/a/sbx-<28 hex>`. Next requires it to start
+// `BIAL_BASE_PATH` is the app's own address, e.g. `/a/<32 hex>`. Next requires it to start
 // with `/` and to carry NO trailing slash; the platform sends it in exactly that shape, and the
 // supervisor refuses to pass on a value that is not.
 const basePath = process.env.BIAL_BASE_PATH ?? "";

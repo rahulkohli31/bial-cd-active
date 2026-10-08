@@ -64,6 +64,7 @@ flowchart TD
   B -->|"interface"| P
   B -->|"API calls, via the edge"| P
   P --> A
+  P -.->|"resolves a preview's address"| A
   A --> DB
   A --> R
   A --> O
@@ -75,9 +76,10 @@ flowchart TD
 ```
 
 Two edges in that picture matter more than they look. The browser reaches a running preview
-**directly**, not proxied through the control plane — the preview is framed from its own origin.
-And a generated application reaches its data **directly**, not through the control plane at all.
-Both are explained below.
+**without passing through the control plane** — the preview is framed from its own origin, and the
+portal edge only asks the control plane which container an address stands for. And a generated
+application reaches its data **directly**, not through the control plane at all. Both are explained
+below.
 
 ## How a build flows
 
@@ -285,9 +287,22 @@ preview. They are not a content policy over the application's own network access
 never intended to be — the boundary that constrains what generated code can reach is the
 environment allowlist and the per-project credential, not the framing headers.
 
-The control plane is also unreachable on the generated application's own origin. Nothing on the
-path that serves applications forwards to the API, so an application cannot call the platform's
-own endpoints by convenience of being nearby.
+**An application's address does not name its container, and the control plane is unreachable on
+it.** A preview, or a colleague's shared view of one, is served at an address carrying a random
+alias, new for every container and never reused; a ready sandbox made ahead gets its alias when it
+is made. The portal edge resolves it to the container through an internal lookup that only the edge
+can call. An unknown or retired alias, and any address that names a container directly, shows the
+"app not available" page. A deployed application keeps its own permanent address, which is its
+public link, and its container is reachable only through the edge. That lookup is the one thing on
+the path that serves applications that reaches the control plane, and it never does for a deployed
+application: it sits outside the public API, is authenticated by a secret only the edge holds, and
+is not forwarded from the applications site, so an application cannot call the platform's own
+endpoints by convenience of being nearby (ADR-0033).
+
+An alias hides an identifier; it is not a gate. Previews are shareable by design, so anyone holding
+a link opens the preview, and signing in is the application's own business. Code running in a
+container can still read its own Host header, which carries the container's name, and calls
+between containers inside the network do not pass the edge.
 
 **The edge sends a page's security headers once, and a preview's development surface not at
 all.** The portal edge owns the browser-facing security headers: what the control plane sets

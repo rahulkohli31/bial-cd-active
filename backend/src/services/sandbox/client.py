@@ -38,6 +38,9 @@ from src.services.redis import (
     registry_key,
 )
 from src.services.redis.keys import (
+    ALIAS_TTL_SECONDS,
+    IS_ALIAS,
+    REGISTRY_FIELD_ALIAS,
     REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
@@ -50,6 +53,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
     REGISTRY_FIELD_WAITING_SINCE,
+    alias_key,
 )
 from src.services.sandbox.aca import (
     _LRO_CEILING_SECONDS,
@@ -79,6 +83,7 @@ from src.services.sandbox.base import (
     ServedPage,
     a_fresh_sandbox_name,
     base_path_for,
+    new_alias,
     pool_member_tags,
     sandbox_tags,
     shared_sandbox_tags,
@@ -170,7 +175,7 @@ _PER_PROJECT_ENV_NAMES: Final = frozenset(
 # A container's registry record, written only while the record names no container: a start spends
 # seconds between the provision's guard and this write, and another start may take the slot
 # meanwhile. ARGV: app name, app id, fqdn, token_ref, birth, then the shared view's project and
-# owner, both empty for a build sandbox.
+# owner, both empty for a build sandbox, then the alias.
 #
 # The record is per user and outlives its container, so every field a previous occupant could
 # leave is overwritten or deleted here. `serving_since` is written as the empty sentinel and never
@@ -186,7 +191,8 @@ _WRITE_THE_REGISTRY_LUA: Final = (
     f"'{REGISTRY_FIELD_APP_ID}', ARGV[2], '{REGISTRY_FIELD_FQDN}', ARGV[3], "
     f"'{REGISTRY_FIELD_TOKEN_REF}', ARGV[4], '{REGISTRY_FIELD_CREATED_AT}', ARGV[5], "
     f"'{REGISTRY_FIELD_STATE}', '{REGISTRY_STATE_READY}', "
-    f"'{REGISTRY_FIELD_WAITING_SINCE}', ARGV[5], '{REGISTRY_FIELD_SERVING_SINCE}', '') "
+    f"'{REGISTRY_FIELD_WAITING_SINCE}', ARGV[5], '{REGISTRY_FIELD_SERVING_SINCE}', '', "
+    f"'{REGISTRY_FIELD_ALIAS}', ARGV[8]) "
     f"redis.call('HDEL', KEYS[1], '{REGISTRY_FIELD_PREVIEW_STAY_UNTIL}', "
     f"'{REGISTRY_FIELD_SHARED_SERVED_COUNT}') "
     "if ARGV[6] ~= '' then "
@@ -203,6 +209,9 @@ _SUPERVISOR_TOKEN_BYTES: Final = 32
 # inlined because it is now read back as well as written: it is the token's durable home across
 # a control-plane restart (`_recover_token`), so the two sites must never drift apart.
 _SUPERVISOR_TOKEN_ENV: Final = "SUPERVISOR_TOKEN"
+# The container-env key its base path is injected under; read back for a container the registry
+# cannot describe yet (`attach_by_name`, a claimed pool container).
+_BASE_PATH_ENV: Final = "BIAL_BASE_PATH"
 _TOKEN_REF_BYTES: Final = 16
 
 # WHICH BIRTH a container had, carried only so the create notice can say. A
@@ -434,8 +443,8 @@ def _identity_tags(kind: SandboxKind, user_uuid: uuid.UUID, app_id: uuid.UUID) -
     return sandbox_tags(user_id=user_uuid, app_id=app_id)
 
 
-def _public_app_url(app_name: str) -> str:
-    """Where a BIAL employee's browser reaches this app.
+def _public_app_url(base_path: str) -> str:
+    """Where a BIAL employee's browser reaches the app served under `base_path`.
 
     NOT `https://{fqdn}/`. The Container Apps environment is internal and publishes no public
     DNS, so its own domain does not resolve from a BIAL desk. Lazy settings import for the
@@ -443,7 +452,7 @@ def _public_app_url(app_name: str) -> str:
     """
     from src.config import settings  # lazy: avoid an import cycle via src.config
 
-    return settings.app_url(app_name)
+    return f"{settings.APPS_BASE_URL}{base_path}"
 
 
 def _apps_hostname() -> str:
@@ -471,12 +480,12 @@ def portal_origin() -> str:
     return settings.FRONTEND_URL.rstrip("/")
 
 
-def _name_bound_env(name: str, token: str) -> dict[str, str]:
-    """What a container is created with from its own name: its supervisor bearer, the path it is
-    served under and the hostname that path is served on."""
+def _creation_env(base_path: str, token: str) -> dict[str, str]:
+    """What every container is created with: its supervisor bearer, the path it is served under
+    and the hostname that path is served on."""
     return {
         _SUPERVISOR_TOKEN_ENV: token,
-        "BIAL_BASE_PATH": base_path_for(name),
+        _BASE_PATH_ENV: base_path,
         "BIAL_APPS_HOSTNAME": _apps_hostname(),
     }
 
@@ -940,6 +949,7 @@ class AcaSandboxClient(SandboxClient):
         *,
         app_name: str,
         app_id: uuid.UUID,
+        alias: str,
         fqdn: str,
         token_ref: str,
         shared_project_id: uuid.UUID | None = None,
@@ -949,6 +959,9 @@ class AcaSandboxClient(SandboxClient):
         `_SlotTakenError`, writing nothing, otherwise. `shared_project_id` and `shared_owner_id`
         come together, for a colleague's view, or not at all. See `_WRITE_THE_REGISTRY_LUA`."""
         born = datetime.now(UTC).isoformat()
+        # First, so a failure leaves no record; one left behind by a refused or failed registry
+        # write below can only answer no (see `alias_key`).
+        await get_redis().set(alias_key(alias), str(user_uuid), ex=ALIAS_TTL_SECONDS)
         run_script = get_redis().eval  # aliased to keep the call off the JS-oriented eval guard
         written = await run_script(
             _WRITE_THE_REGISTRY_LUA,
@@ -961,6 +974,7 @@ class AcaSandboxClient(SandboxClient):
             born,
             "" if shared_project_id is None else str(shared_project_id),
             "" if shared_owner_id is None else str(shared_owner_id),
+            alias,
         )
         if not written:
             raise _SlotTakenError("the registry already names a container")
@@ -1098,6 +1112,16 @@ class AcaSandboxClient(SandboxClient):
         except (AcaError, AcaTransientError):  # fmt: skip  # ruff py314 strips parens
             _log.warning("supervisor_token_recovery_failed", app_name=app_name, exc_info=True)
             return None
+
+    async def _read_base_path(self, app_name: str) -> str:
+        """The path a container serves under, read off its own ACA env; its own name when the env
+        carries none. A failed read is `SandboxNotReadyError`, never a guess: a wrong path 404s
+        every probe of an app that is running."""
+        try:
+            raw = await self._aca.get_app_env_value(name=app_name, key=_BASE_PATH_ENV)
+        except (AcaError, AcaTransientError) as exc:  # fmt: skip  # ruff py314 strips parens
+            raise SandboxNotReadyError("could not read the container's base path") from exc
+        return raw or base_path_for(app_name)
 
     async def _recover_token(self, token_ref: str, app_name: str) -> str | None:
         """Re-read a container's supervisor bearer from its ACA env, re-bound to the registry's
@@ -1302,15 +1326,15 @@ class AcaSandboxClient(SandboxClient):
         container is the caller's to let go."""
         stopwatch = running_stopwatch()
         with stopwatch.lap("bearer_read"):
-            token = await self._read_a_claimed_bearer(member.name)
+            token, alias = await self._read_a_claimed_env(member.name)
+        base_path = base_path_for(alias)
         handle = SandboxHandle(
             fqdn=member.fqdn,
             token=token,
             app_name=member.name,
-            # Its base path, apps hostname and portal origin were set when it was made, from
-            # this same name.
-            preview_url=_public_app_url(member.name),
+            preview_url=_public_app_url(base_path),
             ready=False,
+            base_path=base_path,
         )
         try:
             await self._check_health(handle)
@@ -1329,6 +1353,7 @@ class AcaSandboxClient(SandboxClient):
                     user_uuid,
                     app_name=member.name,
                     app_id=app_id,
+                    alias=alias,
                     fqdn=member.fqdn,
                     token_ref=token_ref,
                     shared_project_id=shared_project_id,
@@ -1340,24 +1365,27 @@ class AcaSandboxClient(SandboxClient):
             raise
         return handle
 
-    async def _read_a_claimed_bearer(self, name: str) -> str:
-        """A claimed container's supervisor bearer, off its Azure environment. A transient ARM
-        error is asked again once, and a second keeps the container: nothing was learnt of it. A
-        container Azure does not have, or one with no bearer, falls through to be let go."""
+    async def _read_a_claimed_env(self, name: str) -> tuple[str, str]:
+        """A claimed container's supervisor bearer and alias, off its Azure environment. A
+        transient ARM error is asked again once, and a second keeps the container: nothing was
+        learnt of it. A container Azure does not have, one with no bearer, or one made before
+        aliases, which serves at its own name, falls through to be let go."""
         transient: AcaTransientError | None = None
         for attempt in range(_BEARER_READS):
             if attempt:
                 await _asleep(_ACA_RETRY_START_SECONDS)
             try:
                 token = await self._aca.get_app_env_value(name=name, key=_SUPERVISOR_TOKEN_ENV)
+                base_path = await self._aca.get_app_env_value(name=name, key=_BASE_PATH_ENV)
             except AcaTransientError as exc:
                 transient = exc
                 continue
             except AcaError as exc:
                 raise _ClaimFellThroughError("claim_failed") from exc
-            if token is None:
+            alias = (base_path or "").removeprefix("/a/")
+            if token is None or base_path != base_path_for(alias) or not IS_ALIAS.fullmatch(alias):
                 raise _ClaimFellThroughError("claim_failed")
-            return token
+            return token, alias
         raise _ClaimFellThroughError("claim_failed", keep=True) from transient
 
     async def _put_it_back(self, member: ClaimedMember) -> None:
@@ -1425,8 +1453,9 @@ class AcaSandboxClient(SandboxClient):
         if member_id is None:
             return "at_target"
         token = secrets.token_urlsafe(_SUPERVISOR_TOKEN_BYTES)
+        # The alias is set now, with the base path it lives in: a claim cannot change either.
         env = {
-            **_name_bound_env(name, token),
+            **_creation_env(base_path_for(new_alias()), token),
             "BIAL_PORTAL_ORIGIN": portal_origin(),
             "BIAL_POOL_MEMBER": "1",
         }
@@ -1563,13 +1592,13 @@ class AcaSandboxClient(SandboxClient):
         # The supervisor bearer lives ONLY in the container env (the supervisor keeps it out of
         # the scrubbed child env) and in-process; Redis stores a token_ref, never the token.
         #
-        # WHERE THIS APP IS SERVED FROM, derived here rather than passed in. This is the one seam
-        # BOTH births pass through — `provision_new` and `restore_from_snapshot` — so a preview
-        # is always served under its own container's name, the key the router matches on. It is
-        # deliberately NOT in `build_app_env`: the publish path calls that same builder, and a
-        # base path added there would ship an `sbx-` value into published containers whose
-        # images were built with a `pub-` one.
-        env = {**app_env, **_name_bound_env(app_name, token)}
+        # WHERE THIS APP IS SERVED FROM, minted at the one seam both births pass through —
+        # `provision_new` and `restore_from_snapshot`. It is deliberately NOT in `build_app_env`:
+        # the publish path calls that same builder, and a preview's alias added there would ship
+        # into published containers whose images were built under their `pub-` name.
+        alias = new_alias()
+        base_path = base_path_for(alias)
+        env = {**app_env, **_creation_env(base_path, token)}
         # Identity resolved BEFORE the create, so a container never exists untagged.
         tags = _identity_tags(kind, user_uuid, app_id)
         # WHETHER THIS CONTAINER MAY READ A CONNECTOR'S DATA, read back out of the environment
@@ -1606,6 +1635,7 @@ class AcaSandboxClient(SandboxClient):
                     user_uuid,
                     app_name=app_name,
                     app_id=app_id,
+                    alias=alias,
                     fqdn=fqdn,
                     token_ref=token_ref,
                     shared_project_id=shared_project_id,
@@ -1622,15 +1652,16 @@ class AcaSandboxClient(SandboxClient):
             fqdn=fqdn,
             token=token,
             app_name=app_name,
-            # THE BROWSER-FACING ADDRESS, which is no longer this container's own name. An
-            # internal Container Apps environment publishes no public DNS, so a BIAL desk cannot
-            # resolve `{fqdn}` at all — apps are reached through the platform's router on one
-            # public hostname with the app's key in the path. The control plane keeps using the
-            # direct address: `/_sup/*` composes from `fqdn`, and both serving probes compose
+            # THE BROWSER-FACING ADDRESS, which carries the alias and not this container's name.
+            # An internal Container Apps environment publishes no public DNS, so a BIAL desk
+            # cannot resolve `{fqdn}` at all — apps are reached through the platform's router on
+            # one public hostname with the app's key in the path. The control plane keeps using
+            # the direct address: `/_sup/*` composes from `fqdn`, and both serving probes compose
             # from `handle.app_root_url`, which also derives from `fqdn`. Repointing this field
             # therefore cannot drag control-plane traffic onto the public gateway.
-            preview_url=_public_app_url(app_name),
+            preview_url=_public_app_url(base_path),
             ready=False,
+            base_path=base_path,
         )
 
     async def _hold_the_create(self, app_name: str) -> uuid.UUID | None:
@@ -1772,14 +1803,19 @@ class AcaSandboxClient(SandboxClient):
                 if fqdn_now is not None:
                     raise SandboxNotReadyError("supervisor token temporarily unrecoverable")
             raise SandboxGoneError("token reference not resolvable")
+        alias = reg.get(REGISTRY_FIELD_ALIAS)
+        # A record with no alias describes a container from before aliases, which serves at its
+        # own name. The sweep retires it, writing its work back first.
+        base_path = base_path_for(alias or app_name)
         handle = SandboxHandle(
             fqdn=fqdn,
             token=token,
             app_name=app_name,
             # Same public address as a fresh provision — attach and provision must not disagree
             # about where a person goes, or a relaunched session frames a different URL.
-            preview_url=_public_app_url(app_name),
+            preview_url=_public_app_url(base_path),
             ready=False,
+            base_path=base_path,
         )
         handle = replace(handle, configured=await self._probe_with_retry(handle))
         self._app_owners[app_name] = user_uuid
@@ -1817,12 +1853,14 @@ class AcaSandboxClient(SandboxClient):
         token = await self._read_supervisor_token(app_name)
         if token is None:
             raise SandboxNotReadyError("supervisor token temporarily unrecoverable")
+        base_path = await self._read_base_path(app_name)
         handle = SandboxHandle(
             fqdn=fqdn,
             token=token,
             app_name=app_name,
-            preview_url=_public_app_url(app_name),
+            preview_url=_public_app_url(base_path),
             ready=False,
+            base_path=base_path,
         )
         handle = replace(handle, configured=await self._probe_with_retry(handle))
         try:

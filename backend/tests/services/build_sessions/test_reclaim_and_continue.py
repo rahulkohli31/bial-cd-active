@@ -40,6 +40,7 @@ from src.services.build_sessions.pass_history import CopyAttempt
 from src.services.messages.store import _INTERRUPTED_RESULT, dump_for_row
 from src.services.redis import REGISTRY_STATE_ENDING, REGISTRY_STATE_READY, get_redis
 from src.services.redis.keys import (
+    REGISTRY_FIELD_ALIAS,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -49,7 +50,7 @@ from src.services.redis.keys import (
     lock_key,
     registry_key,
 )
-from src.services.sandbox.base import SandboxError, SandboxGoneError, SandboxHandle
+from src.services.sandbox.base import SandboxError, SandboxGoneError, SandboxHandle, new_alias
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from src.services.storage.errors import StorageError
@@ -436,6 +437,7 @@ async def _a_newer_container_takes_the_slot(
         registry_key(user_id),
         mapping={
             REGISTRY_FIELD_APP_NAME: _NEWER,
+            REGISTRY_FIELD_ALIAS: new_alias(),
             REGISTRY_FIELD_FQDN: f"{_NEWER}.example.io",
             REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
             REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),

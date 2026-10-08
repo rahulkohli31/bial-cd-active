@@ -37,14 +37,39 @@ APPS_HOSTNAME = "apps.bial.test"
 PORTAL_ORIGIN = "https://portal.bial.test"
 
 # 28 lowercase hex, exactly as `app_name_for` / `published_app_name` / `shr_name_for` mint them.
+# A preview's or shared view's container name is NEVER in an address: the browser holds its alias.
 SBX_KEY = "sbx-" + "1a2b3c4d5e6f70819a2b3c4d5e6f"
 PUB_KEY = "pub-" + "1a2b3c4d5e6f70819a2b3c4d5e6f"
 # #198 — a colleague's shared-runtime view of a project shared with them, the third lineage.
 SHR_KEY = "shr-" + "1a2b3c4d5e6f70819a2b3c4d5e6f"
 OTHER_SBX_KEY = "sbx-" + "99887766554433221100aabbccdd"
-# Correctly shaped and deliberately NOT given a DNS alias: this is what an expired sandbox or a
-# mistyped-but-plausible key looks like to the router.
+# Correctly shaped and deliberately NOT given a DNS alias: this is what an expired sandbox looks
+# like to the router once the lookup has named it.
 GHOST_KEY = "sbx-" + "deadbeefdeadbeefdeadbeefdead"
+
+# The 32-hex aliases the browser holds, and the container each stands for in the stub's lookup.
+ALIAS = "1a2b3c4d5e6f70819a2b3c4d5e6f7081"
+OTHER_ALIAS = "99887766554433221100aabbccddeeff"
+SHR_ALIAS = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+GHOST_ALIAS = "deadbeefdeadbeefdeadbeefdeadbeef"
+# Well-formed and known to nobody: what a retired or never-minted alias looks like.
+UNKNOWN_ALIAS = "abcdefabcdefabcdefabcdefabcdefab"
+# The alias whose container is up in DNS but not serving, and one used only by the cache test.
+DEAD_ALIAS = "11111111111111111111111111111111"
+CACHE_ALIAS = "22222222222222222222222222222222"
+# The shared secret the stub's lookup answers to.
+ROUTE_TOKEN = "test-internal-route-token-0123456789abcdef"  # noqa: S105 - a test fixture, not a secret
+STUB_ROUTES = ",".join(
+    f"{alias}:{name}"
+    for alias, name in [
+        (ALIAS, SBX_KEY),
+        (OTHER_ALIAS, OTHER_SBX_KEY),
+        (SHR_ALIAS, SHR_KEY),
+        (GHOST_ALIAS, GHOST_KEY),
+        (DEAD_ALIAS, "sbx-" + "1" * 28),
+        (CACHE_ALIAS, OTHER_SBX_KEY),
+    ]
+)
 # The stub answers for the portal's backend hop under this name too.
 BACKEND_ALIAS = f"backend.{APPS_DOMAIN}"
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -35,11 +36,13 @@ from src.services.build_sessions import pool_pass
 from src.services.lake.env import connector_env_names
 from src.services.redis import registry_key
 from src.services.redis.keys import (
+    REGISTRY_FIELD_ALIAS,
     REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_SHARED_OWNER_ID,
     REGISTRY_FIELD_SHARED_PROJECT_ID,
+    alias_key,
 )
 from src.services.sandbox import client as client_module
 from src.services.sandbox import pool
@@ -55,6 +58,7 @@ from src.services.sandbox.base import (
     a_fresh_sandbox_name,
     control_plane_segment,
     identity_from_tags,
+    new_alias,
 )
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
@@ -106,7 +110,7 @@ class PoolAca(AcaControlPlane):
         self.env_reads: list[str] = []
 
     def made_for_the_pool(self, name: str, *, token: str | None) -> None:
-        self.envs[name] = {"BIAL_POOL_MEMBER": "1"}
+        self.envs[name] = {"BIAL_POOL_MEMBER": "1", "BIAL_BASE_PATH": f"/a/{new_alias()}"}
         if token is not None:
             self.envs[name]["SUPERVISOR_TOKEN"] = token
         self.tags[name] = {
@@ -321,6 +325,7 @@ async def test_a_start_takes_a_ready_container_as_its_own_workspace(world) -> No
     and address, the handle reaches it with its own bearer, and its row is gone, because the
     registry describes it from here."""
     member = await _ready(world)
+    alias = world.aca.envs[member]["BIAL_BASE_PATH"].removeprefix("/a/")
     user, app_id = uuid.uuid4(), uuid.uuid4()
 
     handle, stopwatch = await _start(world.client, user, app_id)
@@ -328,9 +333,13 @@ async def test_a_start_takes_a_ready_container_as_its_own_workspace(world) -> No
     assert handle.app_name == member
     assert handle.fqdn == f"{member}.pool.example"
     assert handle.token == "pool-bearer"
-    assert handle.preview_url.endswith(f"/a/{member}")
+    assert handle.preview_url.endswith(f"/a/{alias}")
+    assert member not in handle.preview_url
+    assert handle.app_root_url == f"https://{member}.pool.example/a/{alias}"
     record = await world.redis.hgetall(registry_key(user))
     assert record[REGISTRY_FIELD_APP_NAME] == member
+    assert record[REGISTRY_FIELD_ALIAS] == alias
+    assert await world.redis.get(alias_key(alias)) == str(user)
     assert record[REGISTRY_FIELD_APP_ID] == str(app_id)
     assert record[REGISTRY_FIELD_FQDN] == f"{member}.pool.example"
     assert world.aca.created == []
@@ -547,6 +556,14 @@ def _configure_hangs(world: SimpleNamespace, name: str) -> None:
     world.supervisors.hangs_on.add((f"{name}.pool.example", "/configure"))
 
 
+def _made_before_aliases(world: SimpleNamespace, name: str) -> None:
+    world.aca.envs[name]["BIAL_BASE_PATH"] = f"/a/{name}"
+
+
+def _alias_outside_its_path(world: SimpleNamespace, name: str) -> None:
+    world.aca.envs[name]["BIAL_BASE_PATH"] = new_alias()
+
+
 _FAILURES = [
     pytest.param(_bearer_unreadable, "claim_failed", id="bearer-unreadable"),
     pytest.param(_container_absent, "claim_failed", id="container-absent"),
@@ -555,6 +572,8 @@ _FAILURES = [
     pytest.param(_health_hangs, "unhealthy", id="health-hangs"),
     pytest.param(_configure_refused, "claim_failed", id="configure-500"),
     pytest.param(_configure_hangs, "claim_failed", id="configure-hangs"),
+    pytest.param(_made_before_aliases, "claim_failed", id="made-before-aliases"),
+    pytest.param(_alias_outside_its_path, "claim_failed", id="alias-outside-its-path"),
 ]
 
 
@@ -909,7 +928,7 @@ async def test_retiring_touches_only_a_claimed_row(world) -> None:
 
 
 async def test_a_fill_makes_a_container_that_holds_nothing_of_any_project(world) -> None:
-    """Made from its own name with the platform's settings and nothing else: no project's
+    """Made at a fresh alias with the platform's settings and nothing else: no project's
     settings, no data identity, and no owner, app or birth on its tags until a claim."""
     assert await world.client.fill_one(5) == "filled"
 
@@ -922,7 +941,7 @@ async def test_a_fill_makes_a_container_that_holds_nothing_of_any_project(world)
         "BIAL_PORTAL_ORIGIN",
         "BIAL_POOL_MEMBER",
     }
-    assert env["BIAL_BASE_PATH"] == f"/a/{name}"
+    assert re.fullmatch(r"/a/[0-9a-f]{32}", env["BIAL_BASE_PATH"])
     assert env["BIAL_APPS_HOSTNAME"] == "citizenapps.bialairport.com"
     assert env["BIAL_PORTAL_ORIGIN"] == "http://localhost:5173"
     assert env["BIAL_POOL_MEMBER"] == "1"
@@ -943,12 +962,14 @@ async def test_a_fill_makes_a_container_that_holds_nothing_of_any_project(world)
     )
 
 
-async def test_each_fill_gets_a_bearer_of_its_own(world) -> None:
+async def test_each_fill_gets_a_bearer_and_an_alias_of_its_own(world) -> None:
+    """A shared alias would route one person's preview to the other's workspace."""
     await world.client.fill_one(5)
     await world.client.fill_one(5)
 
     first, second = world.aca.filled
     assert world.aca.envs[first]["SUPERVISOR_TOKEN"] != world.aca.envs[second]["SUPERVISOR_TOKEN"]
+    assert world.aca.envs[first]["BIAL_BASE_PATH"] != world.aca.envs[second]["BIAL_BASE_PATH"]
 
 
 async def test_a_fill_is_on_the_ledger_before_azure_is_asked(world) -> None:
