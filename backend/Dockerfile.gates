@@ -38,7 +38,7 @@ WORKDIR /app
 #
 # It must never be added to the shipped image: that would re-import a whole Node CVE surface into
 # the artifact this rebase exists to shrink.
-RUN apk add --no-cache git ca-certificates nodejs
+RUN apk upgrade --no-cache && apk add --no-cache git ca-certificates nodejs
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-build --group api --group dev --group worker

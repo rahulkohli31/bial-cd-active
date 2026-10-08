@@ -3,8 +3,8 @@
 Redis backs the coordination layer for the build sandboxes: a one-sandbox-per-user lock, an
 idle-session heartbeat, and a registry of which container is currently live for which user.
 Reach for this document when provisioning Redis for a new environment, when the platform's
-health endpoint reports Redis as degraded, or when Redis has lost its data and you need to know
-what that actually costs.
+health endpoint reports unavailable and the control plane's log names Redis, or when Redis has
+lost its data and you need to know what that actually costs.
 
 ## What Redis holds, and what it does not
 
@@ -64,21 +64,13 @@ take to change it.
 
 ## Reading the health endpoint
 
-`GET /v1/health` reports overall status plus a `redis` field with three possible values:
+`GET /v1/health` answers `ok` with HTTP 200, or `unavailable` with HTTP 503 when PostgreSQL or a
+configured Redis does not answer. The endpoint needs no sign-in, so its body never says which
+dependency failed. The control plane's log does: each failed probe writes a
+`health_dependency_unreachable` warning whose `dependency` field is `database` or `redis`.
 
-- `ok` — reachable.
-- `unreachable` — configured, but not answering. Build sessions fail; every other route keeps
-  working.
-- `not_configured` — no Redis configured for this deployment. This is a supported, non-production
-  posture, not a fault.
-
-Only the `unreachable` state degrades the endpoint's overall status, and even then the HTTP
-status code stays 200 — PostgreSQL is the only dependency that fails this endpoint closed (503).
-**Automated consumers must key on the HTTP status code, not on the status word** — a monitor that
-treats "degraded" as equivalent to a failed check will fire on every Redis-optional development
-box. An operator watching only the HTTP status code will, symmetrically, never see a Redis outage
-this way at all: the code stays 200 throughout. Watch the `redis` field directly, or add a check
-that exercises an actual build start.
+A deployment with no Redis configured reports `ok`. That is a supported posture outside
+production, not a fault, and production refuses to start without Redis.
 
 ## Recovery: total Redis data loss
 
@@ -99,7 +91,8 @@ a double failover. What actually happens:
 
 **Operator steps:**
 
-1. Confirm Redis is back via the health endpoint.
+1. Confirm Redis is back: the health endpoint answers `ok` and the log stops reporting
+   `health_dependency_unreachable` for `redis`.
 2. Expect a wave of retryable errors on build endpoints for as long as Redis is down — that is
    the intended, honest failure, and it clears itself the moment Redis answers. Restarting the
    control plane is not required and will not help; connections are re-established lazily.

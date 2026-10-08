@@ -2608,38 +2608,19 @@
         "type": "object"
       },
       "HealthStatus": {
-        "description": "The `/v1/health` body; every field is single-word, so the camel base is a no-op.\n⚠️ `degraded` NO LONGER IMPLIES 503 — automate on the HTTP status, never on the word\n`degraded`. Postgres unreachable → `degraded` + **503** (fails CLOSED, always-on).\nRedis unreachable → `degraded` + **200** (build sessions only; draining would cost\nusers working functionality for nothing). `not_configured` reports `ok`: Redis is\noptional outside prod, and folding it into `unreachable` would 503 every storage-off\ndev box — the collapse-two-tiers bug this codebase already shipped once.",
+        "description": "The `/v1/health` body: `ok` at 200, or `unavailable` at 503 when Postgres or a configured\nRedis does not answer. No dependency is named, because the endpoint is public.",
         "properties": {
-          "database": {
-            "enum": [
-              "ok",
-              "unreachable"
-            ],
-            "title": "Database",
-            "type": "string"
-          },
-          "redis": {
-            "enum": [
-              "ok",
-              "unreachable",
-              "not_configured"
-            ],
-            "title": "Redis",
-            "type": "string"
-          },
           "status": {
             "enum": [
               "ok",
-              "degraded"
+              "unavailable"
             ],
             "title": "Status",
             "type": "string"
           }
         },
         "required": [
-          "status",
-          "database",
-          "redis"
+          "status"
         ],
         "title": "HealthStatus",
         "type": "object"
@@ -8281,6 +8262,16 @@
             },
             "description": "Account suspended"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Attachment not found"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -11592,7 +11583,7 @@
                 }
               }
             },
-            "description": "A dependency is unreachable"
+            "description": "The service is unavailable"
           }
         },
         "summary": "Health Check",
