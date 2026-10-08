@@ -308,10 +308,21 @@ _FINGERPRINT_THE_WANTED_LOCKFILE: Final = (
 # The one line of a restore's output the control plane reads back: the start it belongs to records
 # whether it paid for a reinstall.
 _REINSTALLED_MARKER: Final = "bial-restore: reinstalling dependencies"
+# Said on stderr when the app keeps the libraries it was saved with because moving them (below)
+# failed. Only the marker is logged: the error itself can quote the file.
+_LIBRARIES_LEFT_AS_SAVED: Final = "bial-restore: libraries left as saved"
+_NPM_INSTALL: Final = "npm install --no-audit --no-fund --loglevel=error"
+# An install that fails on the versions the catch-up moved puts the saved manifest back, with the
+# saved lockfile when the commit tracks one, and installs that instead. One that fails on the saved
+# manifest fails the script.
 _RECONCILE_A_MOVED_LOCKFILE: Final = (
     'if [ "$baked_lock" = "$snap_lock" ]; then '
     "echo 'lockfile unchanged - skipping npm reconcile'; "
-    f"else echo '{_REINSTALLED_MARKER}'; npm install --no-audit --no-fund --loglevel=error; fi; "
+    f"else echo '{_REINSTALLED_MARKER}'; if ! {_NPM_INSTALL}; then "
+    "git diff --quiet HEAD -- package.json && exit 1; "
+    f"echo '{_LIBRARIES_LEFT_AS_SAVED}' >&2; "
+    "git restore -q -s HEAD -- package.json $(git ls-files package-lock.json); "
+    f"{_NPM_INSTALL}; fi; fi; "
 )
 _REMOVE_THE_PUSHED_BUNDLE: Final = f"rm -f /tmp/bial-app.bundle {_BUNDLE_B64_NAME}"
 
@@ -344,16 +355,100 @@ _PUT_THE_IMAGES_NEXT_CONFIG_BACK: Final = (
     f"cp {_IMAGES_NEXT_CONFIG} next.config.ts; fi; "
 )
 
+# An app keeps the library versions it was saved with, so each image that moves the template's
+# versions would have every older app reinstall its older copies on every open and keep running
+# releases the image moved away from. So each of the image's packages and overrides the app
+# declares moves up to the image's version: never down and never onto another major, either of
+# which can break the app's code. An override the app lacks is added. The app's own packages keep
+# their versions, so the install fetches only those; with none, the app takes the image's lockfile
+# and installs nothing. The move is a workspace change like any other, kept by the next save. The
+# image's manifest and lockfile are set aside before the checkout, as its Next config is; a
+# container born from this image has none, its app having been made on these versions.
+_IMAGES_PACKAGE_JSON: Final = ".git/bial-package.json"
+_IMAGES_PACKAGE_LOCK: Final = ".git/bial-package-lock.json"
+_SET_THE_IMAGES_LIBRARIES_ASIDE: Final = (
+    f"[ -f {_IMAGES_PACKAGE_JSON} ] || [ ! -f package.json ] || "
+    f"cp package.json {_IMAGES_PACKAGE_JSON}; "
+    f"[ -f {_IMAGES_PACKAGE_LOCK} ] || [ ! -f package-lock.json ] || "
+    f"cp package-lock.json {_IMAGES_PACKAGE_LOCK}; "
+)
+# Run as `node -e '<this>' <image manifest> <image lockfile>`, so it holds no single quote. Only an
+# exact version, bare or behind a caret or tilde, is compared; an alias, a git URL, a prerelease
+# or a compound range is the app's own choice and stays. "Another major" counts from the first
+# non-zero part, as caret ranges do. A package moves in every section that declares it or in none,
+# because npm refuses an override that disagrees with a direct dependency. Where the app's version
+# of a package differs from the image's, its own lockfile entries win. Nothing is written until
+# both files are worked out.
+_CATCH_UP_JS: Final = (
+    'const fs = require("fs"); '
+    "const [imagePackagePath, imageLockPath] = process.argv.slice(1); "
+    'const read = (path) => JSON.parse(fs.readFileSync(path, "utf8")); '
+    'const json = (value) => JSON.stringify(value, null, 2) + "\\n"; '
+    "const triple = (version) => { "
+    r"const m = String(version).match(/^[\^~]?(\d+)\.(\d+)\.(\d+)$/); "
+    "return m && m.slice(1).map(Number); }; "
+    "const significant = (v) => String(v.slice(0, v.findIndex((x) => x > 0) + 1 || 3)); "
+    "const outranks = (theirs, wanted) => { const a = triple(theirs), b = triple(wanted); "
+    "if (!a || !b || significant(a) !== significant(b)) return true; "
+    "const i = [0, 1, 2].find((k) => a[k] !== b[k]); return i !== undefined && a[i] > b[i]; }; "
+    'const dependencySections = ["dependencies", "devDependencies", "optionalDependencies", '
+    '"peerDependencies"]; '
+    'const sections = [...dependencySections, "overrides"]; '
+    "try { "
+    'const image = read(imagePackagePath), app = read("package.json"); '
+    "const spec = (p, s, name) => (p[s] || {})[name]; "
+    "const imageSpec = (name) => sections.map((s) => spec(image, s, name))"
+    ".find((v) => v !== undefined); "
+    "let moved = false; "
+    'for (const section of ["dependencies", "devDependencies", "overrides"]) '
+    "for (const [name, wanted] of Object.entries(image[section] || {})) { "
+    "const homes = sections.filter((s) => spec(app, s, name) !== undefined "
+    '|| (s === "overrides" && section === s)); '
+    "const holdsBack = (s) => spec(app, s, name) !== undefined "
+    "&& spec(app, s, name) !== wanted && outranks(spec(app, s, name), wanted); "
+    "if (homes.some(holdsBack)) continue; "
+    "for (const s of homes) if (spec(app, s, name) !== wanted) { "
+    "app[s] = { ...app[s], [name]: wanted }; moved = true; } } "
+    "if (moved) { "
+    "const declarationsOf = (p) => JSON.stringify(sections.map((s) => "
+    "Object.entries(p[s] || {}).sort())); "
+    'let lockfile = fs.readFileSync(imageLockPath, "utf8"); '
+    "if (declarationsOf(app) !== declarationsOf(image)) { "
+    "const lock = JSON.parse(lockfile); "
+    'const own = fs.existsSync("package-lock.json") ? read("package-lock.json").packages || {} '
+    ": {}; "
+    'const root = { ...lock.packages[""] }; '
+    "for (const s of dependencySections) { delete root[s]; if (app[s]) root[s] = app[s]; } "
+    'lock.packages[""] = root; '
+    "const pinned = new Set(sections.flatMap((s) => Object.keys(app[s] || {})"
+    ".filter((name) => spec(app, s, name) !== imageSpec(name)))); "
+    'const nameOf = (path) => path.slice(path.lastIndexOf("node_modules/") '
+    '+ "node_modules/".length); '
+    "for (const [path, entry] of Object.entries(own)) "
+    "if (path && (!(path in lock.packages) || pinned.has(nameOf(path)))) "
+    "lock.packages[path] = entry; "
+    "lockfile = json(lock); } "
+    'fs.writeFileSync("package.json", json(app)); '
+    'fs.writeFileSync("package-lock.json", lockfile); } '
+    f'}} catch {{ console.error("{_LIBRARIES_LEFT_AS_SAVED}"); }}'
+)
+_CATCH_THE_APP_UP_WITH_THE_IMAGE: Final = (
+    f"if [ -f {_IMAGES_PACKAGE_JSON} ] && [ -f {_IMAGES_PACKAGE_LOCK} ]; then "
+    f"node -e '{_CATCH_UP_JS}' {_IMAGES_PACKAGE_JSON} {_IMAGES_PACKAGE_LOCK}; fi; "
+)
+
 _RESTORE_SCRIPT: Final = (
     "set -e; "
     + _UNPACK_THE_PUSHED_BUNDLE
     + _FINGERPRINT_THE_INSTALLED_LOCKFILE
     + "git init -q 2>/dev/null || true; "
     + _SET_THE_IMAGES_NEXT_CONFIG_ASIDE
+    + _SET_THE_IMAGES_LIBRARIES_ASIDE
     + "git fetch -q /tmp/bial-app.bundle HEAD; "
     "git checkout -q -f FETCH_HEAD; "
     + _REMOVE_WHAT_THE_APP_DELETED
     + _PUT_THE_IMAGES_NEXT_CONFIG_BACK
+    + _CATCH_THE_APP_UP_WITH_THE_IMAGE
     + _FINGERPRINT_THE_WANTED_LOCKFILE
     + _RECONCILE_A_MOVED_LOCKFILE
     + _REMOVE_THE_PUSHED_BUNDLE
@@ -370,6 +465,7 @@ _DISCARD_SCRIPT: Final = (
     "git reset -q --hard FETCH_HEAD; "
     "git clean -q -fd; "
     + _PUT_THE_IMAGES_NEXT_CONFIG_BACK
+    + _CATCH_THE_APP_UP_WITH_THE_IMAGE
     + _FINGERPRINT_THE_WANTED_LOCKFILE
     + _RECONCILE_A_MOVED_LOCKFILE
     + _REMOVE_THE_PUSHED_BUNDLE
@@ -1903,6 +1999,8 @@ class AcaSandboxClient(SandboxClient):
             )
         if result.exit != 0:
             raise SandboxError(f"{what} failed (exit {result.exit})")
+        if _LIBRARIES_LEFT_AS_SAVED in result.stderr.splitlines():
+            _log.warning("libraries_left_as_saved", app_name=handle.app_name, during=what)
         return result
 
     async def restore_from_snapshot(
