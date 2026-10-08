@@ -23,10 +23,10 @@
 #     like "the app renders the portal", not like a routing error.
 #   - PORTAL_ORIGIN is the link target on the apps site's 404 page — the way back for an
 #     employee who followed a stale link. Missing -> envsubst emits `href=""`, a dead button.
-#   - INTERNAL_ROUTE_TOKEN is the secret the edge presents to the backend's internal alias lookup.
-#     Missing -> the lookup is refused and every preview becomes "app not available". Its shape
-#     matters because it is substituted into a quoted nginx directive; a stray quote or `;` would
-#     break or inject into the config. Never echoed below: it is a secret.
+#   - INTERNAL_ROUTE_TOKEN is the secret the edge presents to the backend's internal alias lookup
+#     and preview entry route. Missing -> both refuse it and every preview becomes "app not
+#     available". Its shape matters because it is substituted into a quoted nginx directive; a
+#     stray quote or `;` would break or inject into the config. Never echoed below: it is a secret.
 #   - DNS_RESOLVER feeds `resolver ${DNS_RESOLVER}` so nginx re-resolves upstreams at request
 #     time (App Service private endpoints; a boot-time-pinned IP caused the "Web App -
 #     Unavailable" 403 loop). It is now load-bearing for BOTH sites: without it the apps site's
