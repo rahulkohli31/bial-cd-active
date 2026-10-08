@@ -72,7 +72,7 @@ still answered; a tool call then returns a fixed "unavailable" result.
 - Analysis capacity costs nothing while nobody uses it, and the platform runs no worker and no pool
   of its own for it. Usage is billed as for every other reply: from the tokens the model reports,
   never from a file's size.
-- Nothing changes for app workspaces: ADR-0014 stands, and the platform's own sandboxes are untouched.
+- Nothing changes for app workspaces: ADR-0014 stands, and so does the warm pool of ADR-0032.
 
 ## Rejected alternatives
 
@@ -95,3 +95,4 @@ still answered; a tool call then returns a fixed "unavailable" result.
 - ADR-0004 (the per-person scoping the send route applies before any session is named)
 - ADR-0014 (the platform's own sandboxes, unchanged by this)
 - ADR-0025 (the shared daily token limit analysis replies count against)
+- ADR-0032 (the warm pool of ready sandboxes, unchanged by this)
