@@ -7,27 +7,39 @@
 // regeneration, and a test fails the moment this file and its source disagree.
 //
 // The worked example for reading BIAL flight operations data from the connected data lake. Every
-// line below has been typechecked under `strict` and run against a real lake; the numbers in the
-// comments are measured, not estimated.
+// line below has been typechecked under `strict` and unit-tested; the numbers in the comments
+// are measured, not estimated.
 //
 // TO USE IT
-//   1. Install the packages. They are NOT pre-installed — an app that does not read flight data
-//      should not carry them, and yours should not carry them until it does:
+//   Run the install command from the app's folder:
 //
-//        npm install hyparquet hyparquet-compressors @azure/identity @azure/storage-blob
+//        node /usr/local/lib/bial/adopt-flight-data.mjs
 //
-//   2. Copy the whole body into `lib/flight-data.ts`, stripping the leading `// ` from each
-//      line. All of it: the page pattern at the end keeps your app inside its memory, and it uses
-//      the reading functions above it, so copy both.
+//   It installs the four packages at the versions this body was tested with, then writes this
+//   body, uncommented, to `lib/flight-data.ts`. If `lib/flight-data.ts` already exists it
+//   changes nothing: that file is this app's own copy.
 //
-//   3. The two environment variables are injected for you when the data connector is switched on
-//      for this project. If they are missing, the connector is off — the code says so explicitly.
+//   The two environment variables are injected for you when the data connector is switched on
+//   for this project. If they are missing, the connector is off — the code says so explicitly.
+//
+//   Only in a workspace without that command, do it by hand:
+//     1. Install the packages. They are NOT pre-installed — an app that does not read flight
+//        data should not carry them, and yours should not carry them until it does:
+//
+//          npm install hyparquet hyparquet-compressors @azure/identity @azure/storage-blob
+//
+//     2. Copy the whole body into `lib/flight-data.ts`, stripping the leading `// ` from each
+//        line. All of it: the page pattern at the end keeps your app inside its memory, and it
+//        uses the reading functions above it, so copy both.
 //
 // WHY IT SHIPS COMMENTED OUT, AND WHY AS A WHOLE FILE
-// The seven mistakes marked below all produce an app that looks finished, builds green, and
-// reports wrong numbers — or crashes only on an unusual day. None of them raises an error at the
-// point you make it. A library would hide them behind a function name; a worked example makes you
-// read each one once, in the place it matters.
+// The template installs none of the four packages, so a live copy of this body would not compile
+// in an app that reads no flight data. The install command writes this same verified body, so an
+// app that does read flight data gets it as source it can read, not as a library. The seven
+// mistakes marked below all produce an app that looks finished, builds green, and reports wrong
+// numbers — or crashes only on an unusual day. None of them raises an error at the point you make
+// it. A library would hide them behind a function name; the body names each one in the place it
+// matters.
 //
 // The body is line-commented rather than wrapped in a block comment on purpose: the JSDoc blocks
 // inside it would close a `/* … */` wrapper early and leave the rest parsing as code. This app's
@@ -37,7 +49,7 @@
 //
 // import { BlobServiceClient } from '@azure/storage-blob'
 // import { ManagedIdentityCredential } from '@azure/identity'
-// import { cachedAsyncBuffer, parquetReadObjects } from 'hyparquet'
+// import { type AsyncBuffer, parquetMetadataAsync, parquetReadObjects } from 'hyparquet'
 // import { compressors } from 'hyparquet-compressors'
 //
 // // ── The limits your app runs inside ──────────────────────────────────────────────────────────
@@ -53,8 +65,9 @@
 // // Reading every file whole, on every request, takes minutes and holds most of the workspace's
 // // memory: it answers nowhere and is killed once published. The functions below stay inside these
 // // limits. They read only the files that hold the current data, download only the columns you
-// // name, and keep one row per flight; `sharedLoad` makes that load once for every request, and
-// // `pageOf` hands the browser one page at a time. Build on them rather than a reader of your own.
+// // name, one row group at a time, and keep one row per flight; `sharedLoad` makes that load once
+// // for every request, and `pageOf` hands the browser one page at a time. Build on them rather than
+// // a reader of your own.
 //
 // // ── The connection ───────────────────────────────────────────────────────────────────────────
 // //
@@ -70,7 +83,8 @@
 //   if (!value) {
 //     throw new Error(
 //       `${name} is not set. The flight-data connector is not switched on for this project — ` +
-//         `the app's owner switches it on in the app's settings, on the Integrations tab, then restart the dev server.`,
+//         `the app's owner switches it on in the app's settings, on the Integrations tab, and the ` +
+//         `change reaches the app the next time it starts.`,
 //     )
 //   }
 //   return value
@@ -233,14 +247,21 @@
 // // Name your columns. Always. And fetch only them: a parquet file stores each column in its own
 // // byte ranges, so reading through ranged downloads fetches the columns you named and the file's
 // // index, not the whole file. A 100 MB file read for eight columns costs a few MB.
-// export async function readColumns<T>(file: LakeFile, columns: string[]): Promise<T[]> {
+// //
+// // Then read each file one row group at a time, keeping each flight's latest row as you go:
+// // `readCurrentRecords` below holds one row group's rows plus one row per flight, never every row
+// // of a file. That bound assumes the files are cut into several row groups. Their row-group layout
+// // has not been measured: a file written as a single row group is read in one piece, and for a
+// // complete copy that is every row it holds, about 350,000.
+// function rangedFile(file: LakeFile): AsyncBuffer {
 //   const blob = container.getBlobClient(file.name)
-//   const ranged = cachedAsyncBuffer({
+//   // No cache in front of the downloads: one would keep every row group's bytes alive until the
+//   // whole file had been read.
+//   return {
 //     byteLength: file.size,
 //     slice: async (start: number, end: number = file.size) =>
 //       ownBytes(await blob.downloadToBuffer(start, end - start)),
-//   })
-//   return (await parquetReadObjects({ file: ranged, columns, compressors })) as T[]
+//   }
 // }
 //
 // // ── The two rules that decide whether your numbers are right ──────────────────────────────────
@@ -280,17 +301,24 @@
 //  * Keep the row with the highest LAST_UPDATE_DATE_TIME for each key. That is the current record.
 //  */
 // export function currentRecordsOnly<T extends Row>(rows: T[]): T[] {
-//   const latest = new Map<string, { stamp: number; row: T }>()
+//   const latest: Latest<T> = new Map()
+//   keepLatest(latest, rows)
+//   return rowsOf(latest)
+// }
 //
+// type Latest<T> = Map<string, { stamp: number; row: T }>
+//
+// /** Fold `rows` into `latest`: each flight keeps its row with the highest LAST_UPDATE_DATE_TIME. */
+// function keepLatest<T extends Row>(latest: Latest<T>, rows: readonly T[]): void {
 //   for (const row of rows) {
 //     const key = String(row[FLIGHT_KEY])
 //     const stamp = asDate(row[LOAD_TIME]).getTime()
 //     const held = latest.get(key)
 //     if (!held || stamp > held.stamp) latest.set(key, { stamp, row })
 //   }
-//
-//   return [...latest.values()].map((entry) => entry.row)
 // }
+//
+// const rowsOf = <T>(latest: Latest<T>): T[] => [...latest.values()].map((entry) => entry.row)
 //
 // // MISTAKE 7 — grouping on a text column without trimming it.
 // // Several text columns carry the same value twice, once padded with trailing spaces.
@@ -362,6 +390,43 @@
 // }
 //
 // /**
+//  * The current record of every flight in `files`, with only the columns you asked for.
+//  *
+//  * Each file is read one row group at a time, and each group's rows are folded in before the next
+//  * group is downloaded, keeping each flight's latest row exactly as `currentRecordsOnly` does. So
+//  * this holds one row group's rows and one row per flight at most, where reading every file whole
+//  * and collapsing afterwards holds every row of every file. The file's index is read once and
+//  * handed to every group's read, so it is not downloaded again per group.
+//  */
+// export async function readCurrentRecords<T extends Row>(
+//   files: readonly LakeFile[],
+//   columns: string[],
+// ): Promise<T[]> {
+//   // Always include the three columns the correctness rules need, whatever the caller asked for.
+//   const needed = [...new Set([...columns, FLIGHT_KEY, LOAD_TIME, FLIGHT_TIME])]
+//   const latest: Latest<T> = new Map()
+//   for (const file of files) {
+//     const ranged = rangedFile(file)
+//     const metadata = await parquetMetadataAsync(ranged)
+//     let rowStart = 0
+//     for (const group of metadata.row_groups) {
+//       const rowEnd = rowStart + Number(group.num_rows)
+//       const rows = await parquetReadObjects({
+//         file: ranged,
+//         metadata,
+//         columns: needed,
+//         rowStart,
+//         rowEnd,
+//         compressors,
+//       })
+//       keepLatest(latest, rows as T[])
+//       rowStart = rowEnd
+//     }
+//   }
+//   return rowsOf(latest)
+// }
+//
+// /**
 //  * Every flight at its latest version, with only the columns you asked for.
 //  *
 //  * WHICH FLIGHTS ARE IN A DATE WINDOW IS DECIDED BY ROWS, NEVER BY FILES: the load-date trap above
@@ -369,13 +434,7 @@
 //  * this returns every current flight, and `flightsBetween` filters the window on `SIBT_SOBT_TIME`.
 //  */
 // export async function currentFlights<T extends Row>(columns: string[]): Promise<T[]> {
-//   // Always include the three columns the correctness rules need, whatever the caller asked for.
-//   const needed = [...new Set([...columns, FLIGHT_KEY, LOAD_TIME, FLIGHT_TIME])]
-//   const rows: T[] = []
-//   for (const file of filesToRead(await listFlightFiles())) {
-//     appendAll(rows, await readColumns<T>(file, needed))
-//   }
-//   return currentRecordsOnly(rows)
+//   return readCurrentRecords<T>(filesToRead(await listFlightFiles()), columns)
 // }
 //
 // /** Every flight scheduled between two dates, deduped, with only the columns you asked for. */

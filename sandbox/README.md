@@ -207,8 +207,9 @@ curl -s -XPOST localhost:8080/_sup/exec -H "Authorization: Bearer $TOK" \
 
 - `*.sh`, `Dockerfile*`, `Caddyfile`, and the template are pinned to **LF** via the root `.gitattributes`
   (`sandbox/** text eol=lf`), so a Windows checkout does not ship a `#!/bin/sh\r` shebang.
-- `Dockerfile.sandbox` runs `sed -i 's/\r$//'` on `entrypoint.sh`, `Caddyfile` and
-  `read_attachment.py` **before** `chmod`, as a belt-and-braces guard for the Windows build host.
+- `Dockerfile.sandbox` runs `sed -i 's/\r$//'` on `entrypoint.sh`, `Caddyfile`,
+  `read_attachment.py` and `adopt-flight-data.mjs` **before** `chmod`, as a belt-and-braces guard
+  for the Windows build host.
 - **No file named `.gitignore` reaches the image.** `az acr build` drops every one from the build
   context, at any depth. The workspace's ignore rules live in `platform-owned.gitignore` instead.
 

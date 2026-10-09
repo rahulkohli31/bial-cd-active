@@ -18,7 +18,9 @@ WHICH IMPLEMENTATION OF THE COMMENTING RULE THIS TEST TRUSTS, AND WHY. `generate
 the only implementation. This test does NOT re-derive the rule in Python: two implementations of
 one rule drift, and the drift would be invisible precisely because both sides would still agree
 with themselves. It shells out to `node generate-reference.mjs --stdout`, which writes the exact
-bytes it would write to the file and touches nothing, and compares. That needs `node` and nothing
+bytes it would write to the file and touches nothing, and compares. The generator's second output,
+the image's install command `sandbox/scripts/adopt-flight-data.mjs`, is compared the same way
+through `--stdout adopt`. That needs `node` and nothing
 else — no Docker, no `npm install`, no `node_modules` (the generator imports only `node:fs`,
 `node:path` and `node:url`). A missing `node` is a clean skip, as with Docker elsewhere in this
 harness.
@@ -44,6 +46,10 @@ GENERATOR = _SANDBOX / "seed" / "generate-reference.mjs"
 SOURCE = _SANDBOX / "seed" / "flight-data.ts"
 #: The path the agent is pointed at when it asks for the connected system's schema.
 REFERENCE = _SANDBOX / "template" / "lib" / "flight-data.reference.ts"
+#: The install command the image bakes; it writes the same body into the app.
+ADOPT = _SANDBOX / "scripts" / "adopt-flight-data.mjs"
+ADOPT_COMMAND = "node /usr/local/lib/bial/adopt-flight-data.mjs"
+NPM_INSTALL = "npm install hyparquet hyparquet-compressors @azure/identity @azure/storage-blob"
 
 #: The seven defects the file exists to name. Each produces an app that builds green and is wrong.
 MISTAKES = 7
@@ -106,8 +112,9 @@ def test_the_hazard_the_line_comments_exist_for_is_still_in_the_body() -> None:
 
 def test_the_head_says_where_it_came_from_and_what_to_install() -> None:
     """A generated file that does not say it is generated gets hand-edited, once, by someone who
-    had no way to know. The install line is the other half: none of the four packages is in the
-    golden image, so the example does not compile until the reader runs it."""
+    had no way to know. The install lines are the other half: none of the four packages is in the
+    golden image, so the example does not compile until the reader runs one. The install command
+    comes first; the hand install is only for a workspace without it."""
     # The head is everything down to the second box rule; the body starts after it.
     lines = _shipped().splitlines()
     rules = [n for n, line in enumerate(lines) if line.startswith("// \u2500")]
@@ -116,9 +123,9 @@ def test_the_head_says_where_it_came_from_and_what_to_install() -> None:
     assert "GENERATED FILE" in head
     assert "sandbox/seed/flight-data.ts" in head
     assert "node sandbox/seed/generate-reference.mjs" in head
-    assert (
-        "npm install hyparquet hyparquet-compressors @azure/identity @azure/storage-blob" in head
-    )
+    assert ADOPT_COMMAND in head
+    assert NPM_INSTALL in head
+    assert head.index(ADOPT_COMMAND) < head.index(NPM_INSTALL)
 
 
 def test_the_seven_mistakes_all_survive_into_the_shipped_file() -> None:
@@ -142,7 +149,8 @@ def test_the_seven_mistakes_all_survive_into_the_shipped_file() -> None:
         "PLAN BEFORE YOU BUILD",  # the page is planned against the limits first
         "filesToRead(",  # the newest complete copy and the files after it, not the whole lake
         "pageOf(",  # the browser gets one page, never the table
-        "cachedAsyncBuffer(",  # ranged downloads: the named columns, not the whole file
+        "downloadToBuffer(start, end - start)",  # ranged downloads, not the whole file
+        "metadata.row_groups",  # one row group at a time, never a whole file's rows
         "globalThis",  # the shared load survives separate route bundles
         "ManagedIdentityCredential",  # never DefaultAzureCredential
     ):
@@ -159,15 +167,23 @@ def test_the_memory_warning_names_both_container_limits() -> None:
     assert "KILLED" in shipped.upper()
 
 
-def test_the_file_carries_no_carriage_returns() -> None:
+def test_the_files_carry_no_carriage_returns() -> None:
     """The root `.gitattributes` carries `sandbox/** text eol=lf` and is the control; this is the
     assertion that the control held. The image is built on a Windows VM, and a CRLF checkout of a
     shipped file has already broken container start on this project once."""
     assert "\r" not in _shipped()
+    assert "\r" not in ADOPT.read_text(encoding="utf-8", newline="")
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not available")
-def test_the_shipped_file_is_a_current_generation_of_its_source() -> None:
+@pytest.mark.parametrize(
+    ("selector", "shipped"),
+    [([], REFERENCE), (["adopt"], ADOPT)],
+    ids=["reference", "adopt"],
+)
+def test_the_shipped_file_is_a_current_generation_of_its_source(
+    selector: list[str], shipped: Path
+) -> None:
     """Byte for byte, against the generator's own output — the only implementation of the rule.
 
     If this fails, the fix is `node sandbox/seed/generate-reference.mjs`, and then a look at what
@@ -175,15 +191,15 @@ def test_the_shipped_file_is_a_current_generation_of_its_source() -> None:
     so a regeneration is the end of the job and not the whole of it.
     """
     proc = subprocess.run(
-        ["node", str(GENERATOR), "--stdout"],
+        ["node", str(GENERATOR), "--stdout", *selector],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         timeout=60,
         cwd=str(GENERATOR.parent),
     )
     assert proc.returncode == 0, f"the generator did not run:\n{proc.stderr[-3000:]}"
-    assert proc.stdout == _shipped(), (
-        "sandbox/template/lib/flight-data.reference.ts is stale — regenerate it with "
+    assert proc.stdout == shipped.read_text(encoding="utf-8", newline=""), (
+        f"{shipped.relative_to(_SANDBOX.parent).as_posix()} is stale — regenerate it with "
         "`node sandbox/seed/generate-reference.mjs`. It is generated from "
         "sandbox/seed/flight-data.ts and must never be hand-edited."
     )

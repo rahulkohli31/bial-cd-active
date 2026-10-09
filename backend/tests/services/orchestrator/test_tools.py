@@ -513,6 +513,7 @@ async def test_run_command_sandbox_gone_escalates() -> None:
         (["npm", "ci"], True),
         (["npx", "tsc", "--noEmit"], True),
         (["npm", "run", "build"], True),
+        (["node", prompt_blocks.FLIGHT_DATA_ADOPT_PATH], True),
         # …and the ones that must NOT get ten minutes to hang in:
         (["npx", "drizzle-kit", "generate", "--name", "add_visits"], False),
         (["npm", "run", "lint"], False),

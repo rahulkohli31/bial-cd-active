@@ -91,6 +91,14 @@ no file is attached. Pictures and PDFs are not listed: they reach you inside the
 carried them."""
 """How the model finds the current files, in every chat kind's file rules."""
 
+FLIGHT_DATA_ADOPT_PATH = "/usr/local/lib/bial/adopt-flight-data.mjs"
+"""Where the image bakes the flight-data install command, run as `node <path>` from the app.
+
+The connected-data schema answer names it, and `services/messages/projection.py` labels that
+command an install, because it runs `npm install` and so needs the long command timeout. Here
+rather than beside `READER_PATH` because importing `services/agent/attachment_tools.py` from the
+projection is an import cycle."""
+
 ANALYSIS_RULES = f"""\
 HOW TO WORK WITH ATTACHED FILES
 - {LATEST_FILE_NOTE_RULE}

@@ -2,7 +2,7 @@
 # that tool's description, on every request. Edit it as prompt text, not as an internal note.
 """The one tool that tells an agent what is in a connected system's data.
 
-WHY IT IS A TOOL AND NOT A PROMPT BLOCK. The answer is ~8,700 tokens. Resident on every turn of
+WHY IT IS A TOOL AND NOT A PROMPT BLOCK. The answer is ~9,400 tokens. Resident on every turn of
 every connector-enabled project it would be the largest thing in the prompt and would be paid for
 by turns that never touch the data; fetched, it is paid for once and then replayed at the
 cache-read rate, because the library moves a cache breakpoint forward over history as a
@@ -48,6 +48,7 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, ToolReturnPart
 from pydantic_ai.toolsets.function import FunctionToolset
 
 from src.core.connectors import ConnectedSystem
+from src.core.prompt_blocks import FLIGHT_DATA_ADOPT_PATH
 from src.services.agent.mode_prompts import PromptContext
 
 logger = structlog.get_logger()
@@ -93,7 +94,7 @@ in step. A new conversation starts empty and gets the schema again.
 
 TWO, NOT ONE. Across the connected-data E2E campaign the model never asked twice in one
 conversation, so this is a ceiling on a failure not yet seen rather than a fix for one. Past it,
-each further call would append another full copy (~8,700 tokens) to a history every later turn
+each further call would append another full copy (~9,400 tokens) to a history every later turn
 replays."""
 
 _ALREADY_LOADED: Final = (
@@ -115,19 +116,61 @@ _THE_WHOLE_SCHEMA: Final = (
     "file's row replaces the copy's. The complete copy is the largest file, when it is at least "
     "ten times the typical file's size (about 100 MB, every flight at its latest version); the "
     "small daily files hold only that day's changes. Never read every file.\n"
-    "2. Download only the columns you use: wrap `blob.downloadToBuffer(offset, count)` in "
-    "hyparquet's `cachedAsyncBuffer` and pass that to `parquetReadObjects` with `columns`, rather "
-    "than downloading whole files.\n"
+    "2. Download only the columns you use, one row group at a time: read the file's index once "
+    "with hyparquet's `parquetMetadataAsync` over `blob.downloadToBuffer(offset, count)`, then "
+    "call `parquetReadObjects` for each row group with `columns`, `metadata`, `rowStart` and "
+    "`rowEnd`, keeping each flight's latest row as you go, rather than downloading or holding "
+    "whole files.\n"
     "3. Load once on the server, held on `globalThis` so every route shares it, reused for an "
     "hour; requests that arrive together wait for the same load.\n"
     "4. Filter, total and paginate on the server. The browser gets one page of rows or totals, "
     "and dropdowns are built from the same load.\n"
-    "Plan the page against these rules before writing code. `lib/flight-data.reference.ts` in the "
-    "workspace has the packages to install, the environment variables that address the store, "
-    "the traps, and worked code. If that copy reads every file or downloads whole files, it is an "
-    "older copy: follow the rules here."
+    "Plan the page against these rules before writing code.\n\n"
+    f"THE DATA MODULE. Run `node {FLIGHT_DATA_ADOPT_PATH}` from the app's folder "
+    f'(`run_command` with `["node", "{FLIGHT_DATA_ADOPT_PATH}"]`). It installs the four packages '
+    "at tested versions and writes `lib/flight-data.ts`, a tested module that follows every rule "
+    "above and reads the store's address from the two environment variables the connector "
+    "injects: build on it instead of writing a reader. If `lib/flight-data.ts` already exists it "
+    "changes nothing, because that file is the app's own copy: read its exports before relying on "
+    "the summary below. If that copy reads every file or downloads whole files, it is an older "
+    "copy: follow the rules here. If the command is missing, the workspace predates it: "
+    "`lib/flight-data.reference.ts` in the workspace is the same module commented out, with the "
+    "packages to install by hand.\n"
+    "What the current version of the module exports, all server-only, from `@/lib/flight-data`:\n"
+    "- `currentFlights(columns)`: every flight at its latest version, with the named columns plus "
+    "`AODB_AFTTAB_PK_URNO`, `LAST_UPDATE_DATE_TIME` and `SIBT_SOBT_TIME`.\n"
+    "- `flightsScheduledBetween(from, to, columns)`: the same, kept to flights scheduled in the "
+    "window.\n"
+    "- `flightsBetween(rows, from, to)`: the rows you hold, kept to a window on "
+    "`SIBT_SOBT_TIME`.\n"
+    "- `sharedLoad(name, load, maxAgeMs?)`: a function that returns one load shared by every "
+    "request, reloaded after an hour by default.\n"
+    "- `pageOf(rows, page, pageSize)`: `{ rows, page, pageSize, total, pages }`, pages numbered "
+    "from 1, at most 500 rows.\n"
+    "- `optionsOf(rows, column)`: a dropdown's options: distinct trimmed values, blanks dropped, "
+    "sorted.\n"
+    "- `label(value)`: a text value trimmed, or null when blank.\n"
+    "- `listFlightFiles()` and `newestReadableDay(files)`: the readable files, oldest first, and "
+    "the newest day they hold, to label how current the data is.\n"
+    "- Lower level: `readCurrentRecords(files, columns)`, `filesToRead(files)`, "
+    "`currentRecordsOnly(rows)`, `appendAll`, `classify`, `splitLakeUrl`, `ownBytes`, and the "
+    "column names `FLIGHT_KEY`, `LOAD_TIME` and `FLIGHT_TIME`.\n"
+    "The seven pitfalls it handles, as rules for any code you add:\n"
+    "1. Name the identity: `new ManagedIdentityCredential({ clientId })`, never "
+    "`DefaultAzureCredential`.\n"
+    "2. List the files; never build a path from a date. A folder is named for the month the load "
+    "ran.\n"
+    "3. Match the file name before the size: a zero-length folder is not news, a zero-byte flight "
+    "file is a failed load.\n"
+    "4. Name the columns you read, never all of them.\n"
+    "5. Filter dates on `SIBT_SOBT_TIME`, never on a file's date or on "
+    "`SCHEDULED_OFF_BLOCK_TIME_SOBT`, which is null on every arrival.\n"
+    "6. Never `rows.push(...chunk)`: a large file overflows the stack. Append in a loop.\n"
+    "7. Trim text before grouping, comparing or showing it: some values are stored padded, and "
+    "blanks as empty strings."
 )
-"""Delivered with the artefact, and the ONE place the worked-example file is named.
+"""Delivered with the artefact, and the ONE place the worked-example file and the install command
+are named.
 
 The completeness half is what the description no longer demands: the answer says it is whole,
 rather than the tool asking to be called again per column.
@@ -137,8 +180,9 @@ composed prompt names no template file — so deleting this clause leaves an age
 column names and cannot reach the packages or the environment variables that read them.
 
 THE READING RULES TRAVEL HERE AS WELL AS IN THE FILE. Every saved app keeps its own copy of the
-reference file and reopening restores that copy, so an app saved before the file changed reads an
-older one; this answer is what reaches it."""
+reference file and of `lib/flight-data.ts`, and reopening restores both, so an app saved before
+the module changed holds an older one; this answer is what reaches it. That is also why the
+summary is labelled as the current version and defers to the app's own file."""
 
 
 @cache

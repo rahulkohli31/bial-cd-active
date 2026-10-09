@@ -1,5 +1,6 @@
 /**
- * The pure helpers in `flight-data.ts`, asserted without Azure.
+ * The helpers in `flight-data.ts`, asserted without Azure. The reading path runs against an
+ * in-memory lake whose parquet files `parquet-fixture.ts` writes.
  *
  * WHY THESE AND NOT OTHERS. Every test below pins one of the seven mistakes the reference file
  * names, or one of the two rules that decide whether an app's numbers are right. They are the
@@ -17,7 +18,42 @@
  * Runner: vitest — see package.json. `npm test` from this directory.
  */
 
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { parquetReadObjects } from 'hyparquet'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { type Column, parquetFile } from './parquet-fixture'
+
+/** The lake the module reads in these tests: blob name to bytes, and every name downloaded. */
+const lake = vi.hoisted(() => ({
+  blobs: new Map<string, Uint8Array>(),
+  downloaded: [] as string[],
+}))
+
+vi.mock('@azure/storage-blob', () => ({
+  BlobServiceClient: class {
+    getContainerClient() {
+      return {
+        async *listBlobsFlat() {
+          for (const [name, bytes] of lake.blobs) {
+            yield { name, properties: { contentLength: bytes.byteLength } }
+          }
+        },
+        getBlobClient: (name: string) => ({
+          async downloadToBuffer(offset: number, count: number): Promise<Buffer> {
+            lake.downloaded.push(name)
+            const bytes = lake.blobs.get(name) ?? new Uint8Array()
+            return Buffer.from(bytes.subarray(offset, offset + count))
+          },
+        }),
+      }
+    }
+  },
+}))
+
+vi.mock('hyparquet', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('hyparquet')>()
+  return { ...actual, parquetReadObjects: vi.fn(actual.parquetReadObjects) }
+})
 
 const URL_ENV = 'BIAL_DICE_URL'
 const CLIENT_ENV = 'BIAL_DICE_CLIENT_ID'
@@ -31,9 +67,11 @@ const {
   LOAD_TIME,
   appendAll,
   classify,
+  currentFlights,
   currentRecordsOnly,
   filesToRead,
   flightsBetween,
+  flightsScheduledBetween,
   label,
   newestReadableDay,
   optionsOf,
@@ -77,6 +115,24 @@ describe('the connector being switched off', () => {
       await expect(import('./flight-data')).rejects.toThrow(
         /BIAL_DICE_URL is not set.*not switched on for this project/s,
       )
+    } finally {
+      process.env[URL_ENV] = held
+    }
+  })
+
+  it('says when the switch takes effect, never to restart the dev server', async () => {
+    // The build agent reads this message and is forbidden to start, restart or kill the dev
+    // server, so a message that told it to would send it straight into that rule.
+    vi.resetModules()
+    const held = process.env[URL_ENV]
+    delete process.env[URL_ENV]
+    try {
+      const failure = await import('./flight-data').then(
+        () => '',
+        (error: unknown) => String(error),
+      )
+      expect(failure).toMatch(/next time/)
+      expect(failure).not.toMatch(/restart/i)
     } finally {
       process.env[URL_ENV] = held
     }
@@ -413,6 +469,130 @@ describe('filesToRead', () => {
 
   it('reads nothing from an empty listing', () => {
     expect(filesToRead([])).toEqual([])
+  })
+})
+
+// ── Reading the lake one row group at a time ─────────────────────────────────────────────────
+
+describe('currentFlights', () => {
+  const COLUMNS: Column[] = [
+    { name: FLIGHT_KEY, kind: 'text' },
+    { name: LOAD_TIME, kind: 'time' },
+    { name: FLIGHT_TIME, kind: 'time' },
+    { name: 'STATUS', kind: 'text' },
+    { name: 'AIRLINE_NAME', kind: 'text' },
+  ]
+  const READ = ['STATUS']
+  const SCHEDULED = '2026-09-04T18:00:00Z'
+
+  const version = (key: string, loadedAt: string, status: string, scheduledAt = SCHEDULED) =>
+    flight(key, loadedAt, scheduledAt, { STATUS: status, AIRLINE_NAME: 'INDIGO' })
+
+  const store = (name: string, groups: Row[][]) => lake.blobs.set(name, parquetFile(COLUMNS, groups))
+
+  const statusByFlight = (rows: Row[]) => new Map(rows.map((row) => [row[FLIGHT_KEY], row.STATUS]))
+
+  beforeEach(() => {
+    lake.blobs.clear()
+    lake.downloaded.length = 0
+    vi.mocked(parquetReadObjects).mockClear()
+  })
+
+  it('reads one row group at a time and returns what currentRecordsOnly does for the whole file', async () => {
+    const groups = [
+      [
+        version('URNO-1', '2026-09-05T02:00:00Z', 'SCHEDULED'),
+        version('URNO-2', '2026-09-05T02:00:00Z', 'SCHEDULED'),
+        version('URNO-3', '2026-09-05T02:00:00Z', 'SCHEDULED'),
+      ],
+      [
+        version('URNO-1', '2026-09-06T02:00:00Z', 'AIRBORNE'),
+        version('URNO-4', '2026-09-06T02:00:00Z', 'SCHEDULED'),
+      ],
+      [
+        version('URNO-2', '2026-09-04T02:00:00Z', 'STALE'),
+        version('URNO-5', '2026-09-07T02:00:00Z', 'SCHEDULED'),
+        version('URNO-1', '2026-09-07T02:00:00Z', 'LANDED'),
+      ],
+    ]
+    store(objectName('20260907'), groups)
+
+    const current = await currentFlights<Row>(READ)
+
+    const ranges = vi
+      .mocked(parquetReadObjects)
+      .mock.calls.map(([options]) => [options.rowStart, options.rowEnd])
+    expect(ranges).toEqual([
+      [0, 3],
+      [3, 5],
+      [5, 8],
+    ])
+
+    const whole = parquetFile(COLUMNS, groups)
+    const everyRow = await parquetReadObjects({
+      file: { byteLength: whole.byteLength, slice: (start, end) => whole.slice(start, end).buffer },
+      columns: [...READ, FLIGHT_KEY, LOAD_TIME, FLIGHT_TIME],
+    })
+    expect(current).toEqual(currentRecordsOnly(everyRow))
+    expect(current).toHaveLength(5)
+    // Only the named columns, plus the three the rules need, were read.
+    expect(current.every((row) => !('AIRLINE_NAME' in row))).toBe(true)
+  })
+
+  it('keeps the latest version of a flight updated in two row groups, whichever is first', async () => {
+    store(objectName('20260907'), [
+      [
+        version('URNO-1', '2026-09-07T02:00:00Z', 'LANDED'),
+        version('URNO-2', '2026-09-05T02:00:00Z', 'SCHEDULED'),
+        version('URNO-3', '2026-09-05T02:00:00Z', 'SCHEDULED', '2026-09-10T08:00:00Z'),
+      ],
+      [version('URNO-2', '2026-09-06T02:00:00Z', 'AIRBORNE')],
+      [
+        version('URNO-1', '2026-09-05T02:00:00Z', 'SCHEDULED'),
+        version('URNO-3', '2026-09-06T02:00:00Z', 'RESCHEDULED', '2026-10-02T08:00:00Z'),
+      ],
+    ])
+
+    expect(statusByFlight(await currentFlights<Row>(READ))).toEqual(
+      new Map([
+        ['URNO-1', 'LANDED'],
+        ['URNO-2', 'AIRBORNE'],
+        ['URNO-3', 'RESCHEDULED'],
+      ]),
+    )
+
+    // The window is applied to each flight's latest version: URNO-3's first version is scheduled
+    // inside September, but the flight was moved out of it.
+    const september = await flightsScheduledBetween<Row>(
+      new Date('2026-09-01T00:00:00Z'),
+      new Date('2026-09-30T23:59:59Z'),
+      READ,
+    )
+    expect(statusByFlight(september)).toEqual(
+      new Map([
+        ['URNO-1', 'LANDED'],
+        ['URNO-2', 'AIRBORNE'],
+      ]),
+    )
+  })
+
+  it('never downloads a zero-byte entry, and reads a file with no rows as no flights', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const failedLoad = objectName('20260903')
+    const noRows = objectName('20260904')
+    lake.blobs.set('flight/fact/2026/SEPTEMBER/', new Uint8Array())
+    lake.blobs.set(failedLoad, new Uint8Array())
+    store(noRows, [])
+    store(objectName('20260905'), [[version('URNO-1', '2026-09-05T02:00:00Z', 'LANDED')]])
+
+    const current = await currentFlights<Row>(READ)
+
+    expect(current.map((row) => row[FLIGHT_KEY])).toEqual(['URNO-1'])
+    expect(lake.downloaded).not.toContain(failedLoad)
+    expect(lake.downloaded).toContain(noRows)
+    // The failed load is reported, once; the directory is not news.
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(failedLoad))
   })
 })
 

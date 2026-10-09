@@ -39,6 +39,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RunUsage
 from structlog.testing import capture_logs
 
+from src.core.prompt_blocks import FLIGHT_DATA_ADOPT_PATH
 from src.db.models.conversation import ChatKind
 from src.services.agent.agent import ChatDeps
 from src.services.agent.connector_tools import (
@@ -135,7 +136,7 @@ async def test_the_answer_states_its_own_completeness_and_points_at_the_worked_e
     for rule in (
         "latest complete copy",
         "a daily file's row replaces the copy's",
-        "cachedAsyncBuffer",
+        "one row group at a time",
         "globalThis",
         "one page of rows",
     ):
@@ -143,6 +144,25 @@ async def test_the_answer_states_its_own_completeness_and_points_at_the_worked_e
     assert "it is an older copy: follow the rules here" in answer
     # The artefact itself is untouched and comes FIRST — the sentence is a tail, not a preface.
     assert answer.startswith(SHIPPED)
+
+
+async def test_the_answer_names_the_install_command_and_summarises_the_module() -> None:
+    """The install command saves the agent rewriting the reference file and its own reader, and
+    only this answer names it. The summary describes the CURRENT module, so it defers to an app's
+    own `lib/flight-data.ts` (which the command never overwrites), and the reference file is the
+    fallback for a workspace whose image predates the command."""
+    answer = await connector_schema(_ctx(connected=(SYSTEM,)), SYSTEM.key)
+    assert f"node {FLIGHT_DATA_ADOPT_PATH}" in answer
+    assert f'["node", "{FLIGHT_DATA_ADOPT_PATH}"]' in answer
+    assert "What the current version of the module exports" in answer
+    assert "read its exports before relying on the summary below" in answer
+    assert "If the command is missing, the workspace predates it" in answer
+    for export in ("currentFlights(columns)", "sharedLoad(", "pageOf(", "optionsOf(", "label("):
+        assert export in answer, export
+    pitfalls = answer.split("The seven pitfalls it handles", 1)[1]
+    assert [line.split(".", 1)[0] for line in pitfalls.splitlines()[1:]] == [
+        str(n) for n in range(1, 8)
+    ]
 
 
 async def test_the_key_and_the_display_name_both_resolve() -> None:
