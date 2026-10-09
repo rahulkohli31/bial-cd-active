@@ -961,12 +961,12 @@ _PROJECT_SHAPES = {
     "rich": replace(_CONTEXT, connected_systems=(a_connected_system(),)),
 }
 _PINNED_PROJECT_DIGESTS = {
-    (ChatKind.PLAN, "bare"): "a8623704c8ada503260d33589ec7f8cc01815759548e7bb7f069e7263a500155",
-    (ChatKind.PLAN, "rich"): "cb04d9c9134b76317cfd8e5d95c2325c7f8ff9bb7277070a07186948e3d56ed5",
-    (ChatKind.BUILD, "bare"): "cf4211107cb0c4b152239fe8f53cec63a7ef5ab1ce882cbf8a9754a5ffc84a74",
-    (ChatKind.BUILD, "rich"): "d50dd333c4ed29ca1bc68a55b6fb30693a1a42029f262866e78eb8523bb0f0b5",
+    (ChatKind.PLAN, "bare"): "6747b46391c5345082a3f6e74c9aef8e0191d0bf447ad9cf6c66a50008dbd50c",
+    (ChatKind.PLAN, "rich"): "c00647140c7026500f00d5396dd4d303455629985819eb2847ef5bcf295a3264",
+    (ChatKind.BUILD, "bare"): "fa92c471a5221c5f9b68f15175dac7de6ecb4ce5385aa4b835a10ef614093754",
+    (ChatKind.BUILD, "rich"): "69a4492a8258a6b52d19539d929c57dc204f74d4c057b02b5f614dc921d22b2b",
 }
-_PINNED_GENERIC_DIGEST = "5f6e3a0055d93f6361a9f904174aeba745c656fda1ad280f239eb36ac6fd45e5"
+_PINNED_GENERIC_DIGEST = "0ca936e961be185d9a000f4b2d3f24d8a122185e8c540d8be8c07b5fb132a937"
 _CLAUSE = (
     "you cannot change their files, and you can open a file or run code only through a tool "
     "you have been given."

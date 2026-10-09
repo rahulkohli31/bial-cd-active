@@ -56,7 +56,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Final, cast
 
-from pydantic_ai import ModelRetry, RunContext
+from pydantic_ai import ModelRetry, RunContext, Tool
 from pydantic_ai.toolsets.function import FunctionToolset
 
 from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL
@@ -994,16 +994,19 @@ def sandbox_toolset[DepsT](
             session, outcomes, budget=output_budget_for_exit(0 if succeeded else 1)
         )
 
+    # The tools that change files or run commands run one at a time, in the order the model sent
+    # them: two calls in one reply otherwise start together, and two edits to one file race the
+    # supervisor's unlocked read-change-write. The reads stay concurrent.
     toolset = FunctionToolset[Any](
         [
             read_file,
-            write_file,
-            edit_file,
-            insert_lines,
+            Tool(write_file, sequential=True),
+            Tool(edit_file, sequential=True),
+            Tool(insert_lines, sequential=True),
             declare_done,
-            run_command,
+            Tool(run_command, sequential=True),
             fetch_output_slice,
-            apply_schema_change,
+            Tool(apply_schema_change, sequential=True),
         ],
         id="sandbox-tools",
     )
