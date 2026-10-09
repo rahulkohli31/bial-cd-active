@@ -7,7 +7,7 @@ import asyncio
 import base64
 import json
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Collection
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -50,7 +50,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_STAY_WRITER,
 )
-from src.services.sandbox.aca import AcaControlPlane, AcaTransientError
+from src.services.sandbox.aca import AcaControlPlane, AcaTransientError, ContainerFacts
 from src.services.sandbox.base import (
     SandboxError,
     SandboxGoneError,
@@ -396,16 +396,27 @@ class RecordingAca(AcaControlPlane):
         # quietly re-create the very data-loss path this lane exists to test.
         return self.created.get(name, {}).get(key)
 
+    async def read_app(self, *, name: str, keys: Collection[str]) -> ContainerFacts | None:
+        if name not in self.created:
+            return None
+        identity = self.identities.get(name)
+        return ContainerFacts(
+            env={key: self.created[name][key] for key in keys if key in self.created[name]},
+            identities=frozenset() if identity is None else frozenset({identity}),
+        )
+
     async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
         self.stamped.setdefault(name, {}).update(tags)
 
-    def made_for_the_pool(self, name: str) -> str:
-        """A container a pool fill made, as Azure knows it. Returns its address."""
+    def made_for_the_pool(self, name: str, *, identity: str | None = None) -> str:
+        """A container a pool fill made, carrying `identity`, as Azure knows it. Returns its
+        address."""
         self.created[name] = {
             "SUPERVISOR_TOKEN": "pool-bearer",
             "BIAL_POOL_MEMBER": "1",
             "BIAL_BASE_PATH": f"/a/{new_alias()}",
         }
+        self.identities[name] = identity
         self.fqdns[name] = f"{name}.pool.westeurope.azurecontainerapps.io"
         return self.fqdns[name]
 

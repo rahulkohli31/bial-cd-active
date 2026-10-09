@@ -14,10 +14,14 @@ import re
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import Any, cast
 
 import httpx
 import pytest
 import redis.asyncio as aioredis
+from azure.core.exceptions import ResourceNotFoundError
+from azure.mgmt.appcontainers import models as aca_models
 from pydantic import SecretStr
 from redis.exceptions import RedisError
 from structlog.testing import capture_logs
@@ -35,7 +39,7 @@ from src.services.redis.keys import (
     alias_key,
 )
 from src.services.sandbox import client as client_module
-from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError
+from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError, ContainerFacts
 from src.services.sandbox.base import (
     FleetMember,
     SandboxError,
@@ -788,6 +792,53 @@ def _bare_control_plane() -> AcaControlPlane:
     cp = object.__new__(AcaControlPlane)
     cp._config = _config()  # noqa: SLF001
     return cp
+
+
+def _reading(cp: AcaControlPlane, answer: Callable[[], aca_models.ContainerApp]) -> None:
+    """Give a bare control plane a management client whose every get answers with `answer()`."""
+    cp._client = cast(  # noqa: SLF001
+        Any, SimpleNamespace(container_apps=SimpleNamespace(get=lambda _rg, _name: answer()))
+    )
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "/subscriptions/s/resourceGroups/rg/providers/Microsoft.ManagedIdentity"
+        "/userAssignedIdentities/the-lake-identity",
+        None,
+    ],
+    ids=["identity", "no-identity-block"],
+)
+async def test_one_read_answers_the_values_asked_for_and_the_identities_attached(
+    identity: str | None,
+) -> None:
+    """What a claim checks before a pool container reaches a project, read back from a container
+    shaped like the one a create sends."""
+    cp = _bare_control_plane()
+    env = {"SUPERVISOR_TOKEN": "a-bearer", "BIAL_BASE_PATH": "/a/an-alias", "OTHER": "x"}
+    app = cp._envelope(env, {}, identity_resource_id=identity)  # noqa: SLF001
+    _reading(cp, lambda: app)
+
+    facts = await cp.read_app(
+        name=APP_NAME, keys=("SUPERVISOR_TOKEN", "BIAL_BASE_PATH", "NOT_THERE")
+    )
+
+    assert facts == ContainerFacts(
+        env={"SUPERVISOR_TOKEN": "a-bearer", "BIAL_BASE_PATH": "/a/an-alias"},
+        identities=frozenset() if identity is None else frozenset({identity}),
+    )
+
+
+async def test_one_read_of_a_container_azure_does_not_have_answers_none() -> None:
+    cp = _bare_control_plane()
+
+    def gone() -> aca_models.ContainerApp:
+        raise ResourceNotFoundError("no such container app")
+
+    _reading(cp, gone)
+
+    assert await cp.read_app(name=APP_NAME, keys=("SUPERVISOR_TOKEN",)) is None
 
 
 def test_the_container_probes_knock_on_the_supervisor_and_never_on_the_app() -> None:

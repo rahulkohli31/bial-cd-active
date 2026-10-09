@@ -89,3 +89,19 @@ authorization refusal means the worker's identity lacks the create, tag-write or
 action on the sandbox resource group; rows overdue while filling mean the image reference or the
 registry credentials are wrong; a capacity refusal means the environment is full. When it cannot be
 fixed soon, set every pool size to zero."""
+
+SANDBOX_POOL_WRONG_IDENTITY_EVENT: Final = "sandbox_pool_claim_wrong_identity"
+"""A start claimed a ready sandbox that did not carry exactly the identity its pool requires: a
+plain one carrying any identity, or a flight-data one carrying none or another. The container was
+let go before the project's settings reached it, and the start created its own.
+
+A START NEVER FAILS BECAUSE OF THIS, but it is a security signal: a plain container carrying an
+identity could have handed a project data it was never granted.
+
+Fields: `app_name` (the container), `expected` (the resource id of the identity its pool requires,
+`None` for a plain one) and `carried` (the resource ids of the identities Azure had attached).
+
+WHAT TO DO: a flight-data container carrying another identity means the lake identity changed
+without the flight-data pool being drained, or the worker and the backend hold different lake
+settings. Make them equal, then drain that pool. A plain container carrying any identity was
+changed outside the platform: find out how before anything else."""

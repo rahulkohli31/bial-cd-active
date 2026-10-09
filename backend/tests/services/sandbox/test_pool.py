@@ -12,7 +12,7 @@ import asyncio
 import json
 import re
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -29,7 +29,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from structlog.testing import capture_logs
 
 import src.db.base as db_base
-from src.core.alarms import SANDBOX_POOL_BELOW_SIZE_EVENT
+from src.core.alarms import SANDBOX_POOL_BELOW_SIZE_EVENT, SANDBOX_POOL_WRONG_IDENTITY_EVENT
 from src.core.connectors import CONNECTORS
 from src.db.models.sandbox_pool import SandboxPoolMember, SandboxPoolState
 from src.db.models.sandbox_start import SandboxProjectType
@@ -47,7 +47,7 @@ from src.services.redis.keys import (
 )
 from src.services.sandbox import client as client_module
 from src.services.sandbox import pool
-from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError
+from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError, ContainerFacts
 from src.services.sandbox.base import (
     KIND_BUILD_SANDBOX,
     KIND_SHARED_SANDBOX,
@@ -76,6 +76,10 @@ pytestmark = pytest.mark.usefixtures("empty_sandbox_pool")
 
 PLAIN = SandboxProjectType.PLAIN
 CONNECTOR = SandboxProjectType.CONNECTOR
+LAKE_IDENTITY = (
+    "/subscriptions/s/resourceGroups/rg/providers/Microsoft.ManagedIdentity"
+    "/userAssignedIdentities/the-lake-identity"
+)
 
 
 class PoolAca(AcaControlPlane):
@@ -113,7 +117,9 @@ class PoolAca(AcaControlPlane):
         self.env_reads_refused: set[str] = set()
         self.env_reads: list[str] = []
 
-    def made_for_the_pool(self, name: str, *, token: str | None) -> None:
+    def made_for_the_pool(
+        self, name: str, *, token: str | None, identity: str | None = None
+    ) -> None:
         self.envs[name] = {"BIAL_POOL_MEMBER": "1", "BIAL_BASE_PATH": f"/a/{new_alias()}"}
         if token is not None:
             self.envs[name]["SUPERVISOR_TOKEN"] = token
@@ -122,6 +128,7 @@ class PoolAca(AcaControlPlane):
             TAG_CONTROL_PLANE: control_plane_segment(),
             TAG_POOL: "1",
         }
+        self.identities[name] = identity
 
     async def create_app(
         self,
@@ -163,14 +170,20 @@ class PoolAca(AcaControlPlane):
             raise AcaError("the delete was refused")
         self.envs.pop(name, None)
 
-    async def get_app_env_value(self, *, name: str, key: str) -> str | None:
+    async def read_app(self, *, name: str, keys: Collection[str]) -> ContainerFacts | None:
         self.env_reads.append(name)
         if self.env_reads_throttled.get(name, 0):
             self.env_reads_throttled[name] -= 1
             raise AcaTransientError("ACA get was throttled or 5xx'd")
         if name in self.env_reads_refused:
             raise AcaError("ACA refused the read")
-        return self.envs.get(name, {}).get(key)
+        if name not in self.envs:
+            return None
+        identity = self.identities.get(name)
+        return ContainerFacts(
+            env={key: self.envs[name][key] for key in keys if key in self.envs[name]},
+            identities=frozenset() if identity is None else frozenset({identity}),
+        )
 
     async def get_app_fqdn(self, *, name: str) -> str | None:
         return f"{name}.aca.example" if name in self.envs else None
@@ -286,11 +299,12 @@ async def _ready(
     since: datetime | None = None,
     token: str | None = "pool-bearer",
     project_type: SandboxProjectType = PLAIN,
+    identity: str | None = None,
 ) -> str:
-    """A container made for the pool and its ready row. Returns its name, whose host is
-    `<name>.pool.example`."""
+    """A container made for the pool, carrying `identity`, and its ready row. Returns its name,
+    whose host is `<name>.pool.example`."""
     name = a_fresh_sandbox_name()
-    world.aca.made_for_the_pool(name, token=token)
+    world.aca.made_for_the_pool(name, token=token, identity=identity)
     await a_ready_pool_row(
         name,
         fqdn=f"{name}.pool.example",
@@ -308,14 +322,40 @@ async def _ledger() -> dict[str, SandboxPoolState]:
 
 
 async def _start(
-    client: AcaSandboxClient, user_id: uuid.UUID, app_id: uuid.UUID
+    client: AcaSandboxClient, user_id: uuid.UUID, app_id: uuid.UUID, *, flight_data: bool = False
 ) -> tuple[SandboxHandle, Stopwatch]:
+    """A start of a project, a flight-data one carrying the lake's coordinates."""
+    env = _flight_data_env(app_id) if flight_data else _app_env(app_id)
     stopwatch = Stopwatch()
     with timed_by(stopwatch):
-        handle = await client.provision_new(
-            str(user_id), a_fresh_sandbox_name(), app_env=_app_env(app_id)
-        )
+        handle = await client.provision_new(str(user_id), a_fresh_sandbox_name(), app_env=env)
     return handle, stopwatch
+
+
+def _flight_data_env(app_id: uuid.UUID) -> dict[str, str]:
+    url_name, client_id_name = connector_env_names(next(iter(CONNECTORS)))
+    return {
+        **_app_env(app_id),
+        url_name: "https://lake.example/data/",
+        client_id_name: "lake-client-id",
+    }
+
+
+@pytest.fixture
+def lake(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lake configured, whose identity is `LAKE_IDENTITY`."""
+    from src.config import settings as app_settings
+    from src.services.lake.config import LakeConfig
+
+    monkeypatch.setattr(
+        app_settings,
+        "connector_lake",
+        LakeConfig(
+            url="https://alakeaccount.blob.core.windows.net/acontainer/AOS/reports/",
+            identity_client_id="52b74947-0621-46e2-a523-a6b466f47c33",
+            identity_resource_id=LAKE_IDENTITY,
+        ),
+    )
 
 
 async def _recorded_name(redis: aioredis.Redis, user_id: uuid.UUID) -> str:
@@ -470,11 +510,11 @@ async def test_a_size_of_zero_creates_without_asking_the_ledger(world) -> None:
 async def test_a_connector_start_creates_its_own_with_the_identity_and_claims_nothing(
     world, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ A ready container has no data identity and Azure attaches one only at creation, so a
-    connector project that claimed one would open and then fail to read its data.
+    """★ The flight-data pool is switched off, so a flight-data start creates its own container
+    with the identity, and never takes the plain one that is ready.
 
-    Mutation check: drop the connector miss and the start claims the ready row, and its app is
-    handed the lake's coordinates in a container that holds no identity."""
+    Mutation check: claim from the plain pool here and the start takes the ready row, and its app
+    is handed the lake's coordinates in a container that holds no identity."""
     from src.config import settings as app_settings
     from src.services.lake.config import LakeConfig
 
@@ -506,6 +546,189 @@ async def test_a_connector_start_creates_its_own_with_the_identity_and_claims_no
     assert world.aca.created == [handle.app_name]
     assert world.aca.identities[handle.app_name] == resource_id
     assert await _ledger() == {member: SandboxPoolState.READY}
+
+
+async def test_with_both_pools_off_a_flight_data_start_records_that_its_own_pool_is_off(
+    world, lake
+) -> None:
+    """The miss names the pool the start could have claimed from, and the ledger is not asked."""
+    world.client._config = _config(pool_night_size=0, pool_day_days=frozenset())
+    member = await _ready(world)
+
+    handle, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4(), flight_data=True)
+
+    assert (stopwatch.claimed, stopwatch.miss_reason, stopwatch.ready_count) == (
+        False,
+        "connector",
+        None,
+    )
+    assert world.aca.identities[handle.app_name] == LAKE_IDENTITY
+    assert await _ledger() == {member: SandboxPoolState.READY}
+
+
+def _with_a_flight_data_pool(world: SimpleNamespace) -> None:
+    world.client._config = _config(pool_connector_day_size=1, pool_connector_night_size=1)
+
+
+async def test_a_flight_data_start_takes_a_container_that_already_carries_the_identity(
+    world, lake
+) -> None:
+    """★ The open that #297 exists for: no create, the lake's coordinates delivered on the
+    claim, and one replacement of the same type, which stops at that pool's size."""
+    _with_a_flight_data_pool(world)
+    member = await _ready(world, project_type=CONNECTOR, identity=LAKE_IDENTITY)
+    plain = await _ready(world)
+    app_id = uuid.uuid4()
+
+    handle, stopwatch = await _start(world.client, uuid.uuid4(), app_id, flight_data=True)
+    await _settled(world.client)
+
+    assert handle.app_name == member
+    assert (stopwatch.claimed, stopwatch.miss_reason, stopwatch.ready_count) == (True, None, 1)
+    assert world.aca.created == []
+    [(host, _, delivered)] = world.supervisors.configured
+    url_name, client_id_name = connector_env_names(next(iter(CONNECTORS)))
+    assert host == f"{member}.pool.example"
+    assert (delivered[url_name], delivered[client_id_name]) == (
+        "https://lake.example/data/",
+        "lake-client-id",
+    )
+    [replacement] = world.aca.filled
+    assert world.aca.identities[replacement] == LAKE_IDENTITY
+    assert await _types() == {replacement: CONNECTOR, plain: PLAIN}
+
+
+async def test_a_flight_data_claims_replacement_is_sized_by_its_own_pool(world, lake) -> None:
+    """A flight-data pool of one with two ready: the one left is enough, however large the plain
+    pool is.
+
+    Mutation check: size the refill by the plain pool and a container is made."""
+    _with_a_flight_data_pool(world)
+    for _ in range(2):
+        await _ready(world, project_type=CONNECTOR, identity=LAKE_IDENTITY)
+
+    _, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4(), flight_data=True)
+    await _settled(world.client)
+
+    assert stopwatch.claimed is True
+    assert world.aca.filled == []
+
+
+async def _types() -> dict[str, SandboxProjectType]:
+    async with db_base.async_session_factory() as db:
+        rows = await db.execute(sa.select(SandboxPoolMember.name, SandboxPoolMember.project_type))
+    return {name: project_type for name, project_type in rows}
+
+
+@pytest.mark.parametrize(
+    ("flight_data", "ready_type", "identity"),
+    [
+        pytest.param(False, CONNECTOR, None, id="plain-start-connector-ready"),
+        pytest.param(True, PLAIN, LAKE_IDENTITY, id="flight-data-start-plain-ready"),
+    ],
+)
+async def test_a_start_never_takes_a_container_of_the_other_type(
+    world, lake, flight_data: bool, ready_type: SandboxProjectType, identity: str | None
+) -> None:
+    """Each start finds its own pool empty, creates its own of its own type, and leaves the other
+    pool's container ready."""
+    _with_a_flight_data_pool(world)
+    other = await _ready(
+        world,
+        project_type=ready_type,
+        identity=LAKE_IDENTITY if ready_type is CONNECTOR else None,
+    )
+
+    handle, stopwatch = await _start(
+        world.client, uuid.uuid4(), uuid.uuid4(), flight_data=flight_data
+    )
+    await _settled(world.client)
+
+    assert (stopwatch.claimed, stopwatch.miss_reason, stopwatch.ready_count) == (
+        False,
+        "no_ready",
+        0,
+    )
+    assert world.aca.created == [handle.app_name]
+    assert world.aca.identities[handle.app_name] == identity
+    assert world.supervisors.configured == []
+    assert await _ledger() == {other: SandboxPoolState.READY}
+
+
+async def test_a_shared_view_of_a_flight_data_app_never_takes_a_flight_data_container(
+    world, lake, fake_storage: FakeStorage
+) -> None:
+    """A colleague viewing an app is never handed its owner's grant, so the view is plain."""
+    _with_a_flight_data_pool(world)
+    member = await _ready(world, project_type=CONNECTOR, identity=LAKE_IDENTITY)
+    app_id = uuid.uuid4()
+    await fake_storage.put(snapshot_key(app_id), a_git_bundle())
+
+    handle = await world.client.restore_from_snapshot(
+        str(uuid.uuid4()),
+        a_fresh_sandbox_name(),
+        app_env=_app_env(app_id),
+        kind="shared_sandbox",
+        shared_project_id=uuid.uuid4(),
+        shared_owner_id=uuid.uuid4(),
+    )
+    await _settled(world.client)
+
+    assert world.aca.created == [handle.app_name]
+    assert world.aca.identities[handle.app_name] is None
+    assert await _ledger() == {member: SandboxPoolState.READY}
+
+
+_OTHER_IDENTITY = LAKE_IDENTITY.replace("the-lake-identity", "another-identity")
+
+
+@pytest.mark.parametrize(
+    ("flight_data", "ready_type", "carried"),
+    [
+        pytest.param(False, PLAIN, LAKE_IDENTITY, id="plain-carrying-an-identity"),
+        pytest.param(True, CONNECTOR, None, id="flight-data-carrying-none"),
+        pytest.param(True, CONNECTOR, _OTHER_IDENTITY, id="flight-data-carrying-another"),
+    ],
+)
+async def test_a_claimed_container_carrying_the_wrong_identity_never_reaches_the_project(
+    world,
+    lake,
+    flight_data: bool,
+    ready_type: SandboxProjectType,
+    carried: str | None,
+) -> None:
+    """★ Checked against what Azure attached, not what the ledger says: the container is let go
+    before it answers anything, the alarm fires, and the start creates its own of its own type.
+
+    Mutation check: skip the comparison and the project's settings reach the container."""
+    _with_a_flight_data_pool(world)
+    member = await _ready(world, project_type=ready_type, identity=carried)
+
+    with capture_logs() as logged:
+        handle, stopwatch = await _start(
+            world.client, uuid.uuid4(), uuid.uuid4(), flight_data=flight_data
+        )
+        await _settled(world.client)
+
+    assert (stopwatch.claimed, stopwatch.miss_reason) == (False, "claim_failed")
+    assert f"{member}.pool.example" not in world.supervisors.health_checks
+    assert world.supervisors.configured == []
+    assert world.aca.deleted == [member]
+    assert world.aca.created == [handle.app_name]
+    assert world.aca.identities[handle.app_name] == (LAKE_IDENTITY if flight_data else None)
+    [alarm] = [e for e in logged if e["event"] == SANDBOX_POOL_WRONG_IDENTITY_EVENT]
+    assert (alarm["app_name"], alarm["carried"]) == (member, [carried] if carried else [])
+
+
+async def test_an_identity_azure_hands_back_in_another_case_is_the_same_identity(
+    world, lake
+) -> None:
+    _with_a_flight_data_pool(world)
+    member = await _ready(world, project_type=CONNECTOR, identity=LAKE_IDENTITY.lower())
+
+    handle, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4(), flight_data=True)
+
+    assert (handle.app_name, stopwatch.claimed) == (member, True)
 
 
 async def test_a_shared_view_claims_and_is_restamped_with_the_viewer_as_owner(
@@ -1061,7 +1284,7 @@ async def test_retiring_touches_only_a_claimed_row(world) -> None:
 async def test_a_fill_makes_a_container_that_holds_nothing_of_any_project(world) -> None:
     """Made at a fresh alias with the platform's settings and nothing else: no project's
     settings, no data identity, and no owner, app or birth on its tags until a claim."""
-    assert await world.client.fill_one(5) == "filled"
+    assert await world.client.fill_one(5, project_type=PLAIN) == "filled"
 
     [name] = world.aca.filled
     env = world.aca.envs[name]
@@ -1095,8 +1318,8 @@ async def test_a_fill_makes_a_container_that_holds_nothing_of_any_project(world)
 
 async def test_each_fill_gets_a_bearer_and_an_alias_of_its_own(world) -> None:
     """A shared alias would route one person's preview to the other's workspace."""
-    await world.client.fill_one(5)
-    await world.client.fill_one(5)
+    await world.client.fill_one(5, project_type=PLAIN)
+    await world.client.fill_one(5, project_type=PLAIN)
 
     first, second = world.aca.filled
     assert world.aca.envs[first]["SUPERVISOR_TOKEN"] != world.aca.envs[second]["SUPERVISOR_TOKEN"]
@@ -1106,7 +1329,7 @@ async def test_each_fill_gets_a_bearer_and_an_alias_of_its_own(world) -> None:
 async def test_a_fill_is_on_the_ledger_before_azure_is_asked(world) -> None:
     """So the refill and the worker's pass each count the other's create in flight."""
     world.aca.fills_wait_for = asyncio.Event()
-    filling = asyncio.create_task(world.client.fill_one(5))
+    filling = asyncio.create_task(world.client.fill_one(5, project_type=PLAIN))
     await asyncio.wait_for(world.aca.fill_began.wait(), timeout=5)
 
     [name] = world.aca.filled
@@ -1117,10 +1340,73 @@ async def test_a_fill_is_on_the_ledger_before_azure_is_asked(world) -> None:
     assert await _ledger() == {name: SandboxPoolState.READY}
 
 
+@pytest.mark.parametrize(
+    ("project_type", "identity"), [(PLAIN, None), (CONNECTOR, LAKE_IDENTITY)], ids=str
+)
+async def test_a_fill_makes_its_own_pools_type_with_that_pools_identity_and_no_coordinates(
+    world, lake, project_type: SandboxProjectType, identity: str | None
+) -> None:
+    """The row's type and the identity come from the one type the fill was asked for.
+
+    Mutation check: hard-code the identity, or the row's type, and one case fails."""
+    assert await world.client.fill_one(5, project_type=project_type) == "filled"
+
+    [name] = world.aca.filled
+    assert world.aca.identities[name] == identity
+    assert await _types() == {name: project_type}
+    assert await _ledger() == {name: SandboxPoolState.READY}
+    assert set(world.aca.envs[name]) == {
+        "SUPERVISOR_TOKEN",
+        "BIAL_BASE_PATH",
+        "BIAL_APPS_HOSTNAME",
+        "BIAL_PORTAL_ORIGIN",
+        "BIAL_POOL_MEMBER",
+    }
+
+
+async def test_a_flight_data_fill_with_no_lake_is_refused_before_anything_is_written(
+    world,
+) -> None:
+    """The worker may run without the lake: its flight-data fills are refused and logged, and
+    nothing else stops."""
+    with capture_logs() as logged:
+        refused = await world.client.fill_one(5, project_type=CONNECTOR)
+
+    assert refused == "refused"
+    assert world.aca.create_attempts == []
+    assert await _ledger() == {}
+    assert [
+        e["log_level"]
+        for e in logged
+        if e["event"] == "sandbox_pool_connector_fill_without_a_lake"
+    ] == ["warning"]
+    assert await world.client.fill_one(5, project_type=PLAIN) == "filled"
+
+
+async def test_a_flight_data_create_azure_refuses_is_asked_once_and_starts_create_their_own(
+    world, lake
+) -> None:
+    """Without the grant to assign the identity Azure refuses the create, which is final: the fill
+    leaves nothing behind, and a flight-data start creates its own container as it did before
+    this pool existed."""
+    _with_a_flight_data_pool(world)
+    world.aca.refuses_to_create = True
+
+    assert await world.client.fill_one(1, project_type=CONNECTOR) == "refused"
+    assert len(world.aca.create_attempts) == 1
+    assert await _ledger() == {}
+
+    world.aca.refuses_to_create = False
+    handle, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4(), flight_data=True)
+
+    assert (stopwatch.claimed, stopwatch.miss_reason) == (False, "no_ready")
+    assert world.aca.identities[handle.app_name] == LAKE_IDENTITY
+
+
 async def test_a_create_azure_refuses_leaves_no_row_and_nothing_standing(world) -> None:
     world.aca.refuses_to_create = True
 
-    assert await world.client.fill_one(5) == "refused"
+    assert await world.client.fill_one(5, project_type=PLAIN) == "refused"
 
     [attempted] = world.aca.create_attempts
     assert world.aca.deleted == [attempted]
@@ -1132,7 +1418,7 @@ async def test_a_refused_create_whose_clean_up_is_refused_too_is_left_retiring(w
     world.aca.refuses_to_create = True
     world.aca.refuses_every_delete = True
 
-    assert await world.client.fill_one(5) == "refused"
+    assert await world.client.fill_one(5, project_type=PLAIN) == "refused"
 
     [attempted] = world.aca.create_attempts
     assert await _ledger() == {attempted: SandboxPoolState.RETIRING}
@@ -1160,7 +1446,7 @@ async def test_a_refused_create_whose_row_and_clean_up_are_both_gone_is_held_ret
 
     world.aca.on_each_call = a_pass_lets_the_row_go
 
-    assert await world.client.fill_one(5) == "refused"
+    assert await world.client.fill_one(5, project_type=PLAIN) == "refused"
 
     assert await _ledger() == {let_go[0]: SandboxPoolState.RETIRING}
 
@@ -1174,7 +1460,7 @@ async def _a_fill_whose_row_a_pass_let_go(
         world.supervisors.silent_for = 1_000
         monkeypatch.setattr(client_module, "FIRST_ANSWER_CEILING", timedelta(0))
     world.aca.fills_wait_for = asyncio.Event()
-    filling = asyncio.create_task(world.client.fill_one(5))
+    filling = asyncio.create_task(world.client.fill_one(5, project_type=PLAIN))
     await asyncio.wait_for(world.aca.fill_began.wait(), timeout=5)
     [name] = world.aca.filled
     async with db_base.async_session_factory() as db:
@@ -1232,7 +1518,7 @@ async def test_a_silent_fill_whose_delete_is_refused_is_held_retiring_on_its_own
     monkeypatch.setattr(client_module, "FIRST_ANSWER_CEILING", timedelta(0))
     world.aca.refuses_every_delete = True
 
-    assert await world.client.fill_one(5) == "refused"
+    assert await world.client.fill_one(5, project_type=PLAIN) == "refused"
 
     [name] = world.aca.filled
     assert world.aca.deleted == [name]
@@ -1248,7 +1534,7 @@ async def test_a_fill_queued_past_its_deadline_whose_row_a_pass_let_go_makes_not
     Mutation check: create without restarting the row's clock and a container is made."""
     for _ in range(client_module._POOL_WORK_AT_ONCE):
         await world.client._pool_work.acquire()
-    filling = asyncio.create_task(world.client.fill_one(5))
+    filling = asyncio.create_task(world.client.fill_one(5, project_type=PLAIN))
 
     async def queued() -> bool:
         return len(await _ledger()) == 1
@@ -1347,7 +1633,7 @@ async def test_a_fill_is_ready_only_once_its_supervisor_answers(
 
     monkeypatch.setattr(client_module, "_asleep", asked_again)
 
-    assert await world.client.fill_one(5) == "filled"
+    assert await world.client.fill_one(5, project_type=PLAIN) == "filled"
 
     [name] = world.aca.filled
     assert world.supervisors.health_checks[f"{name}.aca.example"] == 4
@@ -1403,7 +1689,7 @@ async def test_a_fill_waiting_for_the_bound_is_already_on_the_ledger(world) -> N
 
     Mutation check: write the row once the bound is held and the queued fill is not counted."""
     world.aca.fills_wait_for = asyncio.Event()
-    fills = [asyncio.create_task(world.client.fill_one(5)) for _ in range(3)]
+    fills = [asyncio.create_task(world.client.fill_one(5, project_type=PLAIN)) for _ in range(3)]
 
     async def two_in_flight_and_three_rows() -> bool:
         return world.aca.filling_now == 2 and len(await _ledger()) == 3
@@ -1471,7 +1757,7 @@ async def test_a_fill_cut_short_is_retired_for_the_next_pass_to_delete(world) ->
 
     Mutation check: retire nothing on a cancellation and the row stays filling."""
     world.aca.fills_wait_for = asyncio.Event()
-    filling = asyncio.create_task(world.client.fill_one(5))
+    filling = asyncio.create_task(world.client.fill_one(5, project_type=PLAIN))
     await asyncio.wait_for(world.aca.fill_began.wait(), timeout=5)
     [name] = world.aca.filled
 

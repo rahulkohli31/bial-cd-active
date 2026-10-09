@@ -133,7 +133,9 @@ async def keep_the_pool(client: AcaSandboxClient, *, at: datetime) -> PoolPass:
     filled = 0
     made: FillOutcome = "at_target"
     for _ in range(0 if filling_overdue else target):
-        if (made := await client.fill_one(target)) != "filled":
+        if (
+            made := await client.fill_one(target, project_type=SandboxProjectType.PLAIN)
+        ) != "filled":
             break
         filled += 1
 

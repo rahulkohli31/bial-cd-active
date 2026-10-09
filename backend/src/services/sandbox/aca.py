@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import time
+from collections.abc import Collection
+from dataclasses import dataclass
 from typing import Any, Final
 
 from azure.core.exceptions import (
@@ -259,6 +261,23 @@ def _env_value_of(app: aca_models.ContainerApp, key: str) -> str | None:
     return None
 
 
+def _identity_ids_of(app: aca_models.ContainerApp) -> frozenset[str]:
+    """The ARM resource ids of the user-assigned identities attached to a container app."""
+    identity = app.identity
+    attached = identity.user_assigned_identities if identity else None
+    return frozenset(str(resource_id) for resource_id in attached or {})
+
+
+@dataclass(frozen=True)
+class ContainerFacts:
+    """What one read of a container app answers: the values it carries of the environment
+    variables asked for, and the user-assigned identities attached to it. NEVER log `env`: a
+    claim reads the supervisor bearer through it."""
+
+    env: dict[str, str]
+    identities: frozenset[str]
+
+
 class AcaControlPlane:
     """Async facade over the sync ACA management client; one instance per configured sandbox."""
 
@@ -279,11 +298,13 @@ class AcaControlPlane:
 
         `identity_resource_id` is `None` for every container that was NOT granted a connector's
         data: no lake configured, the connector switched off for this project, or its owner not
-        approved. The caller derives it from the coordinates already in `env`
-        (`services/lake/env.py::identity_resource_id_for_env`), so "has the coordinates" and "has
-        the credential" are the same fact rather than two that have to be kept in step. Passing a
-        resource id here while `env` carries no coordinates would hand this container a credential
-        to data its owner was never granted."""
+        approved. A start derives it from the coordinates already in `env`
+        (`services/lake/env.py::identity_resource_id_for_env`), so a container with the
+        coordinates always has the credential. Only a container made ahead of time for the
+        flight-data pool is given the credential without them: it belongs to no project until a
+        flight-data start claims it and hands it the coordinates. Any other caller passing a
+        resource id while `env` carries no coordinates would hand a container a credential to data
+        its owner was never granted."""
         c = self._config
         return aca_models.ContainerApp(
             location=c.region,
@@ -551,6 +572,31 @@ class AcaControlPlane:
         def _run() -> str | None:
             app = self._client.container_apps.get(self._config.resource_group, name)
             return _env_value_of(app, key)
+
+        try:
+            return await asyncio.to_thread(_run)
+        except ResourceNotFoundError:
+            return None
+        except (ServiceRequestError, ServiceResponseError) as exc:
+            raise AcaTransientError("ACA get request failed") from exc
+        except HttpResponseError as exc:
+            if exc.status_code == 404:
+                return None
+            if is_transient(exc):
+                raise AcaTransientError("ACA get was throttled or 5xx'd") from exc
+            raise AcaError("ACA get failed") from exc
+
+    async def read_app(self, *, name: str, keys: Collection[str]) -> ContainerFacts | None:
+        """`keys`' values off a live container app and the identities attached to it, in one
+        read, or `None` when the app does not exist."""
+
+        def _run() -> ContainerFacts:
+            app = self._client.container_apps.get(self._config.resource_group, name)
+            values = {key: _env_value_of(app, key) for key in keys}
+            return ContainerFacts(
+                env={key: value for key, value in values.items() if value is not None},
+                identities=_identity_ids_of(app),
+            )
 
         try:
             return await asyncio.to_thread(_run)
