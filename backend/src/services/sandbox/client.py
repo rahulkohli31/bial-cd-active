@@ -1570,7 +1570,7 @@ class AcaSandboxClient(SandboxClient):
 
     async def fill_one(self, target: int, *, project_type: SandboxProjectType) -> FillOutcome:
         """Make one ready container for the `project_type` pool unless that pool's filling and
-        ready rows of the configured image already number `target`. A flight-data one is made with
+        ready rows of the configured image already number `target`. A connector one is made with
         the lake's identity, and refused before anything is written while no lake is configured.
         Its row is written before it waits for the pool's bound, so every count of the pool sees
         it queued; its deadline restarts once the bound is held, and a fill whose row a pass let

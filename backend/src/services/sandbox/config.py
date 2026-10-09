@@ -124,7 +124,7 @@ class SandboxConfig(BaseModel):
     # How many to hold by day and by night. 0 holds none, and a start then creates its own.
     pool_day_size: PoolSize = 0
     pool_night_size: PoolSize = 0
-    # The same for the pool of containers made with the lake's identity, which only a flight-data
+    # The same for the pool of containers made with the lake's identity, which only a connector
     # project's start claims. Both processes hold the same values.
     pool_connector_day_size: PoolSize = 0
     pool_connector_night_size: PoolSize = 0

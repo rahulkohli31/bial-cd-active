@@ -74,7 +74,7 @@ Fields: `project_id`, `reason` (the exception type — never the message, which 
 content)."""
 
 SANDBOX_POOL_BELOW_SIZE_EVENT: Final = "sandbox_pool_below_size"
-"""A pass over one pool of ready sandboxes, plain or flight-data, ended below the size the settings
+"""A pass over one pool of ready sandboxes, plain or connector, ended below the size the settings
 give for that time, and something stopped it filling: a create was refused, or a container sat
 filling or claimed past its deadline. That pass made no further create for that pool; the next, a
 minute later, tries again. The other pool fills regardless.
@@ -88,15 +88,15 @@ past its deadline).
 
 WHAT TO DO: read the worker's log for that pass, where the refusal is logged beside it. An
 authorization refusal means the worker's identity lacks the create, tag-write or environment-join
-action on the sandbox resource group; for the flight-data pool alone it can also mean the worker
-may not assign the lake's identity. A flight-data fill refused with
+action on the sandbox resource group; for the connector pool alone it can also mean the worker
+may not assign the lake's identity. A connector fill refused with
 `sandbox_pool_connector_fill_without_a_lake` means the worker has no lake settings. Rows overdue
 while filling mean the image reference or the registry credentials are wrong; a capacity refusal
 means the environment is full. When it cannot be fixed soon, set that pool's sizes to zero."""
 
 SANDBOX_POOL_WRONG_IDENTITY_EVENT: Final = "sandbox_pool_claim_wrong_identity"
 """A start claimed a ready sandbox that did not carry exactly the identity its pool requires: a
-plain one carrying any identity, or a flight-data one carrying none or another. The container was
+plain one carrying any identity, or a connector one carrying none or another. The container was
 let go before the project's settings reached it, and the start created its own.
 
 A START NEVER FAILS BECAUSE OF THIS, but it is a security signal: a plain container carrying an
@@ -105,7 +105,7 @@ identity could have handed a project data it was never granted.
 Fields: `app_name` (the container), `expected` (the resource id of the identity its pool requires,
 `None` for a plain one) and `carried` (the resource ids of the identities Azure had attached).
 
-WHAT TO DO: a flight-data container carrying another identity means the lake identity changed
-without the flight-data pool being drained, or the worker and the backend hold different lake
+WHAT TO DO: a connector container carrying another identity means the lake identity changed
+without the connector pool being drained, or the worker and the backend hold different lake
 settings. Make them equal, then drain that pool. A plain container carrying any identity was
 changed outside the platform: find out how before anything else."""

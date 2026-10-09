@@ -301,10 +301,10 @@ class AcaControlPlane:
         approved. A start derives it from the coordinates already in `env`
         (`services/lake/env.py::identity_resource_id_for_env`), so a container with the
         coordinates always has the credential. Only a container made ahead of time for the
-        flight-data pool is given the credential without them: it belongs to no project until a
-        flight-data start claims it and hands it the coordinates. Any other caller passing a
-        resource id while `env` carries no coordinates would hand a container a credential to data
-        its owner was never granted."""
+        connector pool is given the credential without them: it belongs to no project until a
+        connector project's start claims it and hands it the coordinates. Any other caller
+        passing a resource id while `env` carries no coordinates would hand a container a
+        credential to data its owner was never granted."""
         c = self._config
         return aca_models.ContainerApp(
             location=c.region,

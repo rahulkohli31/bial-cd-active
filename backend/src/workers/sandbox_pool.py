@@ -1,4 +1,4 @@
-"""The two pools of ready sandboxes, plain and flight-data, each held at its size every minute
+"""The two pools of ready sandboxes, plain and connector, each held at its size every minute
 (`build_sessions/pool_pass.py`).
 
 Unlike the sweep it runs in every environment: it deletes only containers the pool's own ledger

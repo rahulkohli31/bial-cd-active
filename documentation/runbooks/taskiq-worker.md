@@ -102,13 +102,16 @@ rows section 3 describes, under its own task name.
 
 ## 5. The sandbox pool pass
 
-This pass runs every minute and keeps the number of ready sandboxes at the size the settings give
-for that time of day. Reach for this section to understand what a tick does, to tell that it is
-running, and to read the alarm it raises.
+This pass runs every minute and keeps each of the two pools of ready sandboxes — plain, and the
+data-connector pool made with the data identity — at the size the settings give for that time of
+day. Reach for this section to understand what a tick does, to tell that it is running, and to read
+the alarm it raises.
 
-**What each minute does.** It works out the target for the current time in India time — the day
-size on the configured days and hours, the night size otherwise — and then, looking only at the
-containers the pool's own ledger holds:
+**What each minute does.** It does the following for the plain pool, then for the connector pool,
+each over its own rows only. A start's own create and a refused delete always count as plain rows.
+It works out that pool's target for the current time in India time — the day size on the
+configured days and hours, the night size otherwise — and then, looking only at the containers the
+pool's own ledger holds:
 
 - deletes the container of a row left filling past its deadline — a process stopped in the middle
   of a create — and of a row left claimed past it whose container neither a registry record nor an
@@ -123,6 +126,9 @@ containers the pool's own ledger holds:
   and ready containers made from the configured image reach the target, stopping at the first
   create Azure refuses or container that never answers. A container is ready only once its
   supervisor answers, which can be a minute and more after Azure reports it made.
+
+A refusal or an overdue row stops only that pool's filling; the other pool still fills in the same
+tick.
 
 It takes a database advisory lock, as the retention pass does, so the two schedulers that briefly
 coexist across a deploy never both run it. It is the only periodic pass over the pool: the backend
@@ -145,17 +151,23 @@ claims, and a worker below the backend retires what the backend adds.
 their tags, and to join them to the sandbox environment, on the sandbox resource group;
 `../deployment.md` has the detail. Without that every fill the worker makes is refused and the pool
 stays below its size, which the alarm below says. It also needs the portal's address (section 1)
-and the same sandbox image reference the backend holds.
+and the same sandbox image reference the backend holds. For the connector pool alone it needs two
+more things: the right to attach the data identity, granted on that one identity, and the same
+`CONNECTOR_LAKE__*` settings the backend holds. Without the right, each connector create is
+refused; without the settings, each connector fill is refused before Azure is asked, with the
+warning `sandbox_pool_connector_fill_without_a_lake`. Either way only that pool stays empty, and
+the next tick after the missing piece arrives fills it.
 
-**How to tell it is alive.** Like the sweep, it leaves no durable record. Each tick logs one line:
-its outcome — the target, how many were ready as it ended, and what it filled, retired and
-deleted — even when there was nothing to do; or that another process held the pool's lock, which
-is what a tick says while a long pass is still filling. The minute the worker starts in is skipped,
+**How to tell it is alive.** Like the sweep, it leaves no durable record. Each tick logs one line
+per pool: its outcome — which pool, the target, how many were ready as it ended, and what it
+filled, retired and deleted — even when there was nothing to do; or one line saying that another
+process held the pool's lock, which is what a tick says while a long pass is still filling. The minute the worker starts in is skipped,
 so within two minutes of a fresh start there should be a line, and a minute without one after that
 means the pass is not running.
 
-**The below-size alarm.** A pass that ends below its target after Azure refused a create or a new
-container never answered, or after finding a row left filling past its deadline, logs the alarm;
+**The below-size alarm.** A pool whose run ends below its target after a create was refused or a
+new container never answered, or after finding a row left filling past its deadline, logs the
+alarm, naming that pool;
 each of those stops the filling for that pass, so a refusing Azure is asked once a minute and not
 pressed. The alarm is a log event defined
 beside the platform's other alarms in `backend/src/core/alarms.py`; whether it becomes a

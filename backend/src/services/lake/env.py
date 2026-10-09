@@ -9,8 +9,8 @@ flight data. **A start that hands a container the coordinates hands it the ident
 module is where that is made structural rather than remembered: `identity_resource_id_for_env`
 derives the grant from the presence of the coordinates, so a start cannot attach one without the
 other. The one container that holds the identity without the coordinates is an unclaimed member of
-the flight-data pool (`lake_identity_resource_id`): it belongs to no project, and only a
-flight-data start may claim it.
+the connector pool (`lake_identity_resource_id`): it belongs to no project, and only a connector
+project's start may claim it.
 
 THE NAMES ARE GENERATED FROM THE CONNECTOR'S KEY. `backend/src/` may not contain the connector's
 name (enforced by a word-boundary grep), so the container's URL variable is built here by
@@ -123,6 +123,6 @@ def identity_resource_id_for_env(app_env: dict[str, str]) -> str | None:
 
 def lake_identity_resource_id() -> str | None:
     """The ARM resource id of the configured lake's identity, or `None` with no lake: what a
-    container made ahead of time for the flight-data pool is created with."""
+    container made ahead of time for the connector pool is created with."""
     lake = _configured_lake()
     return None if lake is None else lake.identity_resource_id

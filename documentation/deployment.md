@@ -110,6 +110,10 @@ have, so they are the ones to start first.
 - **Permission for the platform's identity to attach that managed identity** to the container apps
   it creates. Without it, container creation fails outright for projects that switch the data on
   while everything else keeps working — a failure that looks like a platform bug and is not.
+- **Permission for the background worker's identity to attach that managed identity too**, granted
+  on that one identity rather than its resource group, before the data-connector pool of ready
+  sandboxes is switched on. Without it that pool stays empty and nothing else changes; see "The
+  pool of ready sandboxes".
 - **Permission for the platform's own identity to read users' basic profiles in the directory.**
   Without it, sharing finds only people who have signed in before, and everything else works. The
   identity caches its tokens, so restart the control plane after the grant.
@@ -202,6 +206,8 @@ While the two disagree each fills from its own image, which costs at most a few 
 |---|---|---|
 | `SANDBOX__POOL_DAY_SIZE` | How many ready sandboxes to hold during the day | 0 |
 | `SANDBOX__POOL_NIGHT_SIZE` | How many to hold at night | 0 |
+| `SANDBOX__POOL_CONNECTOR_DAY_SIZE` | How many ready sandboxes made with the data identity to hold during the day, for data-connector projects | 0 |
+| `SANDBOX__POOL_CONNECTOR_NIGHT_SIZE` | How many of those to hold at night | 0 |
 | `SANDBOX__POOL_DAY_START` | When the day begins, India time, as `HH:MM` | 09:00 |
 | `SANDBOX__POOL_DAY_END` | When the day ends, India time, as `HH:MM`; the day runs up to, not including, it | 19:00 |
 | `SANDBOX__POOL_DAY_DAYS` | The days that count as the day, as comma-separated three-letter names | Monday to Friday |
@@ -213,13 +219,35 @@ no ready sandboxes in that period, and every size is 0 by default.
 
 **Capacity comes first.** Each ready sandbox takes addresses and cores in the container apps
 environment on top of the live ones, and an image swap briefly needs twice as many. Confirm the
-environment's limits cover twice the largest size plus the peak number of live sandboxes before
-raising a size.
+environment's limits cover twice the largest plain size and twice the largest connector size,
+together, plus the peak number of live sandboxes before raising a size. There is no combined cap.
 
-**A data-connector project never takes a ready sandbox.** It reads tenant data through an identity
-that is attached when its container is created, and a ready sandbox has no project yet, so it
-cannot carry it. Its start creates its own sandbox with that identity instead, so a connector
-project opens no faster with the pool on, and raising a size needs nothing more for it.
+**A data-connector project takes a ready sandbox only from a pool of its own.** It reads tenant data
+through an identity that is attached when its container is created, so a plain ready sandbox
+cannot serve it. The connector pool's sandboxes are created with that identity and nothing of any
+project's. Filling it needs two things the plain pool does not: the worker's identity may attach
+the data identity (see "What has to exist before a production deployment"), and the worker holds
+the same
+`CONNECTOR_LAKE__*` settings as the control plane. Without either, nothing breaks for a person: each
+connector fill is refused with a warning, the worker raises that pool's below-size alarm, and a
+data-connector project's start creates its own sandbox as it always did. Once the missing piece is
+in place the next pass fills, with no restart.
+
+**Switching the connector pool on**, once both processes run the release that brought it:
+
+1. Confirm the worker's grant to attach the data identity, and the control plane's, reading the
+   scope of each as well as that it exists.
+2. Set `CONNECTOR_LAKE__*` on the worker to the control plane's values.
+3. Set both connector sizes on the control plane, then on the worker.
+4. Watch that pool's line in the worker's log until it reaches its size, then prove it with step 9
+   below.
+
+**The control plane's connector sizes are what keep an older release away.** An older release
+refuses to start while either `SANDBOX__POOL_CONNECTOR_*` setting is present, which matters because
+an older control plane would hand a ready sandbox carrying the data identity to any project. So the
+settings go on the control plane, at zero or above, before any worker size rises above zero; a
+drain sets them to zero rather than removing them; and they come off only as the last step of a
+rollback, in `runbooks/reconcile-and-reclamation.md`.
 
 **The release that introduced this is deployed in one order.** It changed how every workspace is
 named and found, and an older backend or worker meeting the newer one's records loses citizens'
@@ -294,9 +322,12 @@ Attaching to a workspace that is already running writes none. A kind that shows 
 that never opens its record, which no other check here would find.
 
 **9. The pool, once a size is above zero.** Within a few minutes the ready sandboxes number the
-configured size, and the worker's per-minute pass logs each tick. A start made then appears in the
-report as having claimed a ready sandbox, its create stage shrunk to the time of the claim; a start
-made with none ready, or for a data-connector project, appears with the reason it created one.
+configured size, and the worker's per-minute pass logs one line for each pool each tick. A start
+made then appears in the report as having claimed a ready sandbox, its create stage shrunk to the
+time of the claim; a start made with none ready in its own pool appears with the reason it created
+one. Once the connector pool is on, open one data-connector project: its start appears as having
+claimed, and its application still reads the data a minute later, once the claim has rewritten the
+sandbox's tags. If it cannot, set the connector sizes back to zero.
 Through a working day that includes a sandbox image deploy, the below-size alarm is quiet, or the
 worker's log explains each one by a refused create, a new sandbox that never answered, or a create a
 restart interrupted.

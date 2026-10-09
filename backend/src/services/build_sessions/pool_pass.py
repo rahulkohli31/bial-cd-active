@@ -1,4 +1,4 @@
-"""The pass that holds each pool of ready sandboxes, plain and flight-data, at its size, run every
+"""The pass that holds each pool of ready sandboxes, plain and connector, at its size, run every
 minute by the worker, one at a time under an advisory lock.
 
 It acts only on containers the pool's ledger holds, never on one a registry names: a claimed row
@@ -92,7 +92,7 @@ async def keep_the_pool_under_the_lock(client: AcaSandboxClient) -> None:
 async def keep_the_pool(
     client: AcaSandboxClient, *, at: datetime
 ) -> dict[SandboxProjectType, PoolPass]:
-    """One pass at `at`, an aware instant: the plain pool, then the flight-data pool, each over its
+    """One pass at `at`, an aware instant: the plain pool, then the connector pool, each over its
     own rows and logged as its own line. A start's own create and a held delete are plain rows."""
     return {
         project_type: await _keep_one_pool(client, project_type, at=at)

@@ -84,9 +84,10 @@ class WorkerSettings(CoreSettings):
     # declared separately and could otherwise drift.
     deploy: DeployConfig | None = None
 
-    # The lake and the identity that reads it, the API's exact values, for the pool's flight-data
-    # containers. Without it each of those fills is refused with a warning, and a flight-data start
-    # creates its own container. Shape pinned to `ApiSettings.connector_lake` by the same test.
+    # The lake and the identity that reads it, the API's exact values, for the connector pool's
+    # containers. Without it each of those fills is refused with a warning, and a connector
+    # project's start creates its own container. Shape pinned to `ApiSettings.connector_lake` by
+    # the same test.
     connector_lake: LakeConfig | None = None
 
     # ============================================================ KNOBS
