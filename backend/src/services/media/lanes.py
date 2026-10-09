@@ -56,11 +56,12 @@ would cycle. `test_the_model_lane_constant_agrees_with_the_byte_gate` keeps the 
 
 # The OPC part each OOXML format must carry. All three share the ZIP signature, so the part name is
 # the only discriminator there is — without it a `.pptx` and a plain `.zip` are the same bytes, and
-# a renamed archive would be admitted as a deck.
-_OPC_PART: Final[dict[str, bytes]] = {
-    WORD_MEDIA_TYPE: b"word/document.xml",
-    EXCEL_MEDIA_TYPE: b"xl/workbook.xml",
-    PPTX_MEDIA_TYPE: b"ppt/presentation.xml",
+# a renamed archive would be admitted as a deck. Each row also carries what a refusal calls the
+# file and the application that saves it.
+_OPC_PART: Final[dict[str, tuple[bytes, str, str]]] = {
+    WORD_MEDIA_TYPE: (b"word/document.xml", "a Word document", "Word"),
+    EXCEL_MEDIA_TYPE: (b"xl/workbook.xml", "a spreadsheet", "Excel"),
+    PPTX_MEDIA_TYPE: (b"ppt/presentation.xml", "a PowerPoint deck", "PowerPoint"),
 }
 
 # CSV and TSV have NO magic bytes — any text is a valid CSV, which is the whole point of the format
@@ -270,13 +271,18 @@ def code_lane_refusal(media_type: str, name: str, data: bytes) -> str | None:
             )
         return None
 
-    part = _OPC_PART.get(media_type)
-    if part is None:
+    office = _OPC_PART.get(media_type)
+    if office is None:
         return f"Unsupported attachment type: {media_type}."
+    part, kind, application = office
     if looks_password_protected(data):
         return PASSWORD_PROTECTED_TEXT
     if data[:4] != _ZIP_SIGNATURE:
-        return f'"{name}" could not be read as an Office file. Re-save it and attach it again.'
+        return (
+            f'"{name}" is not {kind}, whatever its name says. '
+            f"Open it in {application}, re-save it as {canonical_suffix(media_type)}, "
+            "and attach it again."
+        )
     if part not in data:
         # The OPC part is stored uncompressed in the ZIP's own headers, so a plain substring search
         # over the bytes is enough to tell the three formats apart without unpacking anything.
