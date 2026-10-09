@@ -68,13 +68,16 @@ describe('every ending the server can store has a sentence of its own', () => {
   })
 
   it('a refusal reads the same on reload as it did when it happened', () => {
-    // Both refusal codes reach the citizen live on a `TurnErrorFrame`; on RELOAD the banner is
+    // Every refusal code reaches the citizen live on a `TurnErrorFrame`; on RELOAD the banner is
     // rebuilt from the stored reason through this lookup, so the two paths must agree.
     expect(outcomeSummary({ status: 'failed', reason: 'context_hard_limit_exceeded' })).toMatch(
       /start a new chat/i,
     )
     expect(outcomeSummary({ status: 'failed', reason: 'DOCUMENT_TOO_MANY_PAGES' })).toMatch(
       /too many pages/i,
+    )
+    expect(outcomeSummary({ status: 'failed', reason: 'attachment_too_large' })).toMatch(
+      /start a new chat/i,
     )
   })
 })
@@ -98,6 +101,18 @@ describe('a chat that builds nothing', () => {
       'That reply did not finish.',
     )
   })
+
+  it.each([['context_hard_limit_exceeded'], ['DOCUMENT_TOO_MANY_PAGES'], ['attachment_too_large']])(
+    'a chat %s says on reload what it said live, since that sentence names no build',
+    (reason) => {
+      // Mutation receipt: drop the refusal arm from `buildlessEnding` and these read
+      // "That reply did not finish." — true, and no help to someone who must start a new chat.
+      expect(outcomeSummary({ status: 'failed', reason, buildless: true })).toBe(
+        outcomeSummary({ status: 'failed', reason }),
+      )
+      expect(outcomeSummary({ status: 'failed', reason, buildless: true })).toMatch(/new chat/)
+    },
+  )
 })
 
 /**

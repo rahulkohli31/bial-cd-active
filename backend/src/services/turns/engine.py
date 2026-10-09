@@ -208,6 +208,8 @@ from src.services.turns.copy import (
     APP_STOPPED_WORKING_TEXT,
     APP_WORKING_AGAIN_TEXT,
     AT_LIMIT_TEXT,
+    ATTACHMENT_TOO_LARGE_CODE,
+    ATTACHMENT_TOO_LARGE_TEXT,
     ATTACHMENT_UNAVAILABLE_REASON,
     BUILD_WROTE_NOTHING_REASON,
     CANNOT_TELL_WHAT_REMAINS_TEXT,
@@ -380,10 +382,15 @@ _CONTEXT_OVERFLOW_MARKERS: Final = ("prompt is too long", "exceed context limit"
 # have overflowed on the way.
 _PDF_TOO_MANY_PAGES_MARKERS: Final = ("maximum of 600 pdf pages", "pdf pages may be provided")
 
+# THE CHAT'S FILES REFUSED FOR THEIR SIZE, measured through this exact stack: a picture over 8,000
+# pixels on a side, and a request past 32 MB — that one is Azure's gateway, a 400 in its own words.
+_ATTACHMENT_TOO_LARGE_MARKERS: Final = (
+    "image dimensions exceed max allowed size",
+    "request content length exceeded",
+)
+
 DOCUMENT_TOO_LONG_TEXT: Final = (
-    "That PDF has too many pages for the assistant to read, and it stays in this chat, so "
-    "every message here will hit the same limit. Start a new chat and attach a shorter "
-    "document — or split this one and attach just the part you need."
+    "This PDF has too many pages. Start a new chat and attach a shorter one."
 )
 """What the citizen reads when the provider refuses a document on its page count.
 
@@ -421,6 +428,13 @@ def _is_document_too_long(exc: ModelHTTPError) -> bool:
     every malformed request is a 400, and answering an unsupported media type with "that PDF has
     too many pages" is the same class of untrue sentence read from the other end."""
     return any(marker in _provider_refusal_message(exc) for marker in _PDF_TOO_MANY_PAGES_MARKERS)
+
+
+def _is_attachment_too_large(exc: ModelHTTPError) -> bool:
+    """Whether this 400 means the chat's pictures or PDFs are too large to send."""
+    return any(
+        marker in _provider_refusal_message(exc) for marker in _ATTACHMENT_TOO_LARGE_MARKERS
+    )
 
 
 def _is_context_overflow(exc: ModelHTTPError) -> bool:
@@ -1977,10 +1991,11 @@ class TurnEngine:
             )
             self._finish(state, "failed")
         except ModelHTTPError as exc:
-            # THE ONE OVERFLOW NO PRE-FLIGHT CAN CATCH, answered in the platform's words.
+            # THE PROVIDER REFUSALS NO PRE-FLIGHT CAN CATCH, answered in the platform's words.
             #
-            # AHEAD OF THE BROAD ARM, AND NARROW INSIDE IT. Only a refusal that says the prompt
-            # did not fit is translated; every other provider error — a 429, a 500, a 400 about
+            # AHEAD OF THE BROAD ARM, AND NARROW INSIDE IT. Only a refusal whose own sentence names
+            # the cause is translated — the prompt did not fit, a PDF has too many pages, the
+            # chat's files are too large; every other provider error — a 429, a 500, a 400 about
             # a media type — takes the same generic ending it took before this arm existed, and
             # takes it HERE rather than by being re-raised, because a sibling `except` would not
             # catch it. See `_fail_generically` for what re-raising would cost.
@@ -2003,6 +2018,13 @@ class TurnEngine:
                     "turn_document_too_many_pages",
                     DOCUMENT_TOO_LONG_CODE,
                     DOCUMENT_TOO_LONG_TEXT,
+                    exc.status_code,
+                )
+            elif _is_attachment_too_large(exc):
+                await _end_named_refusal(
+                    "turn_attachment_too_large",
+                    ATTACHMENT_TOO_LARGE_CODE,
+                    ATTACHMENT_TOO_LARGE_TEXT,
                     exc.status_code,
                 )
             elif _is_transient_model_status(exc.status_code):

@@ -25,7 +25,8 @@
  */
 import { createContext, useContext, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from 'react'
 import { useAui, type Attachment, type AttachmentAdapter } from '@assistant-ui/react'
-import { BOTH_ATTACHMENT_LANES, type AttachmentLanes } from '../../../utils/attachmentInput'
+import { BOTH_ATTACHMENT_LANES, chatFileBytes, type AttachmentLanes } from '../../../utils/attachmentInput'
+import type { ChatMessage } from '../../../utils/messageTypes'
 import { createAttachmentAdapter } from './attachmentAdapter'
 
 export interface BoundAdapter {
@@ -51,7 +52,13 @@ export interface BoundAdapter {
  * refuses a spreadsheet at pick, paste and drop — every path into `add` runs through it — instead
  * of staging a chip and learning the same thing from the server a full upload later.
  */
-export function useBoundAttachmentAdapter(lanes: AttachmentLanes = BOTH_ATTACHMENT_LANES): BoundAdapter {
+export function useBoundAttachmentAdapter(
+  lanes: AttachmentLanes = BOTH_ATTACHMENT_LANES,
+  messages: readonly ChatMessage[] = [],
+): BoundAdapter {
+  // Read at pick time, long after the render that built the adapter, so a ref rather than a capture.
+  const messagesRef = useRef(messages)
+  messagesRef.current = messages
   // NOTHING STAGED UNTIL THE BINDING MOUNTS, which is the honest reading for a composer whose
   // runtime does not exist yet — and it is a function so that the day it does exist, nothing here
   // has to be told.
@@ -66,6 +73,7 @@ export function useBoundAttachmentAdapter(lanes: AttachmentLanes = BOTH_ATTACHME
       createAttachmentAdapter({
         accept: lanes.accept,
         staged: () => stagedRef.current(),
+        sentFileBytes: (exclude) => chatFileBytes(messagesRef.current, exclude),
         // A REFUSAL REACHES THE COMPOSER THROUGH THE LIBRARY'S OWN `composer.attachmentAddError`
         // event now (see `ComposerBox.tsx`), which carries the same message this hook would have
         // relayed. The adapter still requires one; nothing needs to listen here.

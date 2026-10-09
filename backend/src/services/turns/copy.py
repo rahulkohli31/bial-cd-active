@@ -25,8 +25,7 @@ WORKSPACE_UNAVAILABLE_CODE: Final = "workspace_unavailable"
 share its status family: same status, different remedies."""
 
 CHAT_TOO_LONG_TEXT: Final = (
-    "This chat has got too long to carry on. Start a new chat to keep going — your app and "
-    "everything you have built stays exactly as it is."
+    "This chat is too long. Start a new chat to keep going — nothing is lost."
 )
 """What a citizen is told when a conversation has grown past the boundary set for them.
 
@@ -34,10 +33,9 @@ IT NAMES NO NUMBER. "You have used 203,412 of your 200,000" is not something a p
 and both halves of it are words for the platform's accounting rather than for what is in front of
 them. The number belongs where an administrator sets it.
 
-THE SECOND SENTENCE IS THE LOAD-BEARING ONE. The only reason a citizen would hesitate to start a
+"NOTHING IS LOST" IS THE LOAD-BEARING CLAUSE. The only reason a citizen would hesitate to start a
 new chat is the fear that the work goes with the conversation. It does not — the app lives in the
-project — and without saying so, the honest reading of the first sentence is "you have lost your
-app"."""
+project and the old chat stays readable — and without saying so, "too long" reads as "lost"."""
 
 CHAT_TOO_LONG_CODE: Final = "context_hard_limit_exceeded"
 """The code the too-long refusal carries. A member of `END_REASONS` below."""
@@ -48,6 +46,16 @@ DOCUMENT_TOO_LONG_CODE: Final = "DOCUMENT_TOO_MANY_PAGES"
 UPPERCASE, UNLIKE EVERY OTHER REASON IN THE SYSTEM. It is the provider's own token, stored rows
 already carry it, and normalising it here would make every one of those rows unreadable to the
 lookup that renders them."""
+
+ATTACHMENT_TOO_LARGE_TEXT: Final = (
+    "The files in this chat are too large. Start a new chat and attach smaller files."
+)
+"""What the citizen reads when the provider refuses the chat's files for their size: a picture too
+large to read, or the chat's files together past the request size. Every stored file is sent again
+with each message, so only a new chat recovers."""
+
+ATTACHMENT_TOO_LARGE_CODE: Final = "attachment_too_large"
+"""The code that refusal carries. A member of `END_REASONS` below."""
 
 
 # --- HOW A TURN OR A BUILD ENDED, as a closed set ------------------------------------------
@@ -114,6 +122,7 @@ END_REASONS: Final[frozenset[str]] = frozenset(
         MODEL_UNAVAILABLE_CODE,
         CHAT_TOO_LONG_CODE,
         DOCUMENT_TOO_LONG_CODE,
+        ATTACHMENT_TOO_LARGE_CODE,
     }
 )
 """Every reason a stored row can carry.

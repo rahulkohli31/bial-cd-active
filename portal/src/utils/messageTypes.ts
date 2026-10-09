@@ -42,12 +42,10 @@ export interface TextPart {
 /** Image, PDF or code-lane file bytes living in the object store — `kind` is the chip
  * vocabulary `chip_kind_for` emits, one arm per thing a chip can do.
  *
- * `key` and `size` are OPTIONAL because a part can be rebuilt from the conversation
- * projection on reload, which ships neither: the blob key is an internal storage
- * detail the browser has no business holding, and the byte size is not needed to draw a chip.
- * Both are carried by the composer's own upload path and neither is ever read — `key` is
- * written at `attachmentStore.ts` and never consulted, `size` is read nowhere at all — so
- * typing them as required would force a reload to invent values that look like data. */
+ * `key` is OPTIONAL because a part rebuilt from the conversation projection on reload does not
+ * carry it: the blob key is an internal storage detail the browser has no business holding, and
+ * nothing reads it. `size` is what the composer counts toward the chat's room for pictures and
+ * PDFs; a part without one counts as nothing. */
 export interface FilePartImageOrDocument {
   type: 'file'
   kind: 'image' | 'document' | 'file'
@@ -145,6 +143,7 @@ export type EndReason =
   | 'workspace_unrecoverable'
   | 'context_hard_limit_exceeded'
   | 'DOCUMENT_TOO_MANY_PAGES'
+  | 'attachment_too_large'
 
 /**
  * REASON → THE SENTENCE A CITIZEN READS. The one table; there is no second copy of it.
@@ -202,9 +201,11 @@ export const OUTCOME_COPY: Readonly<Record<EndReason, string>> = {
   workspace_unrecoverable:
     'This build stopped because your workspace could not be brought back. Your last saved version is safe.',
   context_hard_limit_exceeded:
-    'This chat has got too long to carry on. Start a new chat to keep going — your app and everything you have built stays exactly as it is.',
+    'This chat is too long. Start a new chat to keep going — nothing is lost.',
   DOCUMENT_TOO_MANY_PAGES:
-    'That PDF has too many pages for the assistant to read, and it stays in this chat, so every message here will hit the same limit. Start a new chat and attach a shorter document — or split this one and attach just the part you need.',
+    'This PDF has too many pages. Start a new chat and attach a shorter one.',
+  attachment_too_large:
+    'The files in this chat are too large. Start a new chat and attach smaller files.',
 }
 
 const NAMED_ENDINGS: ReadonlySet<string> = new Set(Object.keys(OUTCOME_COPY))
@@ -281,6 +282,14 @@ function genericEnding(status: BuildOutcomeStatus): string {
 export const isCeilingReason = (reason: string | null): boolean =>
   reason === 'request_limit' || reason === 'wall_clock_deadline_exceeded'
 
+/** A refusal only a new chat recovers from. Its sentence names no build, so every kind says it. */
+export const isNewChatRefusal = (
+  reason: string | null,
+): reason is 'context_hard_limit_exceeded' | 'DOCUMENT_TOO_MANY_PAGES' | 'attachment_too_large' =>
+  reason === 'context_hard_limit_exceeded' ||
+  reason === 'DOCUMENT_TOO_MANY_PAGES' ||
+  reason === 'attachment_too_large'
+
 /**
  * The same endings for a chat with no workspace. Only the handful of reasons a buildless chat can
  * actually reach are named; every workspace-shaped one (`workspace_restored`, `idle_teardown`,
@@ -288,6 +297,7 @@ export const isCeilingReason = (reason: string | null): boolean =>
  * given copy that would never print.
  */
 function buildlessEnding(status: BuildOutcomeStatus, reason: string | null): string {
+  if (isNewChatRefusal(reason)) return OUTCOME_COPY[reason]
   if (reason === 'quota_exceeded') return 'This reply stopped: you reached your daily limit.'
   if (reason === 'stopped_by_user') return 'You stopped this reply before it finished.'
   if (reason === 'model_unavailable') {

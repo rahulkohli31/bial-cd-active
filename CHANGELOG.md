@@ -12,6 +12,12 @@ flight data. A flight-data app that took one opened without data access and said
 could not be read". A flight-data project now always gets a workspace of its own, made with that
 identity; every other app still opens from the pool.
 
+A picture or PDF the model cannot take no longer breaks a chat for good. The model refuses a
+picture more than 8,000 pixels wide or tall, and a reply whose files add up to more than 32 MB.
+Every later reply sends the chat's files again, so one such file ended every reply in that chat
+with "The assistant hit a problem", and Retry could not help. The file picker now refuses those
+files as they are attached, and a chat that already holds them says to start a new chat.
+
 > **Before deploying:** run the migrations before the new backend starts. This release adds one,
 > for the new start reason below.
 
@@ -21,6 +27,23 @@ identity; every other app still opens from the pool.
   workspace with the data identity, so it opens as fast as it did with the pool off, and the pool
   keeps serving every other project. The superadmin report of sandbox starts records these starts
   with a new reason, `connector`.
+- **A picture more than 8,000 pixels on either side is refused when it is attached,** by name and
+  size: "is 9,000 × 300 pixels. Resize it to 8,000 pixels or less on each side."
+- **A chat's pictures and PDFs can add up to 20 MB.** A file that would take the chat past it is
+  refused when it is attached, and again when the message is sent: "won't fit in this chat —
+  pictures and PDFs can add up to 20 MB. Attach a smaller file or start a new chat." The count
+  includes files already in the chat, also after the chat is reopened. Word, Excel, PowerPoint
+  and CSV files are read in the analysis session, never sent to the model, and do not count. A PDF
+  is still 20 MB at most, and a picture 7 MB.
+- **A chat whose files are already too large says so:** "The files in this chat are too large.
+  Start a new chat and attach smaller files." It used to end every reply with the general sentence.
+- **BIAL Chat offers no Retry that cannot work.** After that ending, "This chat is too long" or
+  "This PDF has too many pages", the reply shows the sentence and no Retry, also when the chat is
+  reopened; it used to show "That reply did not finish." Retry after any other failure sends the
+  message's words alone, because the server already holds its files.
+- **Shorter sentences for a chat that is too long and a PDF with too many pages:** "This chat is
+  too long. Start a new chat to keep going — nothing is lost." and "This PDF has too many pages.
+  Start a new chat and attach a shorter one."
 
 ## [1.9.3] - 2026-10-09
 

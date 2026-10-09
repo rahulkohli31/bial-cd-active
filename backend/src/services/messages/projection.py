@@ -260,6 +260,8 @@ class AttachmentRefItem(CamelModel):
     kind: str = ""
     name: str = ""
     media_type: str = ""
+    # Bytes as stored; zero when the row is gone.
+    size: int = 0
 
 
 class UserTextItem(CamelModel):
@@ -1479,7 +1481,9 @@ async def project_conversation(
 
     found = (
         await db.execute(
-            sa.select(Attachment.attachment_id, Attachment.name, Attachment.media_type).where(
+            sa.select(
+                Attachment.attachment_id, Attachment.name, Attachment.media_type, Attachment.size
+            ).where(
                 Attachment.user_id == user_id,
                 Attachment.attachment_id.in_(wanted),
             )
@@ -1488,7 +1492,7 @@ async def project_conversation(
     # OWNER-SCOPED, like every other read on this platform (ADR-0004). An attachment id is a
     # client-supplied string, so without the `user_id` predicate one citizen's transcript could
     # name another's file simply by carrying their id.
-    by_id = {row.attachment_id: (row.name, row.media_type) for row in found}
+    by_id = {row.attachment_id: (row.name, row.media_type, row.size) for row in found}
 
     for item in items:
         if not isinstance(item, UserTextItem):
@@ -1497,6 +1501,6 @@ async def project_conversation(
             known = by_id.get(ref.attachment_id)
             if known is None:
                 continue
-            ref.name, ref.media_type = known
+            ref.name, ref.media_type, ref.size = known
             ref.kind = chip_kind_for(ref.media_type)
     return items
