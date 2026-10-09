@@ -44,6 +44,7 @@ import ChatRuntimeProvider from '../components/chat/runtime/ChatRuntimeProvider'
 import { SendRefusal } from '../components/chat/sendRefusal'
 import TurnBanner from '../components/chat/TurnBanner'
 import { DURATION, LAYOUT_EASE } from '../lib/motion'
+import { chatTotalRefusal } from '../utils/attachmentInput'
 import { getStoredUser } from '../utils/auth'
 import {
   buildUserParts,
@@ -59,7 +60,7 @@ import {
 } from '../utils/conversationApi'
 import { contextState } from '../utils/contextLimits'
 import type { ComposerSubmission } from '../components/chat/Composer'
-import { isCeilingReason, type ChatMessage } from '../utils/messageTypes'
+import { isCeilingReason, isNewChatRefusal, type ChatMessage } from '../utils/messageTypes'
 import {
   isKnownFrame,
   readTurnStream,
@@ -121,8 +122,9 @@ function putReplyStep(reply: LiveReply, toolCallId: string, step: StepItem): voi
   if (step.tool !== ACKNOWLEDGEMENT_TOOL) putStep(reply, toolCallId, step)
 }
 
-/** The same question meets the same bound again, so neither offers a retry. */
-const endedAtCeiling = (reply: LiveReply) => isCeilingReason(reply.reason)
+/** A retry would meet the same bound, or the same refused files, again, so neither offers one. */
+const retryCannotHelp = (reply: LiveReply) =>
+  isCeilingReason(reply.reason) || isNewChatRefusal(reply.reason)
 
 export default function AssistantPage() {
   const { chatId: routedId } = useParams()
@@ -147,10 +149,7 @@ export default function AssistantPage() {
   const [urgent, setUrgent] = useState<string | null>(null)
   const [announcement, setAnnouncement] = useState<string | null>(null)
   const [contextTokens, setContextTokens] = useState<number | null>(null)
-  const [lastSend, setLastSend] = useState<{
-    text: string
-    attachmentIds: string[]
-  } | null>(null)
+  const [lastSend, setLastSend] = useState<{ text: string } | null>(null)
   // Replies the citizen stopped, so their steps read as stopped rather than as finished.
   const [interruptedIds, setInterruptedIds] = useState<ReadonlySet<string>>(() => new Set())
 
@@ -439,7 +438,7 @@ export default function AssistantPage() {
         setContextTokens(started.contextTokens)
         // THE RETRY CONTROL ONLY EVER RE-RUNS A TURN THE SERVER TOOK. A refused turn leaves the
         // citizen's words in the composer, so a second way to send them would send them twice.
-        setLastSend({ text, attachmentIds })
+        setLastSend({ text })
         await readTurnStream({
           conversationId: id,
           turnId: started.turnId,
@@ -447,7 +446,7 @@ export default function AssistantPage() {
           onFrame: (frame) => pushFrame(frame, reply),
         })
         if (!aliveRef.current) return
-        if (endedAtCeiling(reply)) setLastSend(null)
+        if (retryCannotHelp(reply)) setLastSend(null)
         setAnnouncement(ANNOUNCE.finished)
       } catch (err) {
         // BEFORE THE LIVENESS GUARD, because taking back what a refusal orphaned is not a paint
@@ -480,6 +479,8 @@ export default function AssistantPage() {
       // region, so a refused seventh file left "You can attach at most 5 files per message." sitting
       // in red above a composer that had since sent those five and been answered.
       setUrgent(null)
+      const tooMuch = chatTotalRefusal(messages, attachments)
+      if (tooMuch) throw new SendRefusal(tooMuch)
       const isFirstMessage = routedId === undefined
       const id = chatId
 
@@ -550,12 +551,13 @@ export default function AssistantPage() {
         })
       })
     },
-    [chatId, navigate, routedId, runTurn],
+    [chatId, messages, navigate, routedId, runTurn],
   )
 
   const retryTurn = useCallback(() => {
     if (!lastSend) return
-    void runTurn(chatId, lastSend.text, lastSend.attachmentIds)
+    // The turn the server took already holds its files; sending them again would store them twice.
+    void runTurn(chatId, lastSend.text, [])
   }, [chatId, lastSend, runTurn])
 
   // No abort: the server closes the stream after `turn_ended`, the frame that marks a reply stopped.

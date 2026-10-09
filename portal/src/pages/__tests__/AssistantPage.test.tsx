@@ -513,6 +513,72 @@ describe('coming back to an address', () => {
     expect(h.createConversation).toHaveBeenCalledTimes(1)
   })
 
+  it('★ a retry sends the words alone, since the turn the server took already holds its files', async () => {
+    // Mutation receipt: send `lastSend`'s files again from `retryTurn` and the second call names att-1.
+    h.buildUserParts.mockResolvedValue([
+      {
+        type: 'file',
+        attachmentId: 'att-1',
+        key: 'k1',
+        kind: 'document',
+        name: 'roster.pdf',
+        mediaType: 'application/pdf',
+        size: 8,
+      },
+      { type: 'text', text: 'what is in this' },
+    ])
+    h.readTurnStream.mockRejectedValueOnce(new Error('the stream died'))
+    mount()
+    type('what is in this')
+
+    fireEvent.click(await screen.findByTestId('assistant-turn-retry'))
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(2))
+    expect(h.startTurn.mock.calls[0][1].attachmentIds).toEqual(['att-1'])
+    expect(h.startTurn.mock.calls[1][1].attachmentIds).toEqual([])
+  })
+
+  it('★ a file picked while the chat was still loading is checked against the whole chat at send', async () => {
+    // The picker counted nothing, because the history had not arrived. Mutation receipt: drop the
+    // `chatTotalRefusal` call from `handleSubmit` and the turn starts.
+    let finishLoading: (value: unknown) => void = () => {}
+    h.getConversation.mockReturnValue(new Promise((resolve) => (finishLoading = resolve)))
+    mount('/assistant/c1')
+    fireEvent.drop(screen.getByTestId('composer-dropzone'), {
+      dataTransfer: {
+        types: ['Files'],
+        files: [new File([new Uint8Array(2 * 1024 * 1024)], 'more.pdf', { type: 'application/pdf' })],
+      },
+    })
+    await waitFor(() => expect(screen.getByTestId('composer-chips').textContent).toContain('more.pdf'))
+    finishLoading(
+      aConversation({
+        messages: [
+          {
+            id: 'u1',
+            role: 'user',
+            seq: 0,
+            parts: [
+              {
+                type: 'file',
+                kind: 'document',
+                attachmentId: 'att-0',
+                name: 'big.pdf',
+                mediaType: 'application/pdf',
+                size: 19 * 1024 * 1024,
+              },
+              { type: 'text', text: 'here is the big one' },
+            ],
+          },
+        ],
+      }),
+    )
+    await screen.findByText('here is the big one')
+    type('and this one')
+
+    expect(await screen.findByText(/"more\.pdf" won't fit in this chat/)).toBeTruthy()
+    expect(h.startTurn).not.toHaveBeenCalled()
+  })
+
   it('renders no suggestion UI', async () => {
     mount()
     expect(screen.queryByTestId('composer-suggestions')).toBeNull()
@@ -1244,6 +1310,22 @@ describe('a reply that works through the citizen files', () => {
       )
       expect(announcing).toHaveLength(1)
       expect(screen.getByTestId('activity-announcer').textContent).toBe('Reply finished.')
+      expect(screen.queryByTestId('assistant-turn-retry')).toBeNull()
+    },
+  )
+
+  it.each([['context_hard_limit_exceeded'], ['DOCUMENT_TOO_MANY_PAGES'], ['attachment_too_large']])(
+    '★ a turn that ends with %s offers no retry, since only a new chat helps',
+    async (reason) => {
+      // Mutation receipt: drop `isNewChatRefusal` from `retryCannotHelp` and the retry is offered.
+      const turn = scriptTurn()
+      mount()
+      type('what is in these files')
+      await turn.opened()
+      await turn.frame({ type: 'error', seq: 1, message: 'Start a new chat.' })
+      await turn.frame({ type: 'turn_ended', seq: 2, turnId: 't1', status: 'failed', reason })
+      await turn.end()
+
       expect(screen.queryByTestId('assistant-turn-retry')).toBeNull()
     },
   )

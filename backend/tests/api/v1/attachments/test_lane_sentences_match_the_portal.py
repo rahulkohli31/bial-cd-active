@@ -110,11 +110,12 @@ def _limit(name: str) -> int:
     ("name", "server_limit"),
     [
         ("IMAGE_MAX_MB", IMAGE_MAX_MB),
-        ("PDF_MAX_MB", PDF_MAX_MB),
+        ("CHAT_FILES_MAX_MB", PDF_MAX_MB),
         ("CODE_LANE_MAX_MB", CODE_LANE_MAX_MB),
     ],
 )
 def test_each_size_limit_is_the_portal_s_number_for_number(name: str, server_limit: int) -> None:
     """The browser refuses an oversized file before it uploads. Set lower than the server's, it
-    refuses files the server takes; set higher, a citizen waits out an upload that is refused."""
+    refuses files the server takes; set higher, a citizen waits out an upload that is refused.
+    The portal's total for a chat's pictures and PDFs is also its largest PDF."""
     assert _limit(name) == server_limit

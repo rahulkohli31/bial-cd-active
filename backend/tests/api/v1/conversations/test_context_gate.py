@@ -273,7 +273,7 @@ async def test_the_refusal_names_the_way_out(client, db_session) -> None:
     message = (await _send(client, user, conversation.id)).json()["error"]["message"]
 
     assert "new chat" in message
-    assert "stays exactly as it is" in message
+    assert "nothing is lost" in message
     assert str(DEFAULT_CONTEXT_HARD) not in message  # never quotes the number
     assert "200,000" not in message
 

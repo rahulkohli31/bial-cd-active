@@ -2444,13 +2444,15 @@ async def test_a_turn_with_nothing_left_after_the_dedupe_is_not_drawn(db_session
 # --- the enrichment entry point -----------------------------------------------------------
 
 
-async def _stored_attachment(db_session, user_id, attachment_id: str, name: str, media_type: str):
+async def _stored_attachment(
+    db_session, user_id, attachment_id: str, name: str, media_type: str, size: int = 1
+):
     row = Attachment(
         user_id=user_id,
         attachment_id=attachment_id,
         media_type=media_type,
         name=name,
-        size=1,
+        size=size,
         storage_key=f"att/{user_id}/{attachment_id}",
     )
     db_session.add(row)
@@ -2459,10 +2461,13 @@ async def _stored_attachment(db_session, user_id, attachment_id: str, name: str,
 
 
 async def test_a_chip_is_filled_in_from_the_attachment_row(db_session) -> None:
-    """`project_rows` is pure and carries only the id; the name and media type live in the
-    attachments table. This is the seam that joins them, and it is what every route calls."""
+    """`project_rows` is pure and carries only the id; the name, media type and size live in the
+    attachments table. This is the seam that joins them, and it is what every route calls. The
+    size is what lets a reopened chat's composer know how much of its file room is already used."""
     user, _, conversation = await _thread(db_session)
-    await _stored_attachment(db_session, user.id, "att_sheet", "movements.xlsx", EXCEL_MEDIA_TYPE)
+    await _stored_attachment(
+        db_session, user.id, "att_sheet", "movements.xlsx", EXCEL_MEDIA_TYPE, size=4096
+    )
     await _code_lane_turn(db_session, user, conversation, "what is in this?", ["att_sheet"])
 
     rows = await _rows(db_session, user, conversation)
@@ -2473,7 +2478,7 @@ async def test_a_chip_is_filled_in_from_the_attachment_row(db_session) -> None:
     ]
 
     chip = items[0].attachments[0]
-    assert (chip.name, chip.media_type) == ("movements.xlsx", EXCEL_MEDIA_TYPE)
+    assert (chip.name, chip.media_type, chip.size) == ("movements.xlsx", EXCEL_MEDIA_TYPE, 4096)
     assert chip.kind == chip_kind_for(EXCEL_MEDIA_TYPE)
 
 
@@ -2507,6 +2512,7 @@ async def test_a_transcript_naming_another_citizens_attachment_learns_nothing_ab
     assert chip.attachment_id == "att_theirs"  # the reference survives — it is in their payload
     assert chip.name == ""
     assert chip.media_type == ""
+    assert chip.size == 0
 
 
 async def test_a_reference_whose_row_is_gone_reads_as_unavailable_rather_than_failing(

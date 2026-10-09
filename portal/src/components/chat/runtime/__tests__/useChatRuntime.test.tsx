@@ -59,7 +59,12 @@ function mountRuntime(options: Partial<ChatRuntimeOptions> = {}) {
     // REQUIRED, and required rather than optional on purpose: the
     // `attachments` capability is DERIVED from this adapter's presence, so a caller that could
     // omit it would be a caller that silently turns the library's composer box off.
-    attachments: createAttachmentAdapter({ accept: ACCEPT_ATTR, staged: () => [], onRefused: () => {} }),
+    attachments: createAttachmentAdapter({
+      accept: ACCEPT_ATTR,
+      staged: () => [],
+      sentFileBytes: () => 0,
+      onRefused: () => {},
+    }),
     ...options,
   }
 

@@ -30,6 +30,7 @@ import pytest
 
 from src.services.build_sessions import outcome as outcome_module
 from src.services.turns.copy import (
+    ATTACHMENT_TOO_LARGE_CODE,
     CHAT_TOO_LONG_CODE,
     DOCUMENT_TOO_LONG_CODE,
     END_REASONS,
@@ -103,11 +104,16 @@ def test_the_copy_table_is_total_over_the_union() -> None:
 
 @pytest.mark.parametrize(
     "reason",
-    [CHAT_TOO_LONG_CODE, DOCUMENT_TOO_LONG_CODE, MODEL_UNAVAILABLE_CODE],
-    ids=["chat_too_long", "document_too_long", "model_unavailable"],
+    [
+        CHAT_TOO_LONG_CODE,
+        DOCUMENT_TOO_LONG_CODE,
+        ATTACHMENT_TOO_LARGE_CODE,
+        MODEL_UNAVAILABLE_CODE,
+    ],
+    ids=["chat_too_long", "document_too_long", "attachment_too_large", "model_unavailable"],
 )
 def test_the_direct_assignment_reasons_are_in_the_collection(reason: str) -> None:
-    """The three reasons that never pass through `_WriteEndedError`: two named refusals and the
+    """The four reasons that never pass through `_WriteEndedError`: three named refusals and the
     model-unavailable ending assign `state.end_reason` directly. A union derived from the
     exception class would be green while every one of them still reproduced the bug on reload."""
     assert reason in END_REASONS

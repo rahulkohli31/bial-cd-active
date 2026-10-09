@@ -85,7 +85,7 @@ import { discardUnsavedChanges, fetchSaveState, saveProject, fetchPreviewState, 
 import type { PreviewState } from '../../utils/buildSessionApi'
 import { resolvePlanOptions } from '../../utils/turnStreamApi'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../../utils/attachmentStore'
-import { validateConversationAttachmentCap } from '../../utils/attachmentInput'
+import { chatTotalRefusal, validateConversationAttachmentCap } from '../../utils/attachmentInput'
 import { announceDeploymentChanged } from '../../hooks/usePublishState'
 import { useProjectDialogs } from '../../hooks/useProjectDialogs'
 
@@ -1583,6 +1583,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
     if (attachments.length > 0) {
       const cap = validateConversationAttachmentCap(countAttachments(messages), attachments.length)
       if ('error' in cap) throw new SendRefusal(cap.error)
+      const tooMuch = chatTotalRefusal(messages, attachments)
+      if (tooMuch) throw new SendRefusal(tooMuch)
     }
 
     // THE CHAT THE COMPOSER STAMPED AT PRESS TIME, not whichever one is open when this

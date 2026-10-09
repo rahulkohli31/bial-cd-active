@@ -24,6 +24,7 @@ import {
   type AttachmentLanes,
 } from '../../../utils/attachmentInput'
 import type { ComposerSubmission } from '../ComposerBox'
+import type { ChatMessage } from '../../../utils/messageTypes'
 
 afterEach(cleanup)
 
@@ -45,6 +46,8 @@ interface DrawOptions {
   locked?: boolean
   /** Narrow the conversation to one lane. Absent is the shared harness, which is both. */
   lanes?: AttachmentLanes
+  /** The chat's transcript so far. Absent is the shared harness, which has none. */
+  messages?: ChatMessage[]
 }
 
 /**
@@ -52,11 +55,19 @@ interface DrawOptions {
  * `ComposerHarness` takes no lanes, and a chat with no workspace is only itself under a narrowed
  * one.
  */
-function Harness({ lanes, children }: { lanes: AttachmentLanes | undefined; children: ReactNode }) {
-  if (!lanes) return <ComposerHarness>{children}</ComposerHarness>
+function Harness({
+  lanes,
+  messages,
+  children,
+}: {
+  lanes: AttachmentLanes | undefined
+  messages: ChatMessage[] | undefined
+  children: ReactNode
+}) {
+  if (!lanes && !messages) return <ComposerHarness>{children}</ComposerHarness>
   return (
     <ChatRuntimeProvider
-      messages={[]}
+      messages={messages ?? []}
       isRunning={false}
       onNew={vi.fn().mockResolvedValue(undefined)}
       onCancel={vi.fn().mockResolvedValue(undefined)}
@@ -74,10 +85,11 @@ function draw({
   onAccepted,
   locked = false,
   lanes,
+  messages,
 }: DrawOptions = {}) {
   const submit = onSubmit ?? vi.fn().mockResolvedValue(undefined)
   const mount = (conversationId: string) => (
-    <Harness lanes={lanes}>
+    <Harness lanes={lanes} messages={messages}>
       <ComposerBox
         conversationId={conversationId}
         placeholder="Describe the change you need…"
@@ -496,6 +508,74 @@ describe('★ the attachment pipeline stays ours', () => {
     expect(submission.attachments[0]).toMatchObject({ name: 'payroll.csv', mediaType: 'text/csv' })
     expect(typeof submission.attachments[0]?.base64).toBe('string')
     expect(submission.conversationId).toBe('chat-1')
+  })
+
+  it('refuses a PDF the chat has no room left for, counting what it already holds', async () => {
+    // The chat's own transcript is what tells the picker how much it already holds. Mutation
+    // receipt: stop passing `messages` to the adapter in `ChatRuntimeProvider` and the PDF is staged.
+    const onUrgent = vi.fn()
+    const held: ChatMessage = {
+      id: 'm1',
+      role: 'user',
+      parts: [
+        {
+          type: 'file',
+          kind: 'document',
+          attachmentId: 'att-1',
+          name: 'big.pdf',
+          mediaType: 'application/pdf',
+          size: 19 * 1024 * 1024,
+        },
+      ],
+    }
+    draw({ onUrgent, messages: [held] })
+    drop(new File([new Uint8Array(2 * 1024 * 1024)], 'more.pdf', { type: 'application/pdf' }))
+    await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
+    expect(onUrgent.mock.calls[0]?.[0]).toMatch(/won't fit in this chat/)
+    expect(screen.queryByTestId('composer-chips')).toBeNull()
+  })
+
+  it("counts a chat's history that arrives after the picker was set up", async () => {
+    // A reopened chat mounts before its history loads, and the picker is built once. Mutation
+    // receipt: capture `messages` instead of reading the ref in `useBoundAttachmentAdapter` and
+    // the PDF is staged.
+    const onUrgent = vi.fn()
+    const held: ChatMessage = {
+      id: 'm1',
+      role: 'user',
+      parts: [
+        {
+          type: 'file',
+          kind: 'document',
+          attachmentId: 'att-1',
+          name: 'big.pdf',
+          mediaType: 'application/pdf',
+          size: 19 * 1024 * 1024,
+        },
+      ],
+    }
+    const box = (messages: ChatMessage[]) => (
+      <ChatRuntimeProvider
+        messages={messages}
+        isRunning={false}
+        onNew={vi.fn().mockResolvedValue(undefined)}
+        onCancel={vi.fn().mockResolvedValue(undefined)}
+      >
+        <ComposerBox
+          conversationId="chat-1"
+          placeholder="Describe the change you need…"
+          onSubmit={vi.fn().mockResolvedValue(undefined)}
+          unavailableReason={null}
+          locked={false}
+          onUrgent={onUrgent}
+        />
+      </ChatRuntimeProvider>
+    )
+    const view = render(box([]))
+    view.rerender(box([held]))
+    drop(new File([new Uint8Array(2 * 1024 * 1024)], 'more.pdf', { type: 'application/pdf' }))
+    await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
+    expect(onUrgent.mock.calls[0]?.[0]).toMatch(/won't fit in this chat/)
   })
 
   it('★ says a refused file out loud, which the library would swallow', async () => {

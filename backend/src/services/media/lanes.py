@@ -77,7 +77,8 @@ CODE_LANE_MEDIA: Final[frozenset[str]] = frozenset(_OPC_PART) | frozenset(_DELIM
 
 # ONE SIZE LIMIT PER LANE, in MiB, with images split from PDFs inside the model lane. The upload
 # route is the only place they are enforced, and every refusal that names a size interpolates
-# them. The portal mirrors all three in `attachmentInput.ts`, and a test holds the two equal.
+# them. The portal mirrors the image and code-lane limits in `attachmentInput.ts` and uses the PDF
+# limit as its total for a chat's pictures and PDFs together; a test holds each pair equal.
 IMAGE_MAX_MB: Final = 7
 """The provider caps an image at 10 MB of base64, which is about 7.5 MB of file."""
 PDF_MAX_MB: Final = 20

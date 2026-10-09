@@ -90,6 +90,7 @@ interface ProjectedAttachment {
   kind?: unknown
   name?: unknown
   mediaType?: unknown
+  size?: unknown
 }
 
 /**
@@ -114,6 +115,7 @@ function fileParts(item: RawProjectionItem): MessagePart[] {
       attachmentId,
       name: typeof entry.name === 'string' ? entry.name : '',
       mediaType: typeof entry.mediaType === 'string' ? entry.mediaType : '',
+      ...(typeof entry.size === 'number' ? { size: entry.size } : {}),
     })
   }
   return parts

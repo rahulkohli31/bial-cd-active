@@ -1,3 +1,6 @@
+import { imageSize } from 'image-size'
+import type { ChatMessage } from './messageTypes'
+
 /**
  * Pure helpers for the chat attachment composer. Validation + base64 reading +
  * ref-building live here so the composer logic is testable without a DOM render. The real trust boundary is
@@ -72,18 +75,18 @@ export const ACCEPT_ATTR = [
   ...[...LEGACY_OFFICE.keys()].map((ext) => `.${ext}`),
 ].join(',')
 
-// ONE SIZE LIMIT PER LANE, in MiB, matching `media/lanes.py` number for number; a backend test
-// holds the two equal. Measured on the original `File.size`, so a citizen learns a file is too
-// large before it is read, encoded and sent.
+// SIZE LIMITS in MiB; a backend test holds each to its `media/lanes.py` twin. Measured on the
+// original `File.size`, so a citizen learns a file is too large before it is read, encoded and sent.
 export const IMAGE_MAX_MB = 7
-export const PDF_MAX_MB = 20
+// Pictures and PDFs are sent to the assistant again with every message, and it reads at most
+// 32 MB at once — about 24 MB of files once encoded. So this is a chat's total for them, and
+// with it the most one PDF can be.
+export const CHAT_FILES_MAX_MB = 20
 export const CODE_LANE_MAX_MB = 30
+/** The provider refuses a picture wider or taller than this. */
+const IMAGE_MAX_PIXELS = 8000
 
-function maxFileSizeMb(mediaType: string): number {
-  if (IMAGE_MEDIA_TYPES.includes(mediaType)) return IMAGE_MAX_MB
-  if (MODEL_LANE_MEDIA_TYPES.includes(mediaType)) return PDF_MAX_MB
-  return CODE_LANE_MAX_MB
-}
+const MIB = 1024 * 1024
 
 export const MAX_FILES_PER_MESSAGE = 5
 // Cumulative cap across a whole conversation (all turns). Distinct from the
@@ -182,18 +185,21 @@ export function resolveMediaType(file: File): string {
  * and both the allowlist and size cap run against that resolved type, measured on the
  * original `File.size`.
  *
- * A pre-2007 Office extension is refused first, by name, ahead of the media-type allowlist. After
- * that every file takes one path, and its lane decides its size limit.
+ * A pre-2007 Office extension is refused first, by name, ahead of the media-type allowlist. A
+ * picture has its own size limit; pictures and PDFs together must fit the chat's total, of which
+ * `heldBytes` is already used; every other file has the code lane's limit.
  */
 export type AttachmentValidationResult = { error: string } | { ok: true }
 
 export function validateAttachmentFiles(
   incoming: File[],
   currentCount = 0,
+  heldBytes = 0,
 ): AttachmentValidationResult {
   if (currentCount + incoming.length > MAX_FILES_PER_MESSAGE) {
     return { error: `You can attach at most ${MAX_FILES_PER_MESSAGE} files per message.` }
   }
+  let held = heldBytes
   for (const file of incoming) {
     const legacy = legacyOfficeFormat(file.name)
     if (legacy) {
@@ -208,12 +214,85 @@ export function validateAttachmentFiles(
       return { error: unsupportedFileMessage(file.name) }
     }
     // Interpolated, never spelled: the figure a citizen is told is the figure enforced.
-    const maxMb = maxFileSizeMb(mediaType)
-    if (file.size > maxMb * 1024 * 1024) {
-      return { error: `"${file.name}" exceeds the ${maxMb} MB limit.` }
+    if (!MODEL_LANE_MEDIA_TYPES.includes(mediaType)) {
+      if (file.size > CODE_LANE_MAX_MB * MIB) {
+        return { error: `"${file.name}" exceeds the ${CODE_LANE_MAX_MB} MB limit.` }
+      }
+      continue
     }
+    if (IMAGE_MEDIA_TYPES.includes(mediaType) && file.size > IMAGE_MAX_MB * MIB) {
+      return { error: `"${file.name}" exceeds the ${IMAGE_MAX_MB} MB limit.` }
+    }
+    held += file.size
+    if (held > CHAT_FILES_MAX_MB * MIB) return { error: wontFit(file.name) }
   }
   return { ok: true }
+}
+
+function wontFit(name: string): string {
+  return (
+    `"${name}" won't fit in this chat — pictures and PDFs can add up to ${CHAT_FILES_MAX_MB} MB. ` +
+    'Attach a smaller file or start a new chat.'
+  )
+}
+
+/**
+ * The refusal for a send whose pictures and PDFs would take the chat past its total, or `null`.
+ * The picker checks as each file arrives; this catches one picked before the chat's history loaded.
+ */
+export function chatTotalRefusal(
+  messages: readonly ChatMessage[],
+  attachments: readonly { name: string; mediaType: string; size: number }[],
+): string | null {
+  let held = chatFileBytes(messages)
+  for (const attachment of attachments) {
+    held += chatFileWeight(attachment.mediaType, attachment.size)
+    if (held > CHAT_FILES_MAX_MB * MIB) return wontFit(attachment.name)
+  }
+  return null
+}
+
+/** What a file of this type and size takes from the chat's room: pictures and PDFs, nothing else. */
+export function chatFileWeight(mediaType: string, size: number): number {
+  return MODEL_LANE_MEDIA_TYPES.includes(mediaType) ? size : 0
+}
+
+const NO_IDS: ReadonlySet<string> = new Set()
+
+/** Bytes of the pictures and PDFs these messages carry, skipping the attachment ids in `exclude`. */
+export function chatFileBytes(messages: readonly ChatMessage[], exclude = NO_IDS): number {
+  let total = 0
+  for (const message of messages) {
+    for (const part of message.parts) {
+      if (part.type === 'file' && !exclude.has(part.attachmentId)) {
+        total += chatFileWeight(part.mediaType, part.size ?? 0)
+      }
+    }
+  }
+  return total
+}
+
+// Every format puts its size in its first few bytes, a JPEG behind its EXIF and colour profile.
+// A window this wide covers them without parsing a whole crafted file.
+const HEADER_BYTES = 1024 * 1024
+
+/**
+ * The refusal for a picture wider or taller than the provider reads, or `null`. Reads the size from
+ * the file's header rather than decoding the picture. A header it cannot read is let through: the
+ * server says what is wrong.
+ */
+export async function pixelLimitRefusal(file: File): Promise<string | null> {
+  if (!IMAGE_MEDIA_TYPES.includes(resolveMediaType(file))) return null
+  let size: { width: number; height: number }
+  try {
+    size = imageSize(new Uint8Array(await file.slice(0, HEADER_BYTES).arrayBuffer()))
+  } catch {
+    return null
+  }
+  const { width, height } = size
+  if (width <= IMAGE_MAX_PIXELS && height <= IMAGE_MAX_PIXELS) return null
+  const n = (value: number) => value.toLocaleString('en-US')
+  return `"${file.name}" is ${n(width)} × ${n(height)} pixels. Resize it to ${n(IMAGE_MAX_PIXELS)} pixels or less on each side.`
 }
 
 /** The pending-composer shape (`chat/runtime/attachmentAdapter.ts` makes them) —

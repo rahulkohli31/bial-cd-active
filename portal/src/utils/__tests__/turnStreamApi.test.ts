@@ -436,7 +436,7 @@ describe('startTurn', () => {
     // sent. Try again."). A 413 arriving without its message would silently regress to that
     // generic line while looking fixed.
     const sentence =
-      'This chat has got too long to carry on. Start a new chat to keep going — your app and everything you have built stays exactly as it is.'
+      'This chat is too long. Start a new chat to keep going — nothing is lost.'
     const fetchFn = vi.fn(
       async () =>
         new Response(

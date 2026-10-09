@@ -118,7 +118,7 @@ PDF_MEDIA_TYPE = "application/pdf"
 # thread that has already grown too large; it cannot size the message about to be sent, because
 # only the provider can count a prompt. A single long document therefore reaches the provider on
 # its first turn whatever its length, and the refusal comes back from there — which is why
-# `turns/engine.py` translates the provider's own two refusals into sentences of ours rather
+# `turns/engine.py` translates the provider's own refusals into sentences of ours rather
 # than leaving them generic.
 
 

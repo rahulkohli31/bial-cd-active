@@ -749,6 +749,11 @@
             "default": "",
             "title": "Name",
             "type": "string"
+          },
+          "size": {
+            "default": 0,
+            "title": "Size",
+            "type": "integer"
           }
         },
         "required": [

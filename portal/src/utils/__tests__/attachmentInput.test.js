@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import {
   validateAttachmentFiles,
+  pixelLimitRefusal,
+  chatFileBytes,
+  chatTotalRefusal,
   validateConversationAttachmentCap,
   resolveMediaType,
   fileToBase64,
@@ -76,7 +79,6 @@ describe('validateAttachmentFiles', () => {
     ['photo.jpg', 'image/jpeg', 7],
     ['photo.gif', 'image/gif', 7],
     ['photo.webp', 'image/webp', 7],
-    ['spec.pdf', 'application/pdf', 20],
     ['rows.csv', 'text/csv', 30],
     ['rows.tsv', 'text/tab-separated-values', 30],
     ['book.xlsx', XLSX, 30],
@@ -93,6 +95,122 @@ describe('validateAttachmentFiles', () => {
   })
 
 
+})
+
+describe("a chat's room for pictures and PDFs", () => {
+  const MB = 1024 * 1024
+  const wontFit = (name) =>
+    `"${name}" won't fit in this chat — pictures and PDFs can add up to 20 MB. Attach a smaller file or start a new chat.`
+
+  it('takes a PDF up to the whole 20 MB of an empty chat, and not a byte more', () => {
+    // Every picture and PDF is sent to the assistant again with each message, and it reads at
+    // most 32 MB at once. One limit per chat is what keeps every later message under that.
+    expect(validateAttachmentFiles([file('spec.pdf', 'application/pdf', 20 * MB)], 0, 0)).toEqual({ ok: true })
+    expect(validateAttachmentFiles([file('spec.pdf', 'application/pdf', 20 * MB + 1)], 0, 0)).toEqual({
+      error: wontFit('spec.pdf'),
+    })
+  })
+
+  it('counts the pictures and PDFs the chat already holds', () => {
+    expect(validateAttachmentFiles([file('photo.png', 'image/png', 5 * MB)], 0, 15 * MB)).toEqual({ ok: true })
+    expect(validateAttachmentFiles([file('photo.png', 'image/png', 5 * MB + 1)], 0, 15 * MB)).toEqual({
+      error: wontFit('photo.png'),
+    })
+  })
+
+  it('adds up files picked together', () => {
+    const pick = [file('a.pdf', 'application/pdf', 11 * MB), file('b.pdf', 'application/pdf', 11 * MB)]
+    expect(validateAttachmentFiles(pick, 0, 0)).toEqual({ error: wontFit('b.pdf') })
+  })
+
+  it('never counts spreadsheets, documents or decks, which the assistant does not receive', () => {
+    expect(validateAttachmentFiles([file('book.xlsx', XLSX, 30 * MB)], 0, 20 * MB)).toEqual({ ok: true })
+  })
+})
+
+describe('chatFileBytes', () => {
+  it("adds up the pictures and PDFs in the chat's messages, and nothing else", () => {
+    const part = (mediaType, size) => ({ type: 'file', kind: 'file', attachmentId: 'a', name: 'f', mediaType, size })
+    const messages = [
+      { parts: [part('image/png', 100), { type: 'text', text: 'look' }] },
+      { parts: [part('application/pdf', 1000), part(XLSX, 5000)] },
+      // A file whose row is gone has no size, and holds no room.
+      { parts: [{ type: 'file', kind: 'image', attachmentId: 'b', name: '', mediaType: 'image/png' }] },
+    ]
+    expect(chatFileBytes(messages)).toBe(1100)
+  })
+
+  it('leaves out the files it is told to, which a send still in flight holds twice', () => {
+    const messages = [{ parts: [{ type: 'file', kind: 'document', attachmentId: 'a1', name: 'f', mediaType: 'application/pdf', size: 500 }] }]
+    expect(chatFileBytes(messages, new Set(['a1']))).toBe(0)
+  })
+})
+
+describe('chatTotalRefusal', () => {
+  const MB = 1024 * 1024
+  const held = (size) => [{ parts: [{ type: 'file', kind: 'document', attachmentId: 'a0', name: 'big.pdf', mediaType: 'application/pdf', size }] }]
+
+  it("refuses a send that would take the chat's pictures and PDFs past 20 MB, naming the file", () => {
+    expect(chatTotalRefusal(held(19 * MB), [{ name: 'more.pdf', mediaType: 'application/pdf', size: 2 * MB }])).toBe(
+      '"more.pdf" won\'t fit in this chat — pictures and PDFs can add up to 20 MB. Attach a smaller file or start a new chat.',
+    )
+  })
+
+  it('lets through a send that fits, and never counts a spreadsheet', () => {
+    expect(chatTotalRefusal(held(19 * MB), [{ name: 'a.pdf', mediaType: 'application/pdf', size: MB }])).toBeNull()
+    expect(chatTotalRefusal(held(20 * MB), [{ name: 'b.xlsx', mediaType: XLSX, size: 30 * MB }])).toBeNull()
+  })
+})
+
+describe('pixelLimitRefusal', () => {
+  /** The first bytes of a PNG this many pixels wide and tall — all the size check reads. */
+  const pngHeader = (width, height) => {
+    const bytes = new Uint8Array(33)
+    bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52])
+    const view = new DataView(bytes.buffer)
+    view.setUint32(16, width)
+    view.setUint32(20, height)
+    return bytes
+  }
+  const png = (name, width, height, type = 'image/png') => new File([pngHeader(width, height)], name, { type })
+
+  it('refuses a picture wider or taller than 8,000 pixels, saying its size and what to do', async () => {
+    expect(await pixelLimitRefusal(png('logo.png', 8001, 300))).toBe(
+      '"logo.png" is 8,001 × 300 pixels. Resize it to 8,000 pixels or less on each side.',
+    )
+    expect(await pixelLimitRefusal(png('scan.png', 300, 8001))).toMatch(/300 × 8,001 pixels/)
+  })
+
+  it('finds a JPEG\'s size behind the EXIF segment a phone writes first', async () => {
+    const exif = new Uint8Array(4 + 4096)
+    exif.set([0xff, 0xe1, 0x10, 0x02])
+    const sof = new Uint8Array([0xff, 0xc0, 0x00, 0x11, 0x08, 0x01, 0x2c, 0x1f, 0x41, 0x03, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1])
+    const jpeg = new File([new Uint8Array([0xff, 0xd8]), exif, sof], 'photo.jpg', { type: 'image/jpeg' })
+    expect(await pixelLimitRefusal(jpeg)).toBe(
+      '"photo.jpg" is 8,001 × 300 pixels. Resize it to 8,000 pixels or less on each side.',
+    )
+  })
+
+  it('reads only the first megabyte, letting through a picture whose size lies beyond it', async () => {
+    // Mutation receipt: read the whole file instead of a slice and this refuses the picture.
+    const segment = new Uint8Array(2 + 65535)
+    segment.set([0xff, 0xe2, 0xff, 0xff])
+    const sof = new Uint8Array([0xff, 0xc0, 0x00, 0x11, 0x08, 0x01, 0x2c, 0x1f, 0x41, 0x03, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1])
+    const parts = [new Uint8Array([0xff, 0xd8]), ...Array(17).fill(segment), sof]
+    expect(await pixelLimitRefusal(new File(parts, 'huge-profile.jpg', { type: 'image/jpeg' }))).toBeNull()
+  })
+
+  it('takes a picture of exactly 8,000 pixels', async () => {
+    expect(await pixelLimitRefusal(png('logo.png', 8000, 8000))).toBeNull()
+  })
+
+  it('never reads a PDF or a spreadsheet', async () => {
+    expect(await pixelLimitRefusal(png('spec.pdf', 9000, 9000, 'application/pdf'))).toBeNull()
+  })
+
+  it('lets a picture through when its header cannot be read, and the server says what is wrong', async () => {
+    expect(await pixelLimitRefusal(new File(['not a picture'], 'broken.png', { type: 'image/png' }))).toBeNull()
+  })
 })
 
 describe('resolveMediaType', () => {
