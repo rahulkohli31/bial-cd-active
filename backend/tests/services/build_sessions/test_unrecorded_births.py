@@ -22,6 +22,7 @@ from pydantic import SecretStr
 import src.db.base as db_base
 from src.config import settings
 from src.db.models.sandbox_pool import SandboxPoolMember, SandboxPoolState
+from src.db.models.sandbox_start import SandboxProjectType
 from src.services.build_sessions.appdata import build_app_env
 from src.services.build_sessions.locks import read_registry
 from src.services.build_sessions.pool_pass import ROW_DEADLINE, keep_the_pool
@@ -138,9 +139,9 @@ async def test_a_container_a_cancelled_start_left_unrecorded_is_deleted_after_it
     [stranded] = aca.create_calls
     assert await read_registry(fake_redis, user_id) is None, "premise: nothing recorded it"
 
-    inside = await keep_the_pool(client, at=datetime.now(UTC))
+    inside = (await keep_the_pool(client, at=datetime.now(UTC)))[SandboxProjectType.PLAIN]
     assert (inside.deleted, aca.delete_calls) == (0, []), "its create may still be running"
-    after = await keep_the_pool(client, at=_past_the_deadline())
+    after = (await keep_the_pool(client, at=_past_the_deadline()))[SandboxProjectType.PLAIN]
 
     assert after.deleted == 1
     assert aca.delete_calls == [stranded]
@@ -191,7 +192,7 @@ async def test_a_create_whose_record_was_written_loses_only_its_row(
     assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == handle.app_name
     assert await _ledger() == {handle.app_name: SandboxPoolState.CLAIMED}
 
-    outcome = await keep_the_pool(client, at=_past_the_deadline())
+    outcome = (await keep_the_pool(client, at=_past_the_deadline()))[SandboxProjectType.PLAIN]
 
     assert (outcome.deleted, aca.delete_calls) == (0, [])
     assert await _ledger() == {}

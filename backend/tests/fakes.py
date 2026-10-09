@@ -803,6 +803,13 @@ class DevServerDownUntilStarted(FakeSandboxClient):
         return DevStatus(running=up, ready=up, port=3000, root_status=200 if up else None)
 
 
+#: The identity of the lake the `lake` fixture configures.
+LAKE_IDENTITY: Final = (
+    "/subscriptions/s/resourceGroups/rg/providers/Microsoft.ManagedIdentity"
+    "/userAssignedIdentities/the-lake-identity"
+)
+
+
 async def a_ready_pool_row(
     name: str,
     *,

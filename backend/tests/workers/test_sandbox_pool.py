@@ -43,11 +43,13 @@ from src.workers.sandbox_pool import (
     keep_the_pool_at_its_size,
 )
 from tests.factories import UserFactory
-from tests.fakes import FakeSandboxClient
+from tests.fakes import LAKE_IDENTITY, FakeSandboxClient
 from tests.services.sandbox.test_pool import IMAGE, OLD_IMAGE, PoolAca, Supervisors
 
 pytestmark = pytest.mark.usefixtures("empty_sandbox_pool")
 
+PLAIN = SandboxProjectType.PLAIN
+CONNECTOR = SandboxProjectType.CONNECTOR
 READY = SandboxPoolState.READY
 FILLING = SandboxPoolState.FILLING
 CLAIMED = SandboxPoolState.CLAIMED
@@ -57,8 +59,9 @@ RETIRING = SandboxPoolState.RETIRING
 MONDAY_MORNING = datetime(2026, 10, 5, 3, 30, tzinfo=UTC)
 
 
-def _config(*, day: int, night: int) -> SandboxConfig:
-    """Daytime 09:00-19:00 India time, Monday to Friday."""
+def _config(*, day: int, night: int, flight_data: int = 0) -> SandboxConfig:
+    """Daytime 09:00-19:00 India time, Monday to Friday; `flight_data` sizes that pool by day and
+    by night."""
     return SandboxConfig.model_validate(
         {
             "subscription_id": "s",
@@ -71,6 +74,8 @@ def _config(*, day: int, night: int) -> SandboxConfig:
             "image_ref": IMAGE,
             "pool_day_size": day,
             "pool_night_size": night,
+            "pool_connector_day_size": flight_data,
+            "pool_connector_night_size": flight_data,
         }
     )
 
@@ -135,16 +140,23 @@ async def _row(
     *,
     image_ref: str = IMAGE,
     since: datetime | None = None,
+    project_type: SandboxProjectType = PLAIN,
 ) -> str:
-    """A container Azure holds for the pool, and its ledger row in `state`. Returns its name."""
+    """A container Azure holds for the `project_type` pool, and its ledger row in `state`. Returns
+    its name."""
     name = a_fresh_sandbox_name()
-    keeper.aca.made_for_the_pool(name, token="pool-bearer")
+    keeper.aca.made_for_the_pool(
+        name,
+        token="pool-bearer",
+        identity=LAKE_IDENTITY if project_type is CONNECTOR else None,
+    )
     async with db_base.async_session_factory() as db:
         db.add(
             SandboxPoolMember(
                 name=name,
                 fqdn=None if state is FILLING else f"{name}.pool.example",
                 image_ref=image_ref,
+                project_type=project_type,
                 state=state,
                 state_changed_at=since or datetime.now(UTC),
             )
@@ -153,10 +165,17 @@ async def _row(
     return name
 
 
-async def _a_pass(keeper: SimpleNamespace, config: SandboxConfig, *, at: datetime) -> PoolPass:
-    """One pass at `at`, under `config` as the client's own."""
+async def _passes(
+    keeper: SimpleNamespace, config: SandboxConfig, *, at: datetime
+) -> dict[SandboxProjectType, PoolPass]:
+    """One pass at `at`, under `config` as the client's own: what it did to each pool."""
     keeper.client._config = config
     return await keep_the_pool(keeper.client, at=at)
+
+
+async def _a_pass(keeper: SimpleNamespace, config: SandboxConfig, *, at: datetime) -> PoolPass:
+    """What one pass did to the plain pool."""
+    return (await _passes(keeper, config, at=at))[PLAIN]
 
 
 async def _ledger() -> dict[str, tuple[SandboxPoolState, str]]:
@@ -261,7 +280,7 @@ async def test_an_image_change_is_swapped_in_new_before_old_without_dipping_belo
     ready_counts: list[int] = []
 
     async def the_ready_count() -> None:
-        ready_counts.append(await pool.ready_count(project_type=SandboxProjectType.PLAIN))
+        ready_counts.append(await pool.ready_count(project_type=PLAIN))
 
     keeper.aca.on_each_call = the_ready_count
 
@@ -384,11 +403,15 @@ async def test_a_claim_landing_between_the_passes_look_and_its_retire_keeps_its_
     since = datetime.now(UTC) - timedelta(hours=1)
     rows = [await _row(keeper, READY, since=since + timedelta(minutes=i)) for i in range(6)]
     real_reading = pool.the_ledger
+    readings = 0
 
     async def a_start_claims_right_after_the_reading() -> list[SandboxPoolMember]:
+        nonlocal readings
         reading = await real_reading()
-        claimed = await pool.claim(IMAGE, project_type=SandboxProjectType.PLAIN)
-        assert claimed is not None and claimed.name == rows[0]
+        readings += 1
+        if readings == 1:
+            claimed = await pool.claim(IMAGE, project_type=PLAIN)
+            assert claimed is not None and claimed.name == rows[0]
         return reading
 
     monkeypatch.setattr(pool, "the_ledger", a_start_claims_right_after_the_reading)
@@ -438,6 +461,65 @@ async def test_the_alarm_never_fires_while_the_size_is_zero(keeper) -> None:
     assert _events(logged, SANDBOX_POOL_BELOW_SIZE_EVENT) == []
 
 
+# --- the two pools -----------------------------------------------------------------------------
+
+
+async def test_one_pass_fills_each_pool_to_its_own_size(keeper, lake) -> None:
+    """Only the flight-data pool's create carries the lake's identity, and each pool says what it
+    did on its own line."""
+    with capture_logs() as logged:
+        passes = await _passes(keeper, _config(day=2, night=2, flight_data=1), at=MONDAY_MORNING)
+
+    identities = [keeper.aca.identities[name] for name in keeper.aca.filled]
+    assert sorted(identities, key=str) == [LAKE_IDENTITY, None, None]
+    assert {t: (p.target, p.ready, p.filled) for t, p in passes.items()} == {
+        PLAIN: (2, 2, 2),
+        CONNECTOR: (1, 1, 1),
+    }
+    assert [
+        (line["project_type"], line["target"], line["ready"])
+        for line in _events(logged, pool_pass.POOL_PASS_EVENT)
+    ] == [(PLAIN, 2, 2), (CONNECTOR, 1, 1)]
+
+
+async def test_a_flight_data_pool_set_to_zero_retires_only_its_own_containers(keeper) -> None:
+    plain = await _row(keeper, READY)
+    connectors = {await _row(keeper, READY, project_type=CONNECTOR) for _ in range(2)}
+
+    passes = await _passes(keeper, _config(day=1, night=1), at=MONDAY_MORNING)
+
+    assert (passes[CONNECTOR].retired, passes[PLAIN].retired) == (2, 0)
+    assert set(keeper.aca.deleted) == connectors
+    assert await _states() == {plain: READY}
+
+
+@pytest.mark.parametrize("fails", [PLAIN, CONNECTOR])
+@pytest.mark.parametrize("how", ["refused", "overdue"])
+async def test_a_pool_that_cannot_fill_stops_only_its_own_fills_and_raises_only_its_own_alarm(
+    keeper, lake, fails: SandboxProjectType, how: str
+) -> None:
+    """★ The plain pool runs first, so plain failing is the case that proves the flight-data pool
+    still fills.
+
+    Mutation check: share one stop across both pools and the plain-failing cases fill nothing."""
+    at = datetime.now(UTC)
+    if how == "refused":
+        keeper.aca.refuses_creates_carrying.add(LAKE_IDENTITY if fails is CONNECTOR else None)
+    else:
+        await _row(
+            keeper, FILLING, since=at - ROW_DEADLINE - timedelta(minutes=1), project_type=fails
+        )
+    works = CONNECTOR if fails is PLAIN else PLAIN
+
+    with capture_logs() as logged:
+        passes = await _passes(keeper, _config(day=2, night=2, flight_data=2), at=at)
+
+    assert (passes[fails].filled, passes[works].filled, passes[works].ready) == (0, 2, 2)
+    assert [alarm["project_type"] for alarm in _events(logged, SANDBOX_POOL_BELOW_SIZE_EVENT)] == [
+        fails
+    ]
+
+
 # --- one pass at a time ----------------------------------------------------------------------
 
 
@@ -455,22 +537,25 @@ async def test_two_passes_at_once_run_one_between_them(keeper, configured) -> No
 
     assert len(keeper.aca.filled) == 2
     assert len(_events(logged, pool_pass.POOL_PASS_LOCKED_OUT_EVENT)) == 1
-    assert len(_events(logged, pool_pass.POOL_PASS_EVENT)) == 1
+    assert len(_events(logged, pool_pass.POOL_PASS_EVENT)) == 2
 
 
 # --- the worker task -------------------------------------------------------------------------
 
 
-async def test_each_tick_logs_one_line_even_at_a_size_of_zero(keeper, configured) -> None:
+async def test_each_tick_logs_one_line_per_pool_even_at_a_size_of_zero(keeper, configured) -> None:
     """A silent minute is how an operator tells the pass is not running."""
     configured(_config(day=0, night=0))
 
     with capture_logs() as logged:
         await keep_the_pool_at_its_size()
 
-    [line] = [entry for entry in logged if entry["event"].startswith("sandbox_pool_pass")]
-    assert line["event"] == pool_pass.POOL_PASS_EVENT
-    assert (line["target"], line["ready"], line["filled"]) == (0, 0, 0)
+    lines = [entry for entry in logged if entry["event"].startswith("sandbox_pool_pass")]
+    assert [(line["event"], line["project_type"]) for line in lines] == [
+        (pool_pass.POOL_PASS_EVENT, PLAIN),
+        (pool_pass.POOL_PASS_EVENT, CONNECTOR),
+    ]
+    assert {(line["target"], line["ready"], line["filled"]) for line in lines} == {(0, 0, 0)}
 
 
 async def test_a_worker_with_no_sandbox_says_so_and_does_nothing() -> None:

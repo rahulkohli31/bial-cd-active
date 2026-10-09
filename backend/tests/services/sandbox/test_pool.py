@@ -65,7 +65,7 @@ from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
 from src.services.sandbox.stopwatch import Stopwatch, running_stopwatch, timed_by
 from src.services.storage import snapshot_key
-from tests.fakes import FakeStorage, a_git_bundle, a_ready_pool_row
+from tests.fakes import LAKE_IDENTITY, FakeStorage, a_git_bundle, a_ready_pool_row
 
 IMAGE = "acr.azurecr.io/citizen-dev-sandbox:v2"
 OLD_IMAGE = "acr.azurecr.io/citizen-dev-sandbox:v1"
@@ -76,10 +76,6 @@ pytestmark = pytest.mark.usefixtures("empty_sandbox_pool")
 
 PLAIN = SandboxProjectType.PLAIN
 CONNECTOR = SandboxProjectType.CONNECTOR
-LAKE_IDENTITY = (
-    "/subscriptions/s/resourceGroups/rg/providers/Microsoft.ManagedIdentity"
-    "/userAssignedIdentities/the-lake-identity"
-)
 
 
 class PoolAca(AcaControlPlane):
@@ -96,6 +92,8 @@ class PoolAca(AcaControlPlane):
         self.filled: list[str] = []
         self.deleted: list[str] = []
         self.refuses_to_create = False
+        # The identities whose creates are refused, `None` for one carrying none.
+        self.refuses_creates_carrying: set[str | None] = set()
         self.refuses_to_delete: set[str] = set()
         self.refuses_every_delete = False
         # Set, a create for the pool waits on it: how a test holds a fill in flight.
@@ -141,7 +139,7 @@ class PoolAca(AcaControlPlane):
         if self.on_each_call is not None:
             await self.on_each_call()
         self.create_attempts.append(name)
-        if self.refuses_to_create:
+        if self.refuses_to_create or identity_resource_id in self.refuses_creates_carrying:
             raise AcaError("the create was refused")
         self.envs[name] = dict(env)
         self.tags[name] = dict(tags)
@@ -339,23 +337,6 @@ def _flight_data_env(app_id: uuid.UUID) -> dict[str, str]:
         url_name: "https://lake.example/data/",
         client_id_name: "lake-client-id",
     }
-
-
-@pytest.fixture
-def lake(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A lake configured, whose identity is `LAKE_IDENTITY`."""
-    from src.config import settings as app_settings
-    from src.services.lake.config import LakeConfig
-
-    monkeypatch.setattr(
-        app_settings,
-        "connector_lake",
-        LakeConfig(
-            url="https://alakeaccount.blob.core.windows.net/acontainer/AOS/reports/",
-            identity_client_id="52b74947-0621-46e2-a523-a6b466f47c33",
-            identity_resource_id=LAKE_IDENTITY,
-        ),
-    )
 
 
 async def _recorded_name(redis: aioredis.Redis, user_id: uuid.UUID) -> str:
@@ -1546,7 +1527,7 @@ async def test_a_fill_queued_past_its_deadline_whose_row_a_pass_let_go_makes_not
         aca=world.aca,
     )
     late = datetime.now(UTC) + pool_pass.ROW_DEADLINE + timedelta(minutes=1)
-    after = await pool_pass.keep_the_pool(worker, at=late)
+    after = (await pool_pass.keep_the_pool(worker, at=late))[PLAIN]
     await worker.aclose()
     assert after.overdue, "guard the premise: the pass let the queued fill's row go"
     for _ in range(client_module._POOL_WORK_AT_ONCE):
@@ -1566,7 +1547,7 @@ async def test_one_claim_makes_one_replacement_that_a_pass_meanwhile_counts(worl
 
     handle, _ = await _start(world.client, uuid.uuid4(), uuid.uuid4())
     await asyncio.wait_for(world.aca.fill_began.wait(), timeout=5)
-    meanwhile = await pool_pass.keep_the_pool(world.client, at=datetime.now(UTC))
+    meanwhile = (await pool_pass.keep_the_pool(world.client, at=datetime.now(UTC)))[PLAIN]
     world.aca.fills_wait_for.set()
     await _settled(world.client)
 
@@ -1653,7 +1634,7 @@ async def test_a_container_that_never_answers_is_let_go_and_the_pass_counts_it_r
     world.client._config = _config(pool_day_size=1, pool_night_size=1)
 
     with capture_logs() as logged:
-        outcome = await pool_pass.keep_the_pool(world.client, at=datetime.now(UTC))
+        outcome = (await pool_pass.keep_the_pool(world.client, at=datetime.now(UTC)))[PLAIN]
 
     assert (outcome.filled, outcome.refused) == (0, True)
     [name] = world.aca.filled
@@ -1767,7 +1748,7 @@ async def test_a_fill_cut_short_is_retired_for_the_next_pass_to_delete(world) ->
 
     assert await _ledger() == {name: SandboxPoolState.RETIRING}
     world.client._config = _config(pool_day_size=0, pool_night_size=0)
-    after = await pool_pass.keep_the_pool(world.client, at=datetime.now(UTC))
+    after = (await pool_pass.keep_the_pool(world.client, at=datetime.now(UTC)))[PLAIN]
     assert after.deleted == 1
     assert world.aca.deleted == [name]
     assert await _ledger() == {}
@@ -1800,9 +1781,9 @@ async def test_a_fill_whose_clock_restarts_has_a_whole_deadline_before_a_pass_le
         )
     assert restarted is not None
     assert abs(datetime.now(UTC) - restarted) < timedelta(seconds=5)
-    after = await pool_pass.keep_the_pool(
-        world.client, at=datetime.now(UTC) + timedelta(minutes=2)
-    )
+    after = (
+        await pool_pass.keep_the_pool(world.client, at=datetime.now(UTC) + timedelta(minutes=2))
+    )[PLAIN]
     assert after.overdue is False
     assert await _ledger() == {name: SandboxPoolState.FILLING}
 

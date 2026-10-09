@@ -74,21 +74,25 @@ Fields: `project_id`, `reason` (the exception type — never the message, which 
 content)."""
 
 SANDBOX_POOL_BELOW_SIZE_EVENT: Final = "sandbox_pool_below_size"
-"""A pass over the pool of ready sandboxes ended below the size the settings give for that time,
-and something stopped it filling: Azure refused a create, or a container sat filling or claimed
-past its deadline. That pass made no further create; the next, a minute later, tries again.
+"""A pass over one pool of ready sandboxes, plain or flight-data, ended below the size the settings
+give for that time, and something stopped it filling: a create was refused, or a container sat
+filling or claimed past its deadline. That pass made no further create for that pool; the next, a
+minute later, tries again. The other pool fills regardless.
 
 A START NEVER FAILS BECAUSE OF THIS. One that finds no ready sandbox creates its own, as it would
 with no pool, only slower, and its start record names why. It never fires while the size is zero.
 
-Fields: `target` (the size for that time), `ready` (how many were ready as the pass ended),
-`refused` (whether Azure refused a create) and `overdue` (whether a row was past its deadline).
+Fields: `project_type` (which pool), `target` (the size for that time), `ready` (how many were
+ready as the pass ended), `refused` (whether a create was refused) and `overdue` (whether a row was
+past its deadline).
 
 WHAT TO DO: read the worker's log for that pass, where the refusal is logged beside it. An
 authorization refusal means the worker's identity lacks the create, tag-write or environment-join
-action on the sandbox resource group; rows overdue while filling mean the image reference or the
-registry credentials are wrong; a capacity refusal means the environment is full. When it cannot be
-fixed soon, set every pool size to zero."""
+action on the sandbox resource group; for the flight-data pool alone it can also mean the worker
+may not assign the lake's identity. A flight-data fill refused with
+`sandbox_pool_connector_fill_without_a_lake` means the worker has no lake settings. Rows overdue
+while filling mean the image reference or the registry credentials are wrong; a capacity refusal
+means the environment is full. When it cannot be fixed soon, set that pool's sizes to zero."""
 
 SANDBOX_POOL_WRONG_IDENTITY_EVENT: Final = "sandbox_pool_claim_wrong_identity"
 """A start claimed a ready sandbox that did not carry exactly the identity its pool requires: a
