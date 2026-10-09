@@ -794,13 +794,13 @@ def sandbox_toolset[DepsT](
 
     async def run_command(ctx: RunContext[Any], command: list[str]) -> str:
         """Run a shell command in the app workspace and get its output back. Pass the command as a
-        list of argv tokens — e.g. `["npm", "install", "zod"]`, `["npm", "run", "lint"]`, `["ls",
-        "app"]`. It runs as an unprivileged user; the output is secret-redacted and length-capped
-        before you see it. A non-zero exit code comes back as a normal result — read the output and
-        fix the cause. A long output is cut to its first and last lines, and the notice in the
-        middle names a handle — pass that handle to `fetch_output_slice` to read what was cut,
-        instead of running the command again. Do NOT start or restart the dev server (`next dev`);
-        it is already running and the harness reads it for you."""
+        list of argv tokens — e.g. `["npm", "install", "zod"]`, `["ls", "app"]`. It runs as an
+        unprivileged user; the output is secret-redacted and length-capped before you see it. A
+        non-zero exit code comes back as a normal result — read the output and fix the cause. A
+        long output is cut to its first and last lines, and the notice in the middle names a handle
+        — pass that handle to `fetch_output_slice` to read what was cut, instead of running the
+        command again. Do NOT start or restart the dev server (`next dev`); it is already running
+        and the harness reads it for you."""
         session = sandbox_of(ctx)
         # alias keeps the call off the JS-oriented exec guard
         transport = session.sandbox_client.exec

@@ -48,7 +48,7 @@ def test_the_walkthrough_delete_from_visitors_is_blocked() -> None:
     lowered = refusal.lower()
     assert "blocked" in lowered
     assert "migration" in lowered
-    assert "type-check" in lowered or "render" in lowered
+    assert "the harness checks the app" in lowered
 
 
 # --- benign commands pass untouched ------------------------------------------

@@ -994,10 +994,10 @@ _PROJECT_SHAPES = {
     ),
 }
 _PINNED_PROJECT_DIGESTS = {
-    (ChatKind.PLAN, "bare"): "fd9e7a2ace32002403f79ae8ca2a05739de1db46544a8303657a3651d357f04c",
-    (ChatKind.PLAN, "rich"): "390a7dd7a9cf33f66a309e7229f58f9a1ff12cba41f68dd99eb51442c02005ce",
-    (ChatKind.BUILD, "bare"): "44c1530d76917a82c105f9a427e572c588fe80183740848e282ed6d09e124fad",
-    (ChatKind.BUILD, "rich"): "c4bea3b8383411da2ca466b060bf5b137363d13f8f10b7786ed618daae93f336",
+    (ChatKind.PLAN, "bare"): "472c9fbad9a74b1d32147d5c87fae25d0737bd8f0bc4f7de6164745b162cbd30",
+    (ChatKind.PLAN, "rich"): "92e9a6b836bbdbc2fda87998ad30304891389553ae698995601fbb4b57e79b92",
+    (ChatKind.BUILD, "bare"): "437f7b15200d63e09eccff8af9b0a105a68c1c98b749b6ddfd94f5baed97c279",
+    (ChatKind.BUILD, "rich"): "762372e1609d60371dea42bb04411df25a404a942a1c678d6a35a17205b942b3",
 }
 _PINNED_GENERIC_DIGEST = "de5de801ddf51de4b7c18fabd73cde105f64db1f40f6e0fa5073da882d404d7c"
 _CLAUSE = (

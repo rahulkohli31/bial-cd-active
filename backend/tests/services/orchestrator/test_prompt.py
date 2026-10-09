@@ -112,7 +112,7 @@ def test_data_integrity_is_truthful_and_carries_the_never_mutate_rule() -> None:
     # The truthful claim + the never-mutate rule + the sanctioned-drop condition are present.
     assert "may already hold" in lowered
     assert "truncate" in lowered
-    assert "type-checking and rendering" in lowered
+    assert "never check your work by mutating records" in lowered
     assert "requirements remove that feature" in lowered
     assert "say so plainly" in lowered
     # Single source: the rules block is the reusable constant that Write mode's prompt
