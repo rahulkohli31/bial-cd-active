@@ -5,9 +5,7 @@
  * NAMED and every refused one must NOT be — both directions, not one.
  *
  * Drives the validator rather than scanning the constant, since the message is assembled from
- * a flag-dependent fragment a source-string read would not see. NOT COVERED HERE, on purpose:
- * `LEGACY_DOC_REJECT_MSG`'s "save as .docx (or PDF)" — reachable and true today, and deleted by
- * the same change that would falsify it.
+ * a flag-dependent fragment a source-string read would not see.
  */
 import { describe, it, expect } from 'vitest'
 import { validateAttachmentFiles, ALLOWED_MEDIA_TYPES } from '../attachmentInput'
@@ -82,27 +80,21 @@ describe('the composer refusal sentence agrees with the real allowlist', () => {
     expect(message).toContain('terminal-3.zip')
   })
 
-  it('never advises a citizen to bring back a format the picker would also refuse', () => {
-    // The refusal sentence as behaviour rather than as a constant: advice is only honest while it
-    // leads somewhere.
-    // The two legacy messages used to say "save as .docx" and "save as .pptx"; both stopped being
-    // followable when those formats were refused too, so both are gone and there is one refusal
-    // that names what IS accepted. Driving the validator is what proves that, rather than trusting
-    // a constant by reading it.
+  it('advises a citizen only toward a format the composer accepts', () => {
+    // Advice is only honest while it leads somewhere. A pre-2007 file is told to re-save in its
+    // newer format, so that format has to be one the validator takes. Driving the validator is
+    // what proves it, rather than trusting a constant by reading it.
     for (const legacy of [
       new File(['x'], 'gate-plan.ppt', { type: 'application/vnd.ms-powerpoint' }),
       new File(['x'], 'terminal-brief.doc', { type: 'application/msword' }),
+      new File(['x'], 'rota.xls', { type: 'application/vnd.ms-excel' }),
     ]) {
-      // The ADVICE is what is under test, not the whole sentence: the message quotes the
-      // citizen's own filename back to them, so `"rota.xlsx" isn't supported` legitimately
-      // contains `.xlsx`. Reading the advice half is what separates "we echoed your file's name"
-      // from "we told you to bring it back in a format we also refuse".
-      const advice = refusalFor(legacy).replace(/^"[^"]*"/, '')
-      expect(advice, 'the refusal sends the citizen to a format the picker also refuses').not.toMatch(
-        /save as|\.doc\b|\.ppt\b|\.xls\b/i,
-      )
-      // …and it still tells them what WOULD work, rather than only saying no.
-      expect(advice).toMatch(/PDF/i)
+      const advised = refusalFor(legacy).match(/re-save it as (\.\w+)/)?.[1]
+      expect(advised, `the refusal for "${legacy.name}" names no format to re-save it as`).toBeDefined()
+      expect(
+        validateAttachmentFiles([new File(['x'], `advised${advised}`)]),
+        `the refusal sends the citizen to ${advised}, which the composer also refuses`,
+      ).toEqual({ ok: true })
     }
   })
 })

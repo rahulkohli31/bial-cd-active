@@ -43,6 +43,20 @@ export const ALLOWED_MEDIA_TYPES = [
 // browser without a converter this platform does not host, so their chips return the file
 // instead.
 export const TEXT_PREVIEW_MEDIA_TYPES = new Set(['text/csv', 'text/tab-separated-values'])
+
+// The pre-2007 binary formats are refused by name, with the format to re-save them as, which is
+// accepted. Keyed by extension: it is the one signal the OS reports reliably.
+const LEGACY_OFFICE = new Map([
+  ['doc', { application: 'Word', modern: '.docx' }],
+  ['xls', { application: 'Excel', modern: '.xlsx' }],
+  ['ppt', { application: 'PowerPoint', modern: '.pptx' }],
+])
+
+function legacyOfficeFormat(fileName: string) {
+  const extension = fileName.match(/\.([^.]+)$/)?.[1].toLowerCase()
+  return extension === undefined ? undefined : LEGACY_OFFICE.get(extension)
+}
+
 // Extension tokens let the OS picker show these even when it reports an inconsistent or empty
 // MIME — which it does constantly for Office and delimited files (see `resolveMediaType`).
 //
@@ -50,8 +64,12 @@ export const TEXT_PREVIEW_MEDIA_TYPES = new Set(['text/csv', 'text/tab-separated
 // `text/tab-separated-values` and the TSV door admits that suffix by name — but the picker filters
 // on this list, so a citizen browsing for `movements.tab` could not select it at all, and the file
 // they were told was supported was invisible. The drag path worked; the picker path failed silently.
+//
+// The legacy extensions ride along so those files reach `validateAttachmentFiles`, which names them;
+// the library's own refusal of a file it filters out carries no file name.
 export const ACCEPT_ATTR = [
   ...ALLOWED_MEDIA_TYPES, '.csv', '.tsv', '.tab', '.xlsx', '.docx', '.pptx',
+  ...[...LEGACY_OFFICE.keys()].map((ext) => `.${ext}`),
 ].join(',')
 
 // ONE SIZE LIMIT PER LANE, in MiB, matching `media/lanes.py` number for number; a backend test
@@ -72,13 +90,7 @@ export const MAX_FILES_PER_MESSAGE = 5
 // per-message cap above; checked at send time where the full conversation is visible.
 export const MAX_ATTACHMENTS_PER_CONVERSATION = 20
 
-/**
- * ADVICE IS ONLY HONEST WHILE IT LEADS SOMEWHERE: the two legacy reject messages said "save
- * as .docx"/"save as .pptx", but both stopped being followable once those formats were
- * refused too — a citizen who complied got rejected again, told nothing new. So there is one
- * refusal now, naming what IS accepted — the reasoning this file already used for the
- * flag-off deck case, applied to the permanent one.
- */
+/** The refusal for a file that is not accepted, naming what IS. Legacy Office files are refused earlier. */
 export function unsupportedFileMessage(fileName: string): string {
   return `"${fileName}" ${unsupportedFormatMessage()}`
 }
@@ -170,9 +182,8 @@ export function resolveMediaType(file: File): string {
  * and both the allowlist and size cap run against that resolved type, measured on the
  * original `File.size`.
  *
- * TWO QUESTIONS, NOT THREE. A per-file text cap and a running text-byte budget used to sit here
- * for the inline lane; nothing is inlined now, so both bounded a population that is always empty.
- * Every file takes one path, and its lane decides its size limit.
+ * A pre-2007 Office extension is refused first, by name, ahead of the media-type allowlist. After
+ * that every file takes one path, and its lane decides its size limit.
  */
 export type AttachmentValidationResult = { error: string } | { ok: true }
 
@@ -184,9 +195,14 @@ export function validateAttachmentFiles(
     return { error: `You can attach at most ${MAX_FILES_PER_MESSAGE} files per message.` }
   }
   for (const file of incoming) {
-    // ONE refusal, for every unsupported format. There is no longer a special case for a legacy
-    // `.doc` or `.ppt`: with the OOXML formats refused as well, "save as .docx" led nowhere, and a
-    // single message that names what IS accepted is both true and followable.
+    const legacy = legacyOfficeFormat(file.name)
+    if (legacy) {
+      return {
+        error:
+          `"${file.name}" is an older ${legacy.application} format. ` +
+          `Open it in ${legacy.application}, re-save it as ${legacy.modern}, and attach it again.`,
+      }
+    }
     const mediaType = resolveMediaType(file)
     if (!ALLOWED_MEDIA_TYPES.includes(mediaType)) {
       return { error: unsupportedFileMessage(file.name) }
