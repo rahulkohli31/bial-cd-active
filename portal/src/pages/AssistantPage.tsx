@@ -365,6 +365,7 @@ export default function AssistantPage() {
     async (id: string) => {
       setPhase('loading')
       setBanner(null)
+      setLastSend(null)
       try {
         const loaded = await getConversation(id)
         if (!aliveRef.current) return
@@ -526,6 +527,8 @@ export default function AssistantPage() {
       seqRef.current += 1
       setMessages((held) => [...held, { id: userId, role: 'user', parts, seq: userSeq }])
       const attachmentIds = wireMessageFromParts(parts).attachmentIds ?? []
+      // Retry belongs to the reply that failed, and this message replaces it.
+      setLastSend(null)
 
       // RESOLVED WHEN THE SERVER HAS THE MESSAGE, not when the reply finishes, because the composer
       // empties on the resolve. The reply keeps streaming after this settles, and a stream that

@@ -762,6 +762,48 @@ describe('a turn the server refuses leaves nothing behind that says it was sent'
     await waitFor(() => expect(screen.getByTestId('turn-banner')).toBeTruthy())
     expect(screen.queryByTestId('assistant-turn-retry')).toBeNull()
   })
+
+  it('★ offers no retry of an earlier message when a later one is refused', async () => {
+    // Mutation receipt: drop `setLastSend(null)` from `handleSubmit` and Retry offers the first words.
+    mount()
+    type('first question')
+    await waitFor(() => expect(h.readTurnStream).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.queryByTestId('stop-turn')).toBeNull())
+
+    h.startTurn.mockRejectedValue(refused())
+    type('second question')
+
+    await waitFor(() => expect(screen.getByTestId('turn-banner')).toBeTruthy())
+    expect(screen.queryByTestId('assistant-turn-retry')).toBeNull()
+  })
+
+  it("★ offers no retry of the last chat's message in the next one opened", async () => {
+    // Mutation receipt: drop `setLastSend(null)` from `load` and Retry under c2's lost reply sends
+    // c1's words into c2.
+    function OpenAnother() {
+      const navigate = useNavigate()
+      return <button type="button" data-testid="open-c2" onClick={() => navigate('/assistant/c2')} />
+    }
+    render(
+      <MemoryRouter initialEntries={['/assistant/c1']}>
+        <OpenAnother />
+        <Routes>
+          <Route path="/assistant/:chatId" element={<AssistantPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+    await screen.findByTestId('assistant-transcript')
+    type('first question')
+    await waitFor(() => expect(h.readTurnStream).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.queryByTestId('stop-turn')).toBeNull())
+
+    h.getConversation.mockResolvedValue(aConversation({ id: 'c2', activeTurn: { turnId: 't9', lastSeq: 4 } }))
+    h.readTurnStream.mockRejectedValue(new Error('the stream died'))
+    fireEvent.click(screen.getByTestId('open-c2'))
+
+    await waitFor(() => expect(screen.getByTestId('turn-banner')).toBeTruthy())
+    expect(screen.queryByTestId('assistant-turn-retry')).toBeNull()
+  })
 })
 
 describe('the composer empties the moment the server takes the message', () => {

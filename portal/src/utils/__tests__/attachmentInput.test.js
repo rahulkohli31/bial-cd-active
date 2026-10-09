@@ -102,12 +102,13 @@ describe("a chat's room for pictures and PDFs", () => {
   const wontFit = (name) =>
     `"${name}" won't fit in this chat — pictures and PDFs can add up to 20 MB. Attach a smaller file or start a new chat.`
 
-  it('takes a PDF up to the whole 20 MB of an empty chat, and not a byte more', () => {
+  it('takes a PDF up to the whole 20 MB of an empty chat, and calls a byte more too large for any chat', () => {
     // Every picture and PDF is sent to the assistant again with each message, and it reads at
     // most 32 MB at once. One limit per chat is what keeps every later message under that.
+    // Mutation receipt: give a PDF no limit of its own and the larger one is told to start a new chat.
     expect(validateAttachmentFiles([file('spec.pdf', 'application/pdf', 20 * MB)], 0, 0)).toEqual({ ok: true })
     expect(validateAttachmentFiles([file('spec.pdf', 'application/pdf', 20 * MB + 1)], 0, 0)).toEqual({
-      error: wontFit('spec.pdf'),
+      error: '"spec.pdf" exceeds the 20 MB limit.',
     })
   })
 
@@ -191,13 +192,25 @@ describe('pixelLimitRefusal', () => {
     )
   })
 
-  it('reads only the first megabyte, letting through a picture whose size lies beyond it', async () => {
-    // Mutation receipt: read the whole file instead of a slice and this refuses the picture.
+  it("finds a JPEG's size behind a megabyte of metadata, which design tools write", async () => {
+    // Mutation receipt: drop the segment walk and this picture is let through.
     const segment = new Uint8Array(2 + 65535)
     segment.set([0xff, 0xe2, 0xff, 0xff])
     const sof = new Uint8Array([0xff, 0xc0, 0x00, 0x11, 0x08, 0x01, 0x2c, 0x1f, 0x41, 0x03, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1])
     const parts = [new Uint8Array([0xff, 0xd8]), ...Array(17).fill(segment), sof]
-    expect(await pixelLimitRefusal(new File(parts, 'huge-profile.jpg', { type: 'image/jpeg' }))).toBeNull()
+    expect(await pixelLimitRefusal(new File(parts, 'poster.jpg', { type: 'image/jpeg' }))).toBe(
+      '"poster.jpg" is 8,001 × 300 pixels. Resize it to 8,000 pixels or less on each side.',
+    )
+  })
+
+  it('gives up quickly on a JPEG whose header is damaged', async () => {
+    // Mutation receipt: hand `imageSize` the first megabyte and this takes tens of seconds.
+    const damaged = new File([new Uint8Array([0xff, 0xd8]), new Uint8Array(1024 * 1024)], 'damaged.jpg', {
+      type: 'image/jpeg',
+    })
+    const started = performance.now()
+    expect(await pixelLimitRefusal(damaged)).toBeNull()
+    expect(performance.now() - started).toBeLessThan(5000)
   })
 
   it('takes a picture of exactly 8,000 pixels', async () => {

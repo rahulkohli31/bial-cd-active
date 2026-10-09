@@ -214,19 +214,18 @@ export function validateAttachmentFiles(
       return { error: unsupportedFileMessage(file.name) }
     }
     // Interpolated, never spelled: the figure a citizen is told is the figure enforced.
-    if (!MODEL_LANE_MEDIA_TYPES.includes(mediaType)) {
-      if (file.size > CODE_LANE_MAX_MB * MIB) {
-        return { error: `"${file.name}" exceeds the ${CODE_LANE_MAX_MB} MB limit.` }
-      }
-      continue
-    }
-    if (IMAGE_MEDIA_TYPES.includes(mediaType) && file.size > IMAGE_MAX_MB * MIB) {
-      return { error: `"${file.name}" exceeds the ${IMAGE_MAX_MB} MB limit.` }
-    }
-    held += file.size
+    const limitMb = fileLimitMb(mediaType)
+    if (file.size > limitMb * MIB) return { error: `"${file.name}" exceeds the ${limitMb} MB limit.` }
+    held += chatFileWeight(mediaType, file.size)
     if (held > CHAT_FILES_MAX_MB * MIB) return { error: wontFit(file.name) }
   }
   return { ok: true }
+}
+
+/** One file's own limit. A PDF's is the chat's whole room, so a new chat is never the advice. */
+function fileLimitMb(mediaType: string): number {
+  if (!MODEL_LANE_MEDIA_TYPES.includes(mediaType)) return CODE_LANE_MAX_MB
+  return IMAGE_MEDIA_TYPES.includes(mediaType) ? IMAGE_MAX_MB : CHAT_FILES_MAX_MB
 }
 
 function wontFit(name: string): string {
@@ -272,9 +271,14 @@ export function chatFileBytes(messages: readonly ChatMessage[], exclude = NO_IDS
   return total
 }
 
-// Every format puts its size in its first few bytes, a JPEG behind its EXIF and colour profile.
-// A window this wide covers them without parsing a whole crafted file.
-const HEADER_BYTES = 1024 * 1024
+interface PixelSize {
+  width: number
+  height: number
+}
+
+// Small on purpose: `imageSize` walks a damaged JPEG header a byte at a time, copying what is left
+// at each step, so its cost grows with the square of the bytes it is given.
+const HEADER_BYTES = 128 * 1024
 
 /**
  * The refusal for a picture wider or taller than the provider reads, or `null`. Reads the size from
@@ -283,16 +287,48 @@ const HEADER_BYTES = 1024 * 1024
  */
 export async function pixelLimitRefusal(file: File): Promise<string | null> {
   if (!IMAGE_MEDIA_TYPES.includes(resolveMediaType(file))) return null
-  let size: { width: number; height: number }
-  try {
-    size = imageSize(new Uint8Array(await file.slice(0, HEADER_BYTES).arrayBuffer()))
-  } catch {
-    return null
-  }
+  const size = (await headerSize(file)) ?? (await jpegFrameSize(file))
+  if (!size) return null
   const { width, height } = size
   if (width <= IMAGE_MAX_PIXELS && height <= IMAGE_MAX_PIXELS) return null
   const n = (value: number) => value.toLocaleString('en-US')
   return `"${file.name}" is ${n(width)} × ${n(height)} pixels. Resize it to ${n(IMAGE_MAX_PIXELS)} pixels or less on each side.`
+}
+
+async function headerSize(file: File): Promise<PixelSize | null> {
+  try {
+    return imageSize(new Uint8Array(await file.slice(0, HEADER_BYTES).arrayBuffer()))
+  } catch {
+    return null
+  }
+}
+
+const JPEG_START = 0xd8
+// Start-of-frame markers carry the size; C4, C8 and CC share the range but are not frames.
+const isFrameMarker = (marker: number) =>
+  marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc
+// A 7 MB picture holds about a hundred full segments; a file of thousands is not a photograph.
+const MAX_SEGMENTS = 512
+
+/**
+ * A JPEG's size from its frame header when metadata pushes it past the window: each segment
+ * states its length, so this hops from one to the next reading nine bytes at a time.
+ */
+async function jpegFrameSize(file: File): Promise<PixelSize | null> {
+  const read = async (at: number, length: number) =>
+    new Uint8Array(await file.slice(at, at + length).arrayBuffer())
+  const start = await read(0, 2)
+  if (start[0] !== 0xff || start[1] !== JPEG_START) return null
+  let at = 2
+  for (let hop = 0; hop < MAX_SEGMENTS && at + 9 <= file.size; hop += 1) {
+    const segment = await read(at, 9)
+    if (segment[0] !== 0xff) return null
+    if (isFrameMarker(segment[1])) {
+      return { height: (segment[5] << 8) | segment[6], width: (segment[7] << 8) | segment[8] }
+    }
+    at += 2 + ((segment[2] << 8) | segment[3])
+  }
+  return null
 }
 
 /** The pending-composer shape (`chat/runtime/attachmentAdapter.ts` makes them) —
