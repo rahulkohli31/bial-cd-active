@@ -188,6 +188,24 @@ async def test_each_change_to_the_files_writes_one_note_with_the_whole_current_l
     assert "No file is attached to this conversation now." in third
 
 
+@pytest.mark.parametrize("kind", [ChatKind.PLAN, ChatKind.GENERIC])
+async def test_a_file_named_like_a_secret_writes_one_note_across_turns(
+    kind: ChatKind, client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    """The stored note is compared with the next turn's as written. A redaction of a
+    secret-shaped name in the stored copy would make every later turn write a new note."""
+    user, conv = await _chat(db_session, kind)
+    set_chat_model(_Capture().model())
+
+    await _turn(_fresh_engine, client, user, conv, "hello")
+    await _upload(client, user, conv, "att_secretish", "bial_abcdefghijklmnop.csv")
+    await _turn(_fresh_engine, client, user, conv, "here it is", ["att_secretish"])
+    await _turn(_fresh_engine, client, user, conv, "thanks")
+
+    (note,) = await _notes(db_session, user, conv)
+    assert "bial_abcdefghijklmnop.csv" in note
+
+
 async def test_the_latest_note_is_read_for_this_user_this_chat_and_from_file_notes_only(
     db_session,
 ) -> None:
