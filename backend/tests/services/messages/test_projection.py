@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import get_args
 
+import pytest
 import sqlalchemy as sa
 from pydantic_ai.messages import (
     BinaryContent,
@@ -956,13 +957,20 @@ def test_classify_command_maps_the_pinned_commands() -> None:
     assert _classify_argv(["npm", "run", "lint"])[0] == "Tidying things up"
 
 
-def test_the_flight_data_install_command_is_an_install() -> None:
-    """It runs `npm install` itself, so it takes the install label; any other `node` script keeps
-    the short bound."""
-    assert _classify_argv(["node", FLIGHT_DATA_ADOPT_PATH]) == (
-        "Setting up the tools your app needs",
-        False,
-    )
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["node", FLIGHT_DATA_ADOPT_PATH],
+        [FLIGHT_DATA_ADOPT_PATH],
+        ["bash", "-lc", f"cd /workspace/app && node {FLIGHT_DATA_ADOPT_PATH}"],
+    ],
+    ids=["node", "direct", "shell"],
+)
+def test_the_flight_data_install_command_is_an_install(argv: list[str]) -> None:
+    """It runs `npm install` itself and stops npm inside the long bound, so every way of running
+    it takes that bound; any other `node` script keeps the short one."""
+    assert _classify_argv(argv) == ("Setting up the tools your app needs", False)
+    assert command_needs_the_long_timeout(argv) is True
     assert command_needs_the_long_timeout(["node", "scripts/seed.mjs"]) is False
 
 

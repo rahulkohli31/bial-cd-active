@@ -112,14 +112,16 @@ function render(source) {
   return `${HEAD}${body}\n`
 }
 
-/** `name@version` for each dependency, refusing anything but an exact version. */
+/** The dependencies as `"name": "version",` lines, refusing anything but an exact version. */
 function pinned(dependencies) {
-  return Object.entries(dependencies).map(([name, version]) => {
-    if (!/^\d+\.\d+\.\d+$/.test(version)) {
-      throw new Error(`sandbox/seed/package.json pins ${name} to "${version}", not an exact version`)
-    }
-    return `${name}@${version}`
-  })
+  return Object.entries(dependencies)
+    .map(([name, version]) => {
+      if (!/^\d+\.\d+\.\d+$/.test(version)) {
+        throw new Error(`sandbox/seed/package.json pins ${name} to "${version}", not an exact version`)
+      }
+      return `  ${JSON.stringify(name)}: ${JSON.stringify(version)},`
+    })
+    .join('\n')
 }
 
 /** The install command: the dependencies at their exact versions, and the source as one string
@@ -138,16 +140,19 @@ function adoptScript(source, dependencies) {
 //
 // It installs the four packages at the versions the module was tested with, then writes the
 // module to \`lib/flight-data.ts\`. It changes nothing when that file already exists, and writes no
-// module when the install fails. Everything it writes is embedded below: it reads no file.
+// module when the install fails. It skips the install when the app's \`package.json\` already pins
+// all four at those versions, which is how an app whose packages need an npm flag gets the module.
+// Everything it writes is embedded below.
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 
 const TARGET = 'lib/flight-data.ts'
 
-const PACKAGES = [
-${listed(pinned(dependencies))}
-]
+const PINS = {
+${pinned(dependencies)}
+}
+const PACKAGES = Object.entries(PINS).map(([name, version]) => \`\${name}@\${version}\`)
 
 const MODULE = [
 ${listed(source.split(/\r?\n/))}
@@ -162,24 +167,36 @@ if (existsSync(TARGET)) {
   process.exit(1)
 }
 
-// Inside the platform's ten-minute limit on an install command: npm is stopped here, not left
-// running after that limit ends this script.
-const install = spawnSync(
-  'npm',
-  ['install', '--save-exact', '--no-audit', '--no-fund', '--loglevel=error', ...PACKAGES],
-  { stdio: 'inherit', timeout: 540_000 },
+const manifest = existsSync('package.json') ? JSON.parse(readFileSync('package.json', 'utf8')) : {}
+const installed = Object.entries(PINS).every(
+  ([name, version]) => manifest.dependencies?.[name] === version,
 )
-if (install.status !== 0) {
-  const reason = install.error ? \` (\${install.error.message})\` : ''
-  console.error(\`npm install did not succeed\${reason}, so \${TARGET} was not written.\`)
-  process.exit(1)
+
+if (!installed) {
+  // Inside the platform's ten-minute limit on an install command: npm is stopped here, not left
+  // running after that limit ends this script.
+  const install = spawnSync(
+    'npm',
+    ['install', '--save-exact', '--no-audit', '--no-fund', '--loglevel=error', ...PACKAGES],
+    { stdio: 'inherit', timeout: 540_000 },
+  )
+  if (install.status !== 0) {
+    const reason = install.error ? \` (\${install.error.message})\` : ''
+    console.error(
+      \`npm install did not succeed\${reason}, so \${TARGET} was not written. If this app's \` +
+        'packages need an npm flag such as --legacy-peer-deps, install these yourself with it — ' +
+        \`npm install --save-exact \${PACKAGES.join(' ')} — then run this command again: it \` +
+        'writes the module once they are installed.',
+    )
+    process.exit(1)
+  }
 }
 
 mkdirSync('lib', { recursive: true })
 writeFileSync(TARGET, MODULE)
 console.log(
-  \`Installed \${PACKAGES.join(', ')} and wrote \${TARGET}. Import it from '@/lib/flight-data' \` +
-    'in server code only.',
+  \`\${installed ? 'Found' : 'Installed'} \${PACKAGES.join(', ')} and wrote \${TARGET}. Import it \` +
+    "from '@/lib/flight-data' in server code only.",
 )
 `
 }

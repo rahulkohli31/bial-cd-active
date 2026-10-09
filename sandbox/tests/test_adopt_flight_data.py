@@ -56,7 +56,13 @@ class Run:
         return self.npm_args.read_text(encoding="utf-8").splitlines()
 
 
-def _adopt(tmp_path: Path, *, npm_exit: int = 0, existing: str | None = None) -> Run:
+def _adopt(
+    tmp_path: Path,
+    *,
+    npm_exit: int = 0,
+    existing: str | None = None,
+    dependencies: dict[str, str] | None = None,
+) -> Run:
     """Run a copy of the committed script from a fresh app folder, with npm stubbed."""
     copy = tmp_path / "image" / SCRIPT.name
     copy.parent.mkdir()
@@ -70,6 +76,9 @@ def _adopt(tmp_path: Path, *, npm_exit: int = 0, existing: str | None = None) ->
     if existing is not None:
         (app / "lib").mkdir()
         (app / "lib" / "flight-data.ts").write_text(existing, encoding="utf-8")
+    if dependencies is not None:
+        manifest = json.dumps({"dependencies": dependencies})
+        (app / "package.json").write_text(manifest, encoding="utf-8")
     npm_args = tmp_path / "npm-args"
     env = {
         **os.environ,
@@ -89,9 +98,12 @@ def _adopt(tmp_path: Path, *, npm_exit: int = 0, existing: str | None = None) ->
     return Run(app=app, npm_args=npm_args, proc=proc)
 
 
+def _seed_dependencies() -> dict[str, str]:
+    return json.loads((SEED / "package.json").read_text(encoding="utf-8"))["dependencies"]
+
+
 def _seed_versions() -> list[str]:
-    dependencies = json.loads((SEED / "package.json").read_text(encoding="utf-8"))["dependencies"]
-    return [f"{name}@{version}" for name, version in dependencies.items()]
+    return [f"{name}@{version}" for name, version in _seed_dependencies().items()]
 
 
 def _files_under(root: Path) -> dict[str, bytes]:
@@ -141,6 +153,31 @@ def test_a_failed_install_writes_no_module(tmp_path: Path) -> None:
     assert run.npm_was_asked_for() is not None
     assert not (run.app / "lib" / "flight-data.ts").exists()
     assert "was not written" in run.proc.stderr
+    assert f"npm install --save-exact {' '.join(_seed_versions())}" in run.proc.stderr
+
+
+@needs_node_and_sh
+def test_an_app_that_already_pins_the_packages_gets_the_module_without_an_install(
+    tmp_path: Path,
+) -> None:
+    """The way through when npm needs a flag the command does not pass: the agent installs the
+    pins itself, then the command writes the module."""
+    run = _adopt(tmp_path, dependencies=_seed_dependencies())
+
+    assert run.proc.returncode == 0, run.proc.stderr
+    assert run.npm_was_asked_for() is None
+    assert (run.app / "lib" / "flight-data.ts").read_bytes() == (
+        SEED / "flight-data.ts"
+    ).read_bytes()
+
+
+@needs_node_and_sh
+def test_a_range_instead_of_the_pin_still_installs(tmp_path: Path) -> None:
+    ranged = {name: f"^{version}" for name, version in _seed_dependencies().items()}
+    run = _adopt(tmp_path, dependencies=ranged)
+
+    assert run.proc.returncode == 0, run.proc.stderr
+    assert run.npm_was_asked_for() is not None
 
 
 def _instruction_containing(dockerfile: str, needle: str) -> str:
