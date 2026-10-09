@@ -247,12 +247,6 @@
 // // Name your columns. Always. And fetch only them: a parquet file stores each column in its own
 // // byte ranges, so reading through ranged downloads fetches the columns you named and the file's
 // // index, not the whole file. A 100 MB file read for eight columns costs a few MB.
-// //
-// // Then read each file one row group at a time, keeping each flight's latest row as you go:
-// // `readCurrentRecords` below holds one row group's rows plus one row per flight, never every row
-// // of a file. That bound assumes the files are cut into several row groups. Their row-group layout
-// // has not been measured: a file written as a single row group is read in one piece, and for a
-// // complete copy that is every row it holds, about 350,000.
 // function rangedFile(file: LakeFile): AsyncBuffer {
 //   const blob = container.getBlobClient(file.name)
 //   // No cache in front of the downloads: one would keep every row group's bytes alive until the
@@ -393,10 +387,9 @@
 //  * The current record of every flight in `files`, with only the columns you asked for.
 //  *
 //  * Each file is read one row group at a time, and each group's rows are folded in before the next
-//  * group is downloaded, keeping each flight's latest row exactly as `currentRecordsOnly` does. So
-//  * this holds one row group's rows and one row per flight at most, where reading every file whole
-//  * and collapsing afterwards holds every row of every file. The file's index is read once and
-//  * handed to every group's read, so it is not downloaded again per group.
+//  * group is downloaded, keeping each flight's latest row exactly as `currentRecordsOnly` does, so
+//  * at most one row group's rows and one row per flight are held. A file written as a single row
+//  * group is read in one piece. The file's index is read once and reused for every group.
 //  */
 // export async function readCurrentRecords<T extends Row>(
 //   files: readonly LakeFile[],

@@ -105,7 +105,10 @@ def test_it_installs_the_tested_versions_then_writes_the_seed_module(tmp_path: P
     run = _adopt(tmp_path)
 
     assert run.proc.returncode == 0, run.proc.stderr
-    assert run.npm_was_asked_for() == ["install", "--save-exact", *_seed_versions()]
+    asked = run.npm_was_asked_for()
+    assert asked is not None
+    assert asked[:2] == ["install", "--save-exact"]
+    assert [arg for arg in asked if not arg.startswith("-")][1:] == _seed_versions()
     assert (run.app / "lib" / "flight-data.ts").read_bytes() == (
         SEED / "flight-data.ts"
     ).read_bytes()
@@ -155,7 +158,7 @@ def test_the_image_puts_it_where_the_backend_and_the_reference_say() -> None:
     destination = copy.split()[-1]
     assert destination == "/usr/local/lib/bial/adopt-flight-data.mjs"
 
-    strip_then_chmod = _instruction_containing(dockerfile, "sed -i 's/\\r$//'")
+    strip_then_chmod = _instruction_containing(dockerfile, f"sed -i 's/\\r$//' {destination}")
     strip, chmod = strip_then_chmod.split("&&")
     assert destination in strip
     assert "chmod +x" in chmod and destination in chmod

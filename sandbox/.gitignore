@@ -25,10 +25,10 @@ uv.lock
 # `npm ci` depends on it).
 node_modules/
 
-# Tool output from the seed workspace (`seed/`), which exists only to VERIFY the golden
-# template's reference file: `seed/flight-data.ts` is typechecked under the template's own
-# `strict` settings and unit-tested there, then rendered into
-# `template/lib/flight-data.reference.ts` by `seed/generate-reference.mjs`. Nothing in `seed/`
+# Tool output from the seed workspace (`seed/`), which verifies and renders the flight-data
+# module: `seed/flight-data.ts` is typechecked under the template's own `strict` settings and
+# unit-tested there, then rendered by `seed/generate-reference.mjs` into
+# `template/lib/flight-data.reference.ts` and `scripts/adopt-flight-data.mjs`. Nothing in `seed/`
 # ships — `Dockerfile.sandbox` never copies or installs it — so nothing it produces is committed.
 # Its install is already covered by `node_modules/` above; these are what tsc and vitest leave.
 #

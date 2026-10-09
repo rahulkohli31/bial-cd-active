@@ -526,18 +526,6 @@ async def test_an_accepted_turn_still_resolves_a_pending_card(
 # document on one message. What shows up HERE is what they do to a real send.
 
 
-@pytest.fixture
-def shared_storage(fake_storage, monkeypatch):
-    """ONE store for both consumers of it. The upload route takes its store by injected
-    dependency; the send route's rehydrator reaches the accessor-level `get_storage()`. The
-    directory fixture binds only the first, so a test that uploads and then SENDS the upload
-    needs the accessor bound to the same object or the send answers 503 and proves nothing."""
-    from src.services.storage import accessor
-
-    monkeypatch.setattr(accessor, "_backend_singleton", fake_storage)
-    return fake_storage
-
-
 async def _upload(
     client, user, conversation_id: uuid.UUID, attachment_id: str, media_type: str, data: bytes
 ) -> None:

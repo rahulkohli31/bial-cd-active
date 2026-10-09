@@ -496,10 +496,10 @@ def _classify_command(argv: list[str]) -> tuple[str, bool]:
     head = argv[0]
     rest = argv[1:]
     joined = " ".join(argv)
-    if head in _PACKAGE_MANAGERS and any(sub in _INSTALL_SUBCOMMANDS for sub in rest[:2]):
-        return (_LBL_INSTALL, False)
-    if argv[:2] == ["node", FLIGHT_DATA_ADOPT_PATH]:
-        # The flight-data install command runs `npm install` itself.
+    # The flight-data install command runs `npm install` itself.
+    if (
+        head in _PACKAGE_MANAGERS and any(sub in _INSTALL_SUBCOMMANDS for sub in rest[:2])
+    ) or argv[:2] == ["node", FLIGHT_DATA_ADOPT_PATH]:
         return (_LBL_INSTALL, False)
     if "db:migrate" in joined or "db-migrate" in joined or "drizzle-kit migrate" in joined:
         return (_LBL_DATA_READY, False)

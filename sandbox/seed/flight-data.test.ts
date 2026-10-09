@@ -107,20 +107,7 @@ afterEach(() => {
 // ── The connection ───────────────────────────────────────────────────────────────────────────
 
 describe('the connector being switched off', () => {
-  it('fails with the reason, not with a DNS error', async () => {
-    vi.resetModules()
-    const held = process.env[URL_ENV]
-    delete process.env[URL_ENV]
-    try {
-      await expect(import('./flight-data')).rejects.toThrow(
-        /BIAL_DICE_URL is not set.*not switched on for this project/s,
-      )
-    } finally {
-      process.env[URL_ENV] = held
-    }
-  })
-
-  it('says when the switch takes effect, never to restart the dev server', async () => {
+  it('names the reason and when the switch takes effect, never DNS or a restart', async () => {
     // The build agent reads this message and is forbidden to start, restart or kill the dev
     // server, so a message that told it to would send it straight into that rule.
     vi.resetModules()
@@ -131,6 +118,7 @@ describe('the connector being switched off', () => {
         () => '',
         (error: unknown) => String(error),
       )
+      expect(failure).toMatch(/BIAL_DICE_URL is not set.*not switched on for this project/s)
       expect(failure).toMatch(/next time/)
       expect(failure).not.toMatch(/restart/i)
     } finally {

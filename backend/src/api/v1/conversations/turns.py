@@ -17,7 +17,7 @@ import asyncio
 import unicodedata
 import uuid
 from collections.abc import AsyncIterator, Sequence
-from typing import Literal
+from typing import Final, Literal
 
 import sqlalchemy as sa
 import structlog
@@ -193,7 +193,7 @@ async def _app_is_switched_off(
     return switched_off
 
 
-FILE_NOTE_KIND = "file_note"
+FILE_NOTE_KIND: Final = "file_note"
 """The `meta` kind of the hidden note that lists a conversation's attached files."""
 
 

@@ -308,9 +308,8 @@ class _UnlockedReadChangeWrite(FakeSandbox):
 
 
 async def test_two_edits_to_one_file_in_one_reply_both_land_in_the_order_sent() -> None:
-    """A reply may carry several calls, and pydantic-ai starts them together. Two edits to one
-    file then race an unlocked read-change-write, and the second silently undoes the first. The
-    changing tools run one at a time, in the order the model sent them.
+    """Two edits to one file in one reply race the supervisor's unlocked read-change-write unless
+    the changing tools run one at a time.
 
     Mutation receipt: drop `sequential=True` from `edit_file` and the peak reaches 2 with one
     replacement missing."""

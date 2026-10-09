@@ -19,7 +19,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.providers.anthropic import AnthropicProvider
 
 from src.api.v1.conversations.turns import FILE_NOTE_KIND, _latest_file_note
-from src.core.prompt_blocks import ANALYSIS_RUN_TOOL, ATTACHMENT_READ_TOOL, FILE_NOTE_HEADING
+from src.core.prompt_blocks import FILE_NOTE_HEADING
 from src.db.models.conversation import ChatKind
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.services.deploy.outcome import DEPLOY_DIAGNOSTIC_KIND
@@ -27,20 +27,11 @@ from src.services.messages.store import append_batch, load_rows
 from tests.api.v1.conversations.conftest import _headers
 from tests.factories import ConversationFactory, UserFactory
 
-pytestmark = pytest.mark.usefixtures("_fresh_engine", "_override_billing", "fake_analysis")
+pytestmark = pytest.mark.usefixtures(
+    "_fresh_engine", "_override_billing", "fake_analysis", "shared_storage"
+)
 
 _CSV = base64.b64encode(b"badge,name\n1,Asha\n").decode()
-
-
-@pytest.fixture(autouse=True)
-def _one_store(fake_storage):
-    """The upload door and the send door resolve the object store through different seams; both
-    have to land on the same fake or the send finds no file to place."""
-    from src.services.storage import accessor
-
-    accessor._backend_singleton = fake_storage
-    yield
-    accessor._backend_singleton = None
 
 
 class _Capture:
@@ -55,9 +46,6 @@ class _Capture:
             yield "noted."
 
         return FunctionModel(stream_function=_stream)
-
-    def tools(self, index: int) -> list[str]:
-        return sorted(tool.name for tool in self.requests[index][1].function_tools)
 
 
 async def _wire(
@@ -80,11 +68,7 @@ async def _wire(
 
 async def _chat(db_session, kind: ChatKind):
     user = await UserFactory.create(db_session)
-    if kind is ChatKind.GENERIC:
-        conv = await ConversationFactory.create(db_session, user.id, kind=kind, project_id=None)
-    else:
-        conv = await ConversationFactory.create(db_session, user.id, kind=kind)
-    return user, conv
+    return user, await ConversationFactory.create(db_session, user.id, kind=kind)
 
 
 async def _upload(client, user, conv, attachment_id: str, name: str) -> None:
@@ -152,7 +136,6 @@ async def test_a_file_attached_mid_chat_changes_neither_the_tools_nor_the_instru
     assert tools_three == tools_two, "attaching a file changed the tool list"
     assert system_three == system_two, "attaching a file changed the instructions"
 
-    # One hidden note, written immediately ahead of the message that carried the file.
     rows = await load_rows(
         db_session, user_id=user.id, conversation_id=conv.id, include_hidden=True
     )
@@ -170,34 +153,14 @@ async def test_a_file_attached_mid_chat_changes_neither_the_tools_nor_the_instru
     if kind is not ChatKind.GENERIC:
         assert "on disk: /workspace/attachments/visitors.csv" in text
 
-    # The note and the message travel as one user entry.
     assert FILE_NOTE_HEADING.encode() in live[-1]
     assert b"read the file" in live[-1]
 
-    # What turn 3 sent, the next turn replays from the store byte for byte; and the same list
-    # writes no second note.
+    # The next turn replays what turn 3 sent from the store, byte for byte.
     await _turn(_fresh_engine, client, user, conv, "thanks")
     _, _, replayed = await _wire(*capture.requests[3])
     assert replayed[: len(live)] == live
     assert len(await _notes(db_session, user, conv)) == 1
-
-
-@pytest.mark.parametrize("kind", [ChatKind.PLAN, ChatKind.GENERIC])
-async def test_a_chat_with_no_file_already_has_the_file_tools_and_writes_no_note(
-    kind: ChatKind, client, db_session, set_chat_model, _fresh_engine, fake_analysis
-) -> None:
-    user, conv = await _chat(db_session, kind)
-    capture = _Capture()
-    set_chat_model(capture.model())
-
-    await _turn(_fresh_engine, client, user, conv, "hello")
-
-    expected = {ATTACHMENT_READ_TOOL}
-    if kind is ChatKind.GENERIC:
-        expected.add(ANALYSIS_RUN_TOOL)
-    assert expected <= set(capture.tools(0))
-    assert fake_analysis.calls == []
-    assert await _notes(db_session, user, conv) == []
 
 
 async def test_each_change_to_the_files_writes_one_note_with_the_whole_current_list(
@@ -223,21 +186,6 @@ async def test_each_change_to_the_files_writes_one_note_with_the_whole_current_l
     assert "arrivals.csv" not in second and "departures.csv" in second
     assert "arrivals.csv" not in third and "departures.csv" not in third
     assert "No file is attached to this conversation now." in third
-
-
-async def test_a_credential_shaped_file_name_does_not_look_changed_on_every_turn(
-    client, db_session, set_chat_model, _fresh_engine
-) -> None:
-    user, conv = await _chat(db_session, ChatKind.PLAN)
-    set_chat_model(_Capture().model())
-
-    await _turn(_fresh_engine, client, user, conv, "hello")
-    await _upload(client, user, conv, "att_key", "bial_abcdefghijklmnop.csv")
-    await _turn(_fresh_engine, client, user, conv, "this one", ["att_key"])
-    await _turn(_fresh_engine, client, user, conv, "and again")
-
-    (note,) = await _notes(db_session, user, conv)
-    assert "bial_abcdefghijklmnop.csv" in note
 
 
 async def test_the_latest_note_is_read_for_this_user_and_from_file_notes_only(

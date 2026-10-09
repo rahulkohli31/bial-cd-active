@@ -912,12 +912,13 @@ class _TurnState:
     sandbox: SandboxSession | None = None
     # The conversation's code-lane attachments and the store they live in, or
     # None when it holds none. Set by the send route, which is the only layer holding both the
-    # database session and the object store; used twice — once inside the attach, to put the
-    # files in the container before the agent's first read, and once at the top of the run, to
-    # tell the agent they are there. Carrying the storage HANDLE rather than the bytes is what
-    # keeps a detached turn from pinning tens of megabytes for its whole life.
+    # database session and the object store; used inside the attach, to put the files in the
+    # container before the agent's first read, and to give BIAL Chat's file session its files.
+    # The route, not the engine, tells the agent they are there. Carrying the storage HANDLE
+    # rather than the bytes is what keeps a detached turn from pinning tens of megabytes for its
+    # whole life.
     attachments: AttachmentDelivery | None = None
-    #: BIAL Chat's handle on its file session, when this reply registers the analysis tools.
+    #: BIAL Chat's handle on its file session: set on every BIAL Chat reply, None for the others.
     analysis: AnalysisSession | None = None
     write_session: BuildSession | None = None
     preview_task: asyncio.Task[None] | None = None
@@ -1635,11 +1636,9 @@ class TurnEngine:
             # citizen's prompt is persisted while an injected tail is not — so next turn the
             # prompt replays without it, the bytes vanish from the middle of the history, and
             # every message after them shifts. That is a cache miss on the whole request. A fact
-            # the model needs either rides a TOOL RESULT (persisted, at the absolute tail) or the
-            # per-run INSTRUCTION, which is not part of history at all.
-            #
-            # The attached files are named by a hidden note the route persisted ahead of the
-            # prompt, so it replays as it was sent.
+            # the model needs rides a TOOL RESULT (persisted, at the absolute tail), the per-run
+            # INSTRUCTION (not part of history at all), or a hidden row the route persists ahead of
+            # the prompt (the attached-files note).
             #
             # BIAL Chat has no container; its files go to a session of their own, and only once a
             # tool first asks for one. The handle starts nothing until then.

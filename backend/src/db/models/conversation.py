@@ -39,10 +39,10 @@ class ChatKind(StrEnum):
     (node loop vs `chat_agent.run`). Those three are the whole permitted set — anything else
     holding a kind is stamping a row.
 
-    `GENERIC` is the one kind with no project and no container: its turn resolves no workspace, is
-    handed no toolset, and answers from the transcript and its attachments alone. A reader that
-    asks "is this build?" and treats every other answer as plan is wrong for it — every site that
-    decides on a kind names all three."""
+    `GENERIC` is the one kind with no project and no container: its turn resolves no workspace, and
+    its only tools read and compute over its attached files. A reader that asks "is this build?"
+    and treats every other answer as plan is wrong for it — every site that decides on a kind names
+    all three."""
 
     PLAN = "plan"
     BUILD = "build"

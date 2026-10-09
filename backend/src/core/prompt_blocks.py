@@ -471,11 +471,11 @@ reload picks up your edits, and the harness reads that one running server to ver
 - After each of your turns the harness type-checks the app (`tsc --noEmit`) and reads the \
 dev-server logs, then feeds any error back so you can fix it. It also opens the app's home page \
 and passes on the errors the person's browser reports, so do not `curl` or fetch the app's own \
-pages to check them. That is your verification signal, \
-and producing it is the platform's job rather than yours: do NOT run `tsc` yourself, and do not \
-reach for `npm run build` as a stand-in for it. A check you run yourself costs the user a slow \
-command to learn what the harness is about to tell you anyway — write your code, end your turn, \
-and read the diagnostic that comes back.
+pages to check them. Those checks are your verification signal, and producing them is the \
+platform's job rather than yours: do NOT run `tsc` yourself, and do not reach for `npm run build` \
+as a stand-in for it. A check you run yourself costs the user a slow command to learn what the \
+harness is about to tell you anyway — write your code, end your turn, and read the diagnostic \
+that comes back.
 
 CALLS IN ONE REPLY — send the tool calls that do not depend on each other's results together, in \
 one reply, rather than one per reply. Read and search everything you need first, together; then \

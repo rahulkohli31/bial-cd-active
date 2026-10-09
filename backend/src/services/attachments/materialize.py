@@ -1,14 +1,11 @@
-"""Putting an attached file where code can read it, and telling the agent it is there.
+"""Putting an attached file where code can read it, and the listing that names it to the agent.
 
-R20/R20a AND R11a ARE ONE THING, WHICH IS WHY THEY ARE ONE MODULE. The platform places the file
-in the container and, in the same breath, names it to the agent. Either half alone is worse than
-neither: a file nobody was told about is invisible, and a path nobody wrote to is a hallucination
-the model then explains at length.
+THE TWO HALVES BELONG TOGETHER. A file nobody was told about is invisible, and a path nobody wrote
+to is a hallucination the model then explains at length.
 
 THE FAILURE THIS EXISTS TO PREVENT is not a crash. An agent asked about a spreadsheet it cannot
 see does not stop — it writes its own parser, or answers from the file's NAME, and both read as
-success. So the note is unconditional, it is exact about the path and the invocation, and it says
-plainly that the reader is the one to use.
+success. So the listing is exact about every path.
 
 WHY EVERY CODE-LANE FILE IN THE CONVERSATION IS PLACED ON EVERY TURN, rather than only the ones
 attached to this message. `/workspace/attachments` is a sibling of the app tree specifically so no
@@ -259,7 +256,7 @@ async def _ids_already_sent(
 
 @dataclass(frozen=True, slots=True)
 class AttachmentDelivery:
-    """This conversation's code-lane files, and the two things the platform owes them.
+    """This conversation's code-lane files, and the placing of them in the container.
 
     Built by the send route, which holds the database session and the object store; used by the
     turn engine, which holds the container. It carries the storage HANDLE rather than the bytes,

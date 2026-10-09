@@ -54,6 +54,18 @@ def _bind_a_workspace(app, fake_redis, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def shared_storage(fake_storage, monkeypatch):
+    """ONE store for both consumers of it. The upload route takes its store by injected
+    dependency; the send route's rehydrator reaches the accessor-level `get_storage()`. The
+    directory fixture binds only the first, so a test that uploads and then SENDS the upload
+    needs the accessor bound to the same object or the send answers 503 and proves nothing."""
+    from src.services.storage import accessor
+
+    monkeypatch.setattr(accessor, "_backend_singleton", fake_storage)
+    return fake_storage
+
+
+@pytest.fixture
 def no_workspace_service(app) -> None:
     """The no-sandbox case the binding above guards against, opted into by name: a deployment
     with no sandbox service at all.

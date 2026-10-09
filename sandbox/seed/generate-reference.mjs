@@ -162,7 +162,11 @@ if (existsSync(TARGET)) {
   process.exit(1)
 }
 
-const install = spawnSync('npm', ['install', '--save-exact', ...PACKAGES], { stdio: 'inherit' })
+const install = spawnSync(
+  'npm',
+  ['install', '--save-exact', '--no-audit', '--no-fund', '--loglevel=error', ...PACKAGES],
+  { stdio: 'inherit' },
+)
 if (install.status !== 0) {
   const reason = install.error ? \` (\${install.error.message})\` : ''
   console.error(\`npm install did not succeed\${reason}, so \${TARGET} was not written.\`)
@@ -180,15 +184,18 @@ console.log(
 
 const source = readFileSync(SOURCE, 'utf8')
 const outputs = {
-  reference: [REFERENCE, render(source)],
-  adopt: [ADOPT, adoptScript(source, JSON.parse(readFileSync(MANIFEST, 'utf8')).dependencies)],
+  reference: { path: REFERENCE, text: render(source) },
+  adopt: {
+    path: ADOPT,
+    text: adoptScript(source, JSON.parse(readFileSync(MANIFEST, 'utf8')).dependencies),
+  },
 }
 
 const asked = process.argv.indexOf('--stdout')
 if (asked === -1) {
-  for (const [target, output] of Object.values(outputs)) {
-    writeFileSync(target, output, 'utf8')
-    process.stderr.write(`wrote ${target} (${output.split('\n').length} lines)\n`)
+  for (const { path, text } of Object.values(outputs)) {
+    writeFileSync(path, text, 'utf8')
+    process.stderr.write(`wrote ${path} (${text.split('\n').length} lines)\n`)
   }
 } else {
   const which = process.argv[asked + 1] ?? 'reference'
@@ -196,5 +203,5 @@ if (asked === -1) {
     process.stderr.write(`--stdout takes "reference" or "adopt", not "${which}"\n`)
     process.exit(2)
   }
-  process.stdout.write(outputs[which][1])
+  process.stdout.write(outputs[which].text)
 }

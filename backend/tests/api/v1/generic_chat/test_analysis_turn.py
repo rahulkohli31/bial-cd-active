@@ -312,27 +312,6 @@ async def test_a_chat_with_no_file_has_both_tools_and_touches_no_session(
     assert reads.calls == []
 
 
-async def test_a_chat_that_used_the_tools_keeps_them_after_its_file_is_deleted(
-    client, db_session, set_chat_model, _fresh_engine, stored, reads
-) -> None:
-    """The model API refuses a history carrying tool calls when no tool is defined."""
-    user, chat = await _chat(db_session)
-    await _upload(client, user, chat, "att_q3")
-    set_chat_model(_script([_READ]))
-    await _send(client, user, chat, attachment_ids=["att_q3"])
-    await _settle(_fresh_engine, chat.id)
-    deleted = await client.delete("/v1/attachments/att_q3", headers=_headers(user))
-    assert deleted.status_code == 200
-    seen: dict[str, Any] = {}
-    set_chat_model(_script([], seen=seen))
-
-    await _send(client, user, chat, text="Thanks, and in general?")
-    await _settle(_fresh_engine, chat.id)
-
-    assert seen["tools"] == sorted([ATTACHMENT_READ_TOOL, ANALYSIS_RUN_TOOL])
-    assert _fresh_engine.peek(chat.id).status == "completed"
-
-
 async def test_a_deleted_file_leaves_the_session_on_the_next_access(
     client, db_session, set_chat_model, _fresh_engine, stored, reads
 ) -> None:

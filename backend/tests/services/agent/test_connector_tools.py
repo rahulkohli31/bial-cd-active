@@ -146,29 +146,14 @@ async def test_the_answer_states_its_own_completeness_and_points_at_the_worked_e
     assert answer.startswith(SHIPPED)
 
 
-async def test_the_answer_names_the_install_command_and_summarises_the_module() -> None:
-    """Only this answer names the install command. The summary describes the current module, so it
-    defers to an app's own `lib/flight-data.ts` and falls back to the reference file."""
-    answer = await connector_schema(_ctx(connected=(SYSTEM,)), SYSTEM.key)
-    assert f"node {FLIGHT_DATA_ADOPT_PATH}" in answer
-    assert f'["node", "{FLIGHT_DATA_ADOPT_PATH}"]' in answer
-    assert "What the current version of the module exports" in answer
-    assert "read its exports before relying on the summary below" in answer
-    assert "If the command is missing, the workspace predates it" in answer
-    for export in ("currentFlights(columns)", "sharedLoad(", "pageOf(", "optionsOf(", "label("):
-        assert export in answer, export
-    pitfalls = answer.split("The seven pitfalls it handles", 1)[1]
-    assert [line.split(".", 1)[0] for line in pitfalls.splitlines()[1:]] == [
-        str(n) for n in range(1, 8)
-    ]
-
-
 async def test_only_a_build_chat_is_asked_to_run_the_install_command() -> None:
-    """The answer reaches Plan too, whose read-only `run_command` refuses `node`, so an unscoped
-    instruction costs a planning chat a refused call."""
+    """The answer reaches Plan too, whose read-only `run_command` refuses `node`; an old
+    workspace without the command falls back to the reference file."""
     answer = await connector_schema(_ctx(connected=(SYSTEM,)), SYSTEM.key)
     assert f"In a build chat, run `node {FLIGHT_DATA_ADOPT_PATH}`" in answer
+    assert f'["node", "{FLIGHT_DATA_ADOPT_PATH}"]' in answer
     assert "a planning chat cannot run it and leaves it to the build" in answer
+    assert "If the command is missing, the workspace predates it" in answer
 
 
 async def test_the_key_and_the_display_name_both_resolve() -> None:

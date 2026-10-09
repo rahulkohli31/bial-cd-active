@@ -274,8 +274,7 @@ ADAPTIVE_THINKING: Final[BetaThinkingConfigParam] = {"type": "adaptive", "displa
 The deployed model REFUSES a numeric budget outright: its provider profile disallows budget
 thinking, and the library raises before the request rather than letting the provider return a
 400, directing callers to adaptive thinking plus an effort level. So the two knobs are this and
-the effort below — a shape the owner's ruling on effort maps onto directly, rather than token
-counts nobody could defend.
+the effort level, rather than token counts nobody could defend.
 
 `display` IS LOAD-BEARING AND MUST STAY NAMED. The SDK's own type stub documents it as
 defaulting to `summarized`; this deployment behaves as `omitted` when it is absent, returning a
@@ -290,6 +289,10 @@ DISABLING THINKING IS NOT AN OPTIMISATION, and this is the place someone tuning 
 levels below will be reading. With thinking off, this model occasionally writes a tool call into
 visible text instead of a `tool_use` block. In an agentic loop that is a silent failure: no
 error is raised, the call never runs, and the turn carries on as though it had."""
+
+PLAN_AND_BUILD_EFFORT: Final[AnthropicEffort] = "medium"
+"""How hard the model thinks in a planning or build turn (owner's ruling). Thinking stays in the
+history and is read again as input on every later call, so a lower level costs less twice."""
 
 GENERIC_EFFORT: Final[AnthropicEffort] = "low"
 """How hard the model thinks in a BIAL Chat turn — the lowest level available.
@@ -331,9 +334,6 @@ to hand the model, and the read answers `too_large`."""
 
 ANALYSIS_CODE_LIMIT: Final = 100_000
 """Characters of code one `run_python` call may send."""
-
-PLAN_AND_BUILD_EFFORT: Final[AnthropicEffort] = "medium"
-"""How hard the model thinks in a planning or build turn (owner's ruling)."""
 
 CACHE_TTL: Literal["1h"] = "1h"
 """TTL for every Anthropic prompt-cache breakpoint the loop sets (`anthropic_cache_instructions`,

@@ -52,7 +52,14 @@ def _streaming_text(*chunks: str) -> FunctionModel:
     return FunctionModel(stream_function=_stream)
 
 
-async def _send(client, user, conv, text: str, attachment_texts: list[str] | None = None):
+async def _send(
+    client,
+    user,
+    conv,
+    text: str,
+    attachment_texts: list[str] | None = None,
+    attachment_ids: list[str] | None = None,
+):
     return await client.post(
         f"/v1/conversations/{conv.id}/turns",
         headers=_headers(user),
@@ -60,7 +67,7 @@ async def _send(client, user, conv, text: str, attachment_texts: list[str] | Non
             "message": {
                 "text": text,
                 "attachmentTexts": attachment_texts or [],
-                "attachmentIds": [],
+                "attachmentIds": attachment_ids or [],
             }
         },
     )
@@ -222,13 +229,10 @@ async def test_a_send_refused_at_the_append_leaves_the_chat_unnamed(
 
 @pytest.mark.route_rollback
 async def test_a_send_refused_after_its_file_note_leaves_the_chat_unnamed_and_the_note_standing(
-    client, db_session, set_chat_model, monkeypatch, fake_storage
+    client, db_session, set_chat_model, monkeypatch, shared_storage
 ) -> None:
     """The file note commits on its own, ahead of the naming UPDATE, so a message refused at its
     append must still take the name with it. The note stays, and it is still true."""
-    from src.services.storage import accessor
-
-    monkeypatch.setattr(accessor, "_backend_singleton", fake_storage)
     user = await UserFactory.create(db_session)
     conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.PLAN)
     await db_session.commit()
@@ -254,17 +258,7 @@ async def test_a_send_refused_after_its_file_note_leaves_the_chat_unnamed_and_th
 
     monkeypatch.setattr("src.api.v1.conversations.turns.append_batch", _message_contended)
 
-    resp = await client.post(
-        f"/v1/conversations/{conversation_id}/turns",
-        headers=_headers(user),
-        json={
-            "message": {
-                "text": "words that never landed",
-                "attachmentTexts": [],
-                "attachmentIds": ["att_csv"],
-            }
-        },
-    )
+    resp = await _send(client, user, conv, "words that never landed", attachment_ids=["att_csv"])
     assert resp.status_code == 409, resp.text
 
     await db_session.rollback()

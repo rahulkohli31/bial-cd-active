@@ -957,11 +957,12 @@ def test_classify_command_maps_the_pinned_commands() -> None:
 
 
 def test_the_flight_data_install_command_is_an_install() -> None:
-    """It runs `npm install` itself, so it takes the install label and the install's long timeout
-    rather than the short bound every unrecognised `node` script gets."""
-    argv = ["node", FLIGHT_DATA_ADOPT_PATH]
-    assert _classify_argv(argv) == ("Setting up the tools your app needs", False)
-    assert command_needs_the_long_timeout(argv) is True
+    """It runs `npm install` itself, so it takes the install label; any other `node` script keeps
+    the short bound."""
+    assert _classify_argv(["node", FLIGHT_DATA_ADOPT_PATH]) == (
+        "Setting up the tools your app needs",
+        False,
+    )
     assert command_needs_the_long_timeout(["node", "scripts/seed.mjs"]) is False
 
 
