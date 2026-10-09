@@ -3,10 +3,10 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main, 'release/**']
+    branches: [main, development, 'release/**']
 
-# A newer push to a pull request supersedes the run still in progress for it. Pushes to main and
-# release branches always run to completion.
+# A newer push to a pull request supersedes the run still in progress for it. Pushes to main,
+# development and release branches always run to completion.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
