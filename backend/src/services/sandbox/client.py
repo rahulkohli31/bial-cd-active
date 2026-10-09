@@ -1339,7 +1339,10 @@ class AcaSandboxClient(SandboxClient):
         from src.services.sandbox import pool
 
         stopwatch = running_stopwatch()
-        if self._config.pool_size_at(datetime.now(UTC)) == 0:
+        if (
+            self._config.pool_size_at(datetime.now(UTC), project_type=SandboxProjectType.PLAIN)
+            == 0
+        ):
             stopwatch.missed("size_zero", ready_count=0)
             return None
         if needs_identity:
@@ -1527,9 +1530,12 @@ class AcaSandboxClient(SandboxClient):
         """Replace a claimed container, behind its start, while the pool is below its size. A
         lost fill is made up by the worker's next pass."""
         from src.db.base import DB_UNREACHABLE
+        from src.db.models.sandbox_start import SandboxProjectType
 
         try:
-            await self.fill_one(self._config.pool_size_at(datetime.now(UTC)))
+            await self.fill_one(
+                self._config.pool_size_at(datetime.now(UTC), project_type=SandboxProjectType.PLAIN)
+            )
         except DB_UNREACHABLE:
             _log.warning("sandbox_pool_refill_failed", exc_info=True)
 

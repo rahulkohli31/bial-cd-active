@@ -14,7 +14,7 @@ provisioning secret lives here; the supervisor bearer is minted at provision tim
 from __future__ import annotations
 
 from datetime import datetime, time
-from typing import Annotated, Final, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Final, Literal, Self
 from zoneinfo import ZoneInfo
 
 from pydantic import (
@@ -28,6 +28,9 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import NoDecode
+
+if TYPE_CHECKING:
+    from src.db.models.sandbox_start import SandboxProjectType
 
 #: The platform serves one organisation in one country, so the pool's day is read in this zone and
 #: the zone is not a setting.
@@ -121,6 +124,10 @@ class SandboxConfig(BaseModel):
     # How many to hold by day and by night. 0 holds none, and a start then creates its own.
     pool_day_size: PoolSize = 0
     pool_night_size: PoolSize = 0
+    # The same for the pool of containers made with the lake's identity, which only a flight-data
+    # project's start claims. Both processes hold the same values.
+    pool_connector_day_size: PoolSize = 0
+    pool_connector_night_size: PoolSize = 0
     # India time, `HH:MM`. The day runs from the start up to, not including, the end.
     pool_day_start: time = time(9, 0)
     pool_day_end: time = time(19, 0)
@@ -148,11 +155,18 @@ class SandboxConfig(BaseModel):
             raise ValueError("pool_day_start must come before pool_day_end")
         return self
 
-    def pool_size_at(self, instant: datetime) -> int:
-        """How many ready sandboxes the pool should hold at `instant`, an aware datetime."""
+    def pool_size_at(self, instant: datetime, *, project_type: SandboxProjectType) -> int:
+        """How many ready sandboxes the `project_type` pool should hold at `instant`, an aware
+        datetime."""
+        # Here, not at module scope: the ORM reaches `src.config`, which imports this module. So
+        # nothing may call this while settings are being built.
+        from src.db.models.sandbox_start import SandboxProjectType
+
         local = instant.astimezone(INDIA)
         daytime = (
             local.weekday() in self.pool_day_days
             and self.pool_day_start <= local.time() < self.pool_day_end
         )
+        if project_type is SandboxProjectType.CONNECTOR:
+            return self.pool_connector_day_size if daytime else self.pool_connector_night_size
         return self.pool_day_size if daytime else self.pool_night_size

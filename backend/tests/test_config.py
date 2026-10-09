@@ -11,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from src.config import FoundryConfig, Settings
+from src.db.models.sandbox_start import SandboxProjectType
 from src.services.appdb.config import AppDatabaseSettings
 from src.services.auth.config import AuthConfig
 from src.services.redis.config import RedisConfig
@@ -272,15 +273,27 @@ def test_the_pool_ships_switched_off_with_a_working_day_of_india_time() -> None:
     s = _settings(sandbox=_SANDBOX)
     assert s.sandbox is not None
     assert (s.sandbox.pool_day_size, s.sandbox.pool_night_size) == (0, 0)
+    assert (s.sandbox.pool_connector_day_size, s.sandbox.pool_connector_night_size) == (0, 0)
     assert (s.sandbox.pool_day_start, s.sandbox.pool_day_end) == (time(9, 0), time(19, 0))
     assert s.sandbox.pool_day_days == frozenset({0, 1, 2, 3, 4})
 
 
-def test_a_pool_size_above_twenty_fails_startup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A mistyped size fails the deploy rather than running dozens of ready containers."""
-    _sandbox_env(monkeypatch, pool_day_size="21")
+_POOL_SIZES = [
+    "pool_day_size",
+    "pool_night_size",
+    "pool_connector_day_size",
+    "pool_connector_night_size",
+]
 
-    with pytest.raises(ValidationError, match="pool_day_size"):
+
+@pytest.mark.parametrize("field", _POOL_SIZES)
+def test_a_pool_size_above_twenty_fails_startup(
+    monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    """A mistyped size fails the deploy rather than running dozens of ready containers."""
+    _sandbox_env(monkeypatch, **{field: "21"})
+
+    with pytest.raises(ValidationError, match=field):
         Settings.model_validate(_BASE_ENV)
 
 
@@ -293,7 +306,7 @@ def test_twenty_is_the_largest_size_that_starts(monkeypatch: pytest.MonkeyPatch)
     assert (s.sandbox.pool_day_size, s.sandbox.pool_night_size) == (20, 20)
 
 
-@pytest.mark.parametrize("field", ["pool_day_size", "pool_night_size"])
+@pytest.mark.parametrize("field", _POOL_SIZES)
 def test_a_negative_pool_size_fails_startup(field: str) -> None:
     with pytest.raises(ValidationError):
         _settings(sandbox={**_SANDBOX, field: -1})
@@ -338,27 +351,44 @@ def test_a_day_that_is_not_a_span_of_india_time_fails_startup(start: str, end: s
 
 
 @pytest.mark.parametrize(
-    ("instant", "size"),
+    ("instant", "daytime"),
     [
         # 09:00 India time on a Monday: the day has begun.
-        (datetime(2026, 10, 5, 3, 30, tzinfo=UTC), 5),
+        (datetime(2026, 10, 5, 3, 30, tzinfo=UTC), True),
         # A minute before.
-        (datetime(2026, 10, 5, 3, 29, tzinfo=UTC), 1),
+        (datetime(2026, 10, 5, 3, 29, tzinfo=UTC), False),
         # 18:59 India time: still the day.
-        (datetime(2026, 10, 5, 13, 29, tzinfo=UTC), 5),
+        (datetime(2026, 10, 5, 13, 29, tzinfo=UTC), True),
         # 19:00 India time: the day has ended.
-        (datetime(2026, 10, 5, 13, 30, tzinfo=UTC), 1),
+        (datetime(2026, 10, 5, 13, 30, tzinfo=UTC), False),
         # Sunday 23:00 UTC is 04:30 on Monday in India: night.
-        (datetime(2026, 10, 4, 23, 0, tzinfo=UTC), 1),
+        (datetime(2026, 10, 4, 23, 0, tzinfo=UTC), False),
         # Noon on a Saturday in India: not a day of the working week.
-        (datetime(2026, 10, 10, 6, 30, tzinfo=UTC), 1),
+        (datetime(2026, 10, 10, 6, 30, tzinfo=UTC), False),
     ],
 )
-def test_the_pool_size_follows_the_working_day_in_india_time(instant: datetime, size: int) -> None:
-    s = _settings(sandbox={**_SANDBOX, "pool_day_size": 5, "pool_night_size": 1})
+@pytest.mark.parametrize(
+    ("project_type", "day", "night"),
+    [(SandboxProjectType.PLAIN, 5, 1), (SandboxProjectType.CONNECTOR, 3, 2)],
+)
+def test_each_pools_size_follows_the_working_day_in_india_time(
+    instant: datetime, daytime: bool, project_type: SandboxProjectType, day: int, night: int
+) -> None:
+    """Each pool has its own sizes and shares the day."""
+    s = _settings(
+        sandbox={
+            **_SANDBOX,
+            "pool_day_size": 5,
+            "pool_night_size": 1,
+            "pool_connector_day_size": 3,
+            "pool_connector_night_size": 2,
+        }
+    )
     assert s.sandbox is not None
 
-    assert s.sandbox.pool_size_at(instant) == size
+    assert s.sandbox.pool_size_at(instant, project_type=project_type) == (
+        day if daytime else night
+    )
 
 
 def test_redis_rejects_unknown_nested_key() -> None:

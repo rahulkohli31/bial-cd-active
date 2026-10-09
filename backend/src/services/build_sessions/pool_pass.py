@@ -95,7 +95,7 @@ async def keep_the_pool(client: AcaSandboxClient, *, at: datetime) -> PoolPass:
     configured image's rows reach the size. A refused create, or a filling row past its deadline,
     ends the filling for this pass, and the alarm fires if the pool is left below its size."""
     config = client.config
-    target = config.pool_size_at(at)
+    target = config.pool_size_at(at, project_type=SandboxProjectType.PLAIN)
     members = await pool.the_ledger()
     overdue = [
         member
