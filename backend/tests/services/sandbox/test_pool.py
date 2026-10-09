@@ -32,6 +32,7 @@ import src.db.base as db_base
 from src.core.alarms import SANDBOX_POOL_BELOW_SIZE_EVENT
 from src.core.connectors import CONNECTORS
 from src.db.models.sandbox_pool import SandboxPoolMember, SandboxPoolState
+from src.db.models.sandbox_start import SandboxProjectType
 from src.services.build_sessions import pool_pass
 from src.services.lake.env import connector_env_names
 from src.services.redis import registry_key
@@ -72,6 +73,9 @@ DSN = "postgresql://bialrole_pool:POOLROLEPASSWORD@db.example:5432/bialapp_pool"
 SAS = "sv=2021-08-06&sr=c&sp=rwdl&sig=POOLSASSIGNATURE"
 
 pytestmark = pytest.mark.usefixtures("empty_sandbox_pool")
+
+PLAIN = SandboxProjectType.PLAIN
+CONNECTOR = SandboxProjectType.CONNECTOR
 
 
 class PoolAca(AcaControlPlane):
@@ -281,12 +285,19 @@ async def _ready(
     image_ref: str = IMAGE,
     since: datetime | None = None,
     token: str | None = "pool-bearer",
+    project_type: SandboxProjectType = PLAIN,
 ) -> str:
     """A container made for the pool and its ready row. Returns its name, whose host is
     `<name>.pool.example`."""
     name = a_fresh_sandbox_name()
     world.aca.made_for_the_pool(name, token=token)
-    await a_ready_pool_row(name, fqdn=f"{name}.pool.example", image_ref=image_ref, since=since)
+    await a_ready_pool_row(
+        name,
+        fqdn=f"{name}.pool.example",
+        image_ref=image_ref,
+        project_type=project_type,
+        since=since,
+    )
     return name
 
 
@@ -391,9 +402,11 @@ async def test_two_starts_at_once_never_receive_the_same_ready_container(
     asked = 0
     real_claim = pool.claim
 
-    async def counted_claim(image_ref: str) -> pool.ClaimedMember | None:
+    async def counted_claim(
+        image_ref: str, *, project_type: SandboxProjectType
+    ) -> pool.ClaimedMember | None:
         nonlocal asked
-        claimed = await real_claim(image_ref)
+        claimed = await real_claim(image_ref, project_type=project_type)
         asked += 1
         (first_claimed if asked == 1 else both_asked).set()
         return claimed
@@ -898,12 +911,12 @@ async def test_a_claim_prefers_the_current_image_and_falls_back_to_an_older_one(
     old = await _ready(world, image_ref=OLD_IMAGE, since=an_hour_ago)
     current = await _ready(world)
 
-    first = await pool.claim(IMAGE)
-    second = await pool.claim(IMAGE)
+    first = await pool.claim(IMAGE, project_type=PLAIN)
+    second = await pool.claim(IMAGE, project_type=PLAIN)
 
     assert first is not None and second is not None
     assert (first.name, second.name) == (current, old)
-    assert await pool.claim(IMAGE) is None
+    assert await pool.claim(IMAGE, project_type=PLAIN) is None
 
 
 async def test_a_claim_skips_a_row_another_claim_holds_rather_than_waiting_for_it(world) -> None:
@@ -916,13 +929,88 @@ async def test_a_claim_skips_a_row_another_claim_holds_rather_than_waiting_for_i
             sa.select(SandboxPoolMember.id).where(SandboxPoolMember.name == held).with_for_update()
         )
 
-        mine = await asyncio.wait_for(pool.claim(IMAGE), timeout=5)
-        nothing_left = await asyncio.wait_for(pool.claim(IMAGE), timeout=5)
+        mine = await asyncio.wait_for(pool.claim(IMAGE, project_type=PLAIN), timeout=5)
+        nothing_left = await asyncio.wait_for(pool.claim(IMAGE, project_type=PLAIN), timeout=5)
 
         await other_claim.rollback()
     assert mine is not None and mine.name == free
     assert nothing_left is None
     assert await _ledger() == {held: SandboxPoolState.READY, free: SandboxPoolState.CLAIMED}
+
+
+async def test_a_plain_claim_never_takes_a_connector_container(world) -> None:
+    """★ A connector container carries the lake's identity, which no plain project may hold. Both
+    rows are ones a claim that ignored the type would take, the current image first.
+
+    Mutation check: drop the type from the claim's select and it takes a connector row."""
+    old = await _ready(
+        world,
+        image_ref=OLD_IMAGE,
+        since=datetime.now(UTC) - timedelta(hours=1),
+        project_type=CONNECTOR,
+    )
+    current = await _ready(world, project_type=CONNECTOR)
+
+    assert await pool.claim(IMAGE, project_type=PLAIN) is None
+    assert await _ledger() == {old: SandboxPoolState.READY, current: SandboxPoolState.READY}
+
+
+async def test_a_connector_claim_takes_its_own_type_before_a_current_plain_one(world) -> None:
+    """The type outranks the image: an older-image connector container serves a flight-data start,
+    and a current-image plain one never does."""
+    connector = await _ready(
+        world,
+        image_ref=OLD_IMAGE,
+        since=datetime.now(UTC) - timedelta(hours=1),
+        project_type=CONNECTOR,
+    )
+    plain = await _ready(world)
+
+    claimed = await pool.claim(IMAGE, project_type=CONNECTOR)
+
+    assert claimed is not None and claimed.name == connector
+    assert await _ledger() == {connector: SandboxPoolState.CLAIMED, plain: SandboxPoolState.READY}
+
+
+async def test_a_claim_held_up_in_one_pool_neither_waits_nor_reaches_into_the_other(world) -> None:
+    """Another claim holds the only connector row: a connector claim answers `None` at once rather
+    than take the plain row, and a plain claim takes that row at the same moment."""
+    held = await _ready(world, project_type=CONNECTOR)
+    free = await _ready(world)
+    async with db_base.async_session_factory() as other_claim:
+        await other_claim.execute(
+            sa.select(SandboxPoolMember.id).where(SandboxPoolMember.name == held).with_for_update()
+        )
+
+        connector = await asyncio.wait_for(pool.claim(IMAGE, project_type=CONNECTOR), timeout=5)
+        plain = await asyncio.wait_for(pool.claim(IMAGE, project_type=PLAIN), timeout=5)
+
+        await other_claim.rollback()
+    assert connector is None
+    assert plain is not None and plain.name == free
+    assert await _ledger() == {held: SandboxPoolState.READY, free: SandboxPoolState.CLAIMED}
+
+
+async def test_each_pool_is_filled_to_its_own_size(world) -> None:
+    """Two plain containers in hand fill a plain pool of two and leave a connector pool of two
+    empty, so the connector's row is written, with its type.
+
+    Mutation check: count every type's rows toward the size and the connector fill is refused."""
+    await _ready(world)
+    await _ready(world)
+
+    refused = await pool.add_filling(a_fresh_sandbox_name(), IMAGE, project_type=PLAIN, up_to=2)
+    admitted = await pool.add_filling(
+        a_fresh_sandbox_name(), IMAGE, project_type=CONNECTOR, up_to=2
+    )
+
+    assert refused is None
+    assert admitted is not None
+    async with db_base.async_session_factory() as db:
+        written = await db.scalar(
+            sa.select(SandboxPoolMember.project_type).where(SandboxPoolMember.id == admitted)
+        )
+    assert written is CONNECTOR
 
 
 @pytest.mark.parametrize(
@@ -932,23 +1020,25 @@ async def test_the_ledger_holds_only_names_this_platform_mints(name: str) -> Non
     """Every path that deletes a container refuses a name of any other shape, so a pool
     container under one could never be cleaned up."""
     with pytest.raises(IntegrityError):
-        await a_ready_pool_row(name, fqdn="x.example", image_ref=IMAGE)
+        await a_ready_pool_row(name, fqdn="x.example", image_ref=IMAGE, project_type=PLAIN)
 
 
-async def test_the_ready_count_counts_only_ready_rows(world) -> None:
+async def test_the_ready_count_counts_only_ready_rows_of_the_type_asked_for(world) -> None:
     await _ready(world)
     await _ready(world)
-    claimed = await pool.claim(IMAGE)
+    await _ready(world, project_type=CONNECTOR)
+    claimed = await pool.claim(IMAGE, project_type=PLAIN)
     assert claimed is not None
 
-    assert await pool.ready_count() == 1
+    assert await pool.ready_count(project_type=PLAIN) == 1
+    assert await pool.ready_count(project_type=CONNECTOR) == 1
 
 
 async def test_retiring_touches_only_a_claimed_row(world) -> None:
     """A retire is how a failed claim's row leaves the pool, so it must never take a ready one."""
     first = await _ready(world, since=datetime.now(UTC) - timedelta(hours=1))
     second = await _ready(world)
-    claimed = await pool.claim(IMAGE)
+    claimed = await pool.claim(IMAGE, project_type=PLAIN)
     assert claimed is not None and claimed.name == first
     async with db_base.async_session_factory() as db:
         second_id = await db.scalar(
@@ -1223,7 +1313,9 @@ async def test_a_lost_replacement_does_not_fail_the_start_that_claimed(
     next pass makes up, and nothing else."""
     member = await _ready(world)
 
-    async def unreachable(name: str, image_ref: str, *, up_to: int) -> uuid.UUID:
+    async def unreachable(
+        name: str, image_ref: str, *, project_type: SandboxProjectType, up_to: int
+    ) -> uuid.UUID:
         raise OSError("the database went away")
 
     monkeypatch.setattr(pool, "add_filling", unreachable)
@@ -1433,7 +1525,7 @@ async def test_a_retire_takes_only_a_row_still_in_the_state_it_was_judged_in(wor
     """Every retire is a compare-and-set, which is what keeps one from deleting a container a
     start claimed after the pass looked."""
     member = await _ready(world)
-    claimed = await pool.claim(IMAGE)
+    claimed = await pool.claim(IMAGE, project_type=PLAIN)
     assert claimed is not None and claimed.name == member
 
     assert await pool.retire(claimed.id, was=SandboxPoolState.READY) is False

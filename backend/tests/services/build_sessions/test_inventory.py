@@ -12,6 +12,7 @@ import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.pending_teardown import PendingTeardown
+from src.db.models.sandbox_start import SandboxProjectType
 from src.services.build_sessions.inventory import FleetLister, take_sandbox_inventory
 from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_STATE
@@ -108,7 +109,12 @@ async def test_a_ready_container_the_pool_holds_is_not_reported_as_unregistered(
     """No registry names a pool container until a start claims it, and the runbook tells an
     operator to delete an unregistered one by hand."""
     member, orphan = a_fresh_sandbox_name(), a_fresh_sandbox_name()
-    await a_ready_pool_row(member, fqdn=f"{member}.example", image_ref="acr/img:v1")
+    await a_ready_pool_row(
+        member,
+        fqdn=f"{member}.example",
+        image_ref="acr/img:v1",
+        project_type=SandboxProjectType.PLAIN,
+    )
 
     inv = await take_sandbox_inventory(db_session, fake_redis, _Fleet([member, orphan]))
 

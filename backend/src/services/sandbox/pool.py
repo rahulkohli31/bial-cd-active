@@ -21,6 +21,7 @@ from src.db.models.sandbox_pool import (
     SandboxPoolState,
     sandbox_pool_state_enum,
 )
+from src.db.models.sandbox_start import SandboxProjectType, sandbox_project_type_enum
 
 # Held for the transaction of each fill's row, so two fills never both take the last place.
 _FILL_LOCK_KEY: Final = 0x50_4F_4F_4C_02  # "POOL" + 02
@@ -35,23 +36,28 @@ class ClaimedMember:
     fqdn: str
 
 
-async def ready_count() -> int:
+async def ready_count(*, project_type: SandboxProjectType) -> int:
     async with db_base.async_session_factory() as db:
         counted = await db.scalar(
             sa.select(sa.func.count())
             .select_from(SandboxPoolMember)
-            .where(SandboxPoolMember.state == SandboxPoolState.READY)
+            .where(
+                SandboxPoolMember.state == SandboxPoolState.READY,
+                SandboxPoolMember.project_type == project_type,
+            )
         )
     return int(counted or 0)
 
 
-async def claim(image_ref: str) -> ClaimedMember | None:
-    """Mark one ready container claimed and return it, or `None` when none is free. One made from
-    `image_ref` first; one from an older image only when none of those is ready."""
+async def claim(image_ref: str, *, project_type: SandboxProjectType) -> ClaimedMember | None:
+    """Mark one ready container of `project_type` claimed and return it, or `None` when none is
+    free. One made from `image_ref` first; one from an older image only when none of those is
+    ready. A row's type never changes, so only the select that picks the row asks for it."""
     one_ready = (
         sa.select(SandboxPoolMember.id)
         .where(
             SandboxPoolMember.state == SandboxPoolState.READY,
+            SandboxPoolMember.project_type == project_type,
             SandboxPoolMember.fqdn.is_not(None),
         )
         .order_by(
@@ -81,15 +87,18 @@ async def claim(image_ref: str) -> ClaimedMember | None:
     return ClaimedMember(id=row.id, name=row.name, fqdn=str(row.fqdn))
 
 
-async def add_filling(name: str, image_ref: str, *, up_to: int) -> uuid.UUID | None:
-    """Write the row of a container about to be made for the pool, before it waits for anything,
-    so every count of the pool sees it; `None`, writing nothing, while the filling and ready rows
-    made from `image_ref` already number `up_to`."""
+async def add_filling(
+    name: str, image_ref: str, *, project_type: SandboxProjectType, up_to: int
+) -> uuid.UUID | None:
+    """Write the row of a container about to be made for the `project_type` pool, before it waits
+    for anything, so every count of the pool sees it; `None`, writing nothing, while that pool's
+    filling and ready rows made from `image_ref` already number `up_to`."""
     in_hand = (
         sa.select(sa.func.count())
         .select_from(SandboxPoolMember)
         .where(
             SandboxPoolMember.image_ref == image_ref,
+            SandboxPoolMember.project_type == project_type,
             SandboxPoolMember.state.in_([SandboxPoolState.FILLING, SandboxPoolState.READY]),
         )
         .scalar_subquery()
@@ -97,6 +106,7 @@ async def add_filling(name: str, image_ref: str, *, up_to: int) -> uuid.UUID | N
     the_row = sa.select(
         sa.literal(name),
         sa.literal(image_ref),
+        sa.cast(sa.literal(project_type.value), sandbox_project_type_enum),
         sa.cast(sa.literal(SandboxPoolState.FILLING.value), sandbox_pool_state_enum),
         sa.func.now(),
     ).where(in_hand < up_to)
@@ -105,7 +115,9 @@ async def add_filling(name: str, image_ref: str, *, up_to: int) -> uuid.UUID | N
         member_id = (
             await db.execute(
                 sa.insert(SandboxPoolMember)
-                .from_select(["name", "image_ref", "state", "state_changed_at"], the_row)
+                .from_select(
+                    ["name", "image_ref", "project_type", "state", "state_changed_at"], the_row
+                )
                 .returning(SandboxPoolMember.id)
             )
         ).scalar_one_or_none()

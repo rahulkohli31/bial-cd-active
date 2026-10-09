@@ -27,6 +27,7 @@ from src.config import settings
 from src.core.alarms import SANDBOX_POOL_BELOW_SIZE_EVENT
 from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.sandbox_pool import SandboxPoolMember, SandboxPoolState
+from src.db.models.sandbox_start import SandboxProjectType
 from src.db.models.user import User
 from src.services.build_sessions import pool_pass
 from src.services.build_sessions.pool_pass import ROW_DEADLINE, PoolPass, keep_the_pool
@@ -260,7 +261,7 @@ async def test_an_image_change_is_swapped_in_new_before_old_without_dipping_belo
     ready_counts: list[int] = []
 
     async def the_ready_count() -> None:
-        ready_counts.append(await pool.ready_count())
+        ready_counts.append(await pool.ready_count(project_type=SandboxProjectType.PLAIN))
 
     keeper.aca.on_each_call = the_ready_count
 
@@ -386,7 +387,7 @@ async def test_a_claim_landing_between_the_passes_look_and_its_retire_keeps_its_
 
     async def a_start_claims_right_after_the_reading() -> list[SandboxPoolMember]:
         reading = await real_reading()
-        claimed = await pool.claim(IMAGE)
+        claimed = await pool.claim(IMAGE, project_type=SandboxProjectType.PLAIN)
         assert claimed is not None and claimed.name == rows[0]
         return reading
 

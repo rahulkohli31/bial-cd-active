@@ -1335,6 +1335,7 @@ class AcaSandboxClient(SandboxClient):
         not answer."""
         # Deferred: the ledger reaches `src.db`, which reaches `src.config`.
         from src.db.base import DB_UNREACHABLE
+        from src.db.models.sandbox_start import SandboxProjectType
         from src.services.sandbox import pool
 
         stopwatch = running_stopwatch()
@@ -1347,7 +1348,7 @@ class AcaSandboxClient(SandboxClient):
             stopwatch.missed("connector", ready_count=None)
             return None
         try:
-            ready = await pool.ready_count()
+            ready = await pool.ready_count(project_type=SandboxProjectType.PLAIN)
         except DB_UNREACHABLE:
             _log.warning("sandbox_pool_ledger_unreachable", exc_info=True)
             stopwatch.missed("claim_failed", ready_count=None)
@@ -1358,7 +1359,9 @@ class AcaSandboxClient(SandboxClient):
         try:
             for _ in range(_CLAIMS_PER_START):
                 try:
-                    member = await pool.claim(self._config.image_ref)
+                    member = await pool.claim(
+                        self._config.image_ref, project_type=SandboxProjectType.PLAIN
+                    )
                 except DB_UNREACHABLE:
                     _log.warning("sandbox_pool_ledger_unreachable", exc_info=True)
                     miss = "claim_failed"
@@ -1548,10 +1551,13 @@ class AcaSandboxClient(SandboxClient):
         Azure refuses, a container that never answers, or a fill cut short leaves no row, or a
         retiring one while the container may still stand. A ledger failure raises."""
         from src.db.models.sandbox_pool import SandboxPoolState
+        from src.db.models.sandbox_start import SandboxProjectType
         from src.services.sandbox import pool
 
         name = a_fresh_sandbox_name()
-        member_id = await pool.add_filling(name, self._config.image_ref, up_to=target)
+        member_id = await pool.add_filling(
+            name, self._config.image_ref, project_type=SandboxProjectType.PLAIN, up_to=target
+        )
         if member_id is None:
             return "at_target"
         token = secrets.token_urlsafe(_SUPERVISOR_TOKEN_BYTES)

@@ -19,6 +19,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from src.db.base import Base
 from src.db.mixins import UUIDv7PrimaryKeyMixin
 from src.db.models.pending_teardown import MAX_APP_NAME
+from src.db.models.sandbox_start import SandboxProjectType, sandbox_project_type_enum
 
 
 class SandboxPoolState(enum.StrEnum):
@@ -50,4 +51,9 @@ class SandboxPoolMember(UUIDv7PrimaryKeyMixin, Base):
     # The image the container was made from, which is how an image change is seen.
     image_ref: Mapped[str] = mapped_column(sa.Text, nullable=False)
     state: Mapped[SandboxPoolState] = mapped_column(sandbox_pool_state_enum, nullable=False)
+    # Which pool a ready or filling container is in. A start's own create and a held delete take
+    # the default, since nothing claims, counts or fills by the type of a claimed or retiring row.
+    project_type: Mapped[SandboxProjectType] = mapped_column(
+        sandbox_project_type_enum, nullable=False, server_default=sa.text("'plain'")
+    )
     state_changed_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)

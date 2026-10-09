@@ -211,7 +211,9 @@ async def test_a_relaunch_that_takes_a_ready_container_records_the_claim(
     aca.client._config = _config().model_copy(update={"pool_day_size": 1, "pool_night_size": 1})
     member = a_fresh_sandbox_name()
     fqdn = aca.control_plane.made_for_the_pool(member)
-    await a_ready_pool_row(member, fqdn=fqdn, image_ref="acr/img:latest")
+    await a_ready_pool_row(
+        member, fqdn=fqdn, image_ref="acr/img:latest", project_type=SandboxProjectType.PLAIN
+    )
     user, project_id = await _mk(db_session, "st-claim@rvaiglobal.com")
     await _saved(db_session, user, project_id, fake_storage)
 

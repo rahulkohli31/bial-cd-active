@@ -22,6 +22,7 @@ from src.core.alarms import SANDBOX_POOL_BELOW_SIZE_EVENT
 from src.db import base as db_base
 from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.sandbox_pool import SandboxPoolMember, SandboxPoolState
+from src.db.models.sandbox_start import SandboxProjectType
 from src.services.build_sessions.destroy import single_flight_lock
 from src.services.build_sessions.inventory import registered_app_names
 from src.services.redis import get_redis
@@ -138,7 +139,7 @@ async def keep_the_pool(client: AcaSandboxClient, *, at: datetime) -> PoolPass:
 
     outcome = PoolPass(
         target=target,
-        ready=await pool.ready_count(),
+        ready=await pool.ready_count(project_type=SandboxProjectType.PLAIN),
         filled=filled,
         retired=retired,
         deleted=deleted,
