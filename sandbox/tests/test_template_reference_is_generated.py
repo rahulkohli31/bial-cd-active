@@ -111,10 +111,9 @@ def test_the_hazard_the_line_comments_exist_for_is_still_in_the_body() -> None:
 
 
 def test_the_head_says_where_it_came_from_and_what_to_install() -> None:
-    """A generated file that does not say it is generated gets hand-edited, once, by someone who
-    had no way to know. The install lines are the other half: none of the four packages is in the
-    golden image, so the example does not compile until the reader runs one. The install command
-    comes first; the hand install is only for a workspace without it."""
+    """A generated file that does not say so gets hand-edited by someone who had no way to know.
+    None of the four packages is in the golden image, so the install command leads and the hand
+    install is only for a workspace without it."""
     # The head is everything down to the second box rule; the body starts after it.
     lines = _shipped().splitlines()
     rules = [n for n, line in enumerate(lines) if line.startswith("// \u2500")]

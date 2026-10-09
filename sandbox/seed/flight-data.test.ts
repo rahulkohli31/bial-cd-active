@@ -18,15 +18,15 @@
  * Runner: vitest — see package.json. `npm test` from this directory.
  */
 
-import { parquetReadObjects } from 'hyparquet'
+import { parquetMetadata, parquetReadObjects } from 'hyparquet'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { type Column, parquetFile } from './parquet-fixture'
 
-/** The lake the module reads in these tests: blob name to bytes, and every name downloaded. */
+/** The lake the module reads in these tests: blob name to bytes, and every range downloaded. */
 const lake = vi.hoisted(() => ({
   blobs: new Map<string, Uint8Array>(),
-  downloaded: [] as string[],
+  downloaded: [] as Array<{ name: string; offset: number; count: number }>,
 }))
 
 vi.mock('@azure/storage-blob', () => ({
@@ -40,7 +40,7 @@ vi.mock('@azure/storage-blob', () => ({
         },
         getBlobClient: (name: string) => ({
           async downloadToBuffer(offset: number, count: number): Promise<Buffer> {
-            lake.downloaded.push(name)
+            lake.downloaded.push({ name, offset, count })
             const bytes = lake.blobs.get(name) ?? new Uint8Array()
             return Buffer.from(bytes.subarray(offset, offset + count))
           },
@@ -528,7 +528,21 @@ describe('currentFlights', () => {
       [5, 8],
     ])
 
+    // The file's index is downloaded once, and after it only the named columns' chunks, group by
+    // group: no cache or whole-file copy sits in front of the downloads.
     const whole = parquetFile(COLUMNS, groups)
+    const named = new Set([...READ, FLIGHT_KEY, LOAD_TIME, FLIGHT_TIME])
+    const namedChunks = parquetMetadata(whole.slice().buffer).row_groups.flatMap((group) =>
+      group.columns.flatMap(({ meta_data: meta }) =>
+        meta && named.has(meta.path_in_schema[0] ?? '')
+          ? [{ offset: Number(meta.data_page_offset), count: Number(meta.total_compressed_size) }]
+          : [],
+      ),
+    )
+    const [index, ...afterIndex] = lake.downloaded
+    expect(index && index.offset + index.count).toBe(whole.byteLength)
+    expect(afterIndex.map(({ offset, count }) => ({ offset, count }))).toEqual(namedChunks)
+
     const everyRow = await parquetReadObjects({
       file: { byteLength: whole.byteLength, slice: (start, end) => whole.slice(start, end).buffer },
       columns: [...READ, FLIGHT_KEY, LOAD_TIME, FLIGHT_TIME],
@@ -576,6 +590,31 @@ describe('currentFlights', () => {
     )
   })
 
+  it('keeps one row per flight restated in a later file, the latest version whichever file holds it', async () => {
+    store(objectName('20260905'), [
+      [
+        version('URNO-1', '2026-09-05T02:00:00Z', 'SCHEDULED'),
+        version('URNO-2', '2026-09-06T23:00:00Z', 'LANDED'),
+      ],
+    ])
+    store(objectName('20260906'), [
+      [
+        version('URNO-1', '2026-09-06T02:00:00Z', 'AIRBORNE'),
+        version('URNO-2', '2026-09-05T02:00:00Z', 'SCHEDULED'),
+      ],
+    ])
+
+    const current = await currentFlights<Row>(READ)
+
+    expect(current).toHaveLength(2)
+    expect(statusByFlight(current)).toEqual(
+      new Map([
+        ['URNO-1', 'AIRBORNE'],
+        ['URNO-2', 'LANDED'],
+      ]),
+    )
+  })
+
   it('never downloads a zero-byte entry, and reads a file with no rows as no flights', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const failedLoad = objectName('20260903')
@@ -588,8 +627,9 @@ describe('currentFlights', () => {
     const current = await currentFlights<Row>(READ)
 
     expect(current.map((row) => row[FLIGHT_KEY])).toEqual(['URNO-1'])
-    expect(lake.downloaded).not.toContain(failedLoad)
-    expect(lake.downloaded).toContain(noRows)
+    const downloaded = lake.downloaded.map((download) => download.name)
+    expect(downloaded).not.toContain(failedLoad)
+    expect(downloaded).toContain(noRows)
     // The failed load is reported, once; the directory is not news.
     expect(warn).toHaveBeenCalledTimes(1)
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(failedLoad))

@@ -126,8 +126,9 @@ _THE_WHOLE_SCHEMA: Final = (
     "4. Filter, total and paginate on the server. The browser gets one page of rows or totals, "
     "and dropdowns are built from the same load.\n"
     "Plan the page against these rules before writing code.\n\n"
-    f"THE DATA MODULE. Run `node {FLIGHT_DATA_ADOPT_PATH}` from the app's folder "
-    f'(`run_command` with `["node", "{FLIGHT_DATA_ADOPT_PATH}"]`). It installs the four packages '
+    f"THE DATA MODULE. In a build chat, run `node {FLIGHT_DATA_ADOPT_PATH}` from the app's "
+    f'folder (`run_command` with `["node", "{FLIGHT_DATA_ADOPT_PATH}"]`); a planning chat cannot '
+    "run it and leaves it to the build. It installs the four packages "
     "at tested versions and writes `lib/flight-data.ts`, a tested module that follows every rule "
     "above and reads the store's address from the two environment variables the connector "
     "injects: build on it instead of writing a reader. If `lib/flight-data.ts` already exists it "

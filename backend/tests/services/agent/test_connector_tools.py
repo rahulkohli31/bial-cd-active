@@ -147,10 +147,8 @@ async def test_the_answer_states_its_own_completeness_and_points_at_the_worked_e
 
 
 async def test_the_answer_names_the_install_command_and_summarises_the_module() -> None:
-    """The install command saves the agent rewriting the reference file and its own reader, and
-    only this answer names it. The summary describes the CURRENT module, so it defers to an app's
-    own `lib/flight-data.ts` (which the command never overwrites), and the reference file is the
-    fallback for a workspace whose image predates the command."""
+    """Only this answer names the install command. The summary describes the current module, so it
+    defers to an app's own `lib/flight-data.ts` and falls back to the reference file."""
     answer = await connector_schema(_ctx(connected=(SYSTEM,)), SYSTEM.key)
     assert f"node {FLIGHT_DATA_ADOPT_PATH}" in answer
     assert f'["node", "{FLIGHT_DATA_ADOPT_PATH}"]' in answer
@@ -163,6 +161,14 @@ async def test_the_answer_names_the_install_command_and_summarises_the_module() 
     assert [line.split(".", 1)[0] for line in pitfalls.splitlines()[1:]] == [
         str(n) for n in range(1, 8)
     ]
+
+
+async def test_only_a_build_chat_is_asked_to_run_the_install_command() -> None:
+    """The answer reaches Plan too, whose read-only `run_command` refuses `node`, so an unscoped
+    instruction costs a planning chat a refused call."""
+    answer = await connector_schema(_ctx(connected=(SYSTEM,)), SYSTEM.key)
+    assert f"In a build chat, run `node {FLIGHT_DATA_ADOPT_PATH}`" in answer
+    assert "a planning chat cannot run it and leaves it to the build" in answer
 
 
 async def test_the_key_and_the_display_name_both_resolve() -> None:
