@@ -126,6 +126,12 @@ have, so they are the ones to start first.
   plane must be able to reach it over HTTPS. `backend/.env.example` names the setting, and it stays
   unset until the acceptance check below has passed.
 
+- **For releases through the pipeline:** an agent on the build host, inside the network; an identity
+  for the pipeline that can build, read and copy images in the registry, read the control plane's
+  settings with their secret values and change them, restart both web apps and read their container
+  logs, and update the worker in its container apps environment; and an approval environment,
+  created before the first run, because a run that finds none creates one with no approval.
+
 **Platform side:** the database server and its administrative access, the cache, the storage
 account, the registry, the container apps environment, and the build host.
 
@@ -155,9 +161,9 @@ setting: it needs a shared view of liveness and a shared store for the limiters.
 ### The portal and the control plane change together
 
 The edge resolves a preview's address, and who may open it, by asking the control plane, so the two
-are deployed as a pair in one quiet window. The order is the sandbox image first, which accepts both
-address shapes and is safe on its own, then the portal, then the control plane and the worker, back
-to back. A newer edge works against an older control plane, which never refuses a preview pass, so
+are deployed as a pair in one quiet window. The order is the portal, then the control plane and the
+worker, back to back, and the sandbox image moves with the control plane; it accepts both address
+shapes, so it is safe at that point. A newer edge works against an older control plane, which never refuses a preview pass, so
 previews stay open to anyone holding a link until the control plane restarts; an older edge against
 a newer control plane would show every preview as unavailable. Within one sweep of the worker
 starting, previews from before addresses carried an alias are written back and retired, and their
@@ -231,6 +237,12 @@ owed; the procedure is in `runbooks/reconcile-and-reclamation.md`.
 ## Proving a deployment worked
 
 Work outward, and do not stop at the first green result.
+
+The release pipeline proves less than this list. It confirms the migration reached the head, that
+each web app started on the new image and answers, and that the worker runs one healthy revision of
+it. Everything from check 3 on is still done by a person afterwards. When a run fails, its log
+names the step that stopped it; the rollback commands are printed near its start, and after a
+failed attempt the first attempt's are the ones that restore the old images.
 
 **1. The control plane is up and can reach its dependencies.** The health endpoint answers `ok`
 when the database and the cache both respond, and `unavailable` with a 503 when either does not.

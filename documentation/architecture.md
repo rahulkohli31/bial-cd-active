@@ -46,8 +46,9 @@ Keeping the two apart means the interface can be rebuilt and redeployed without 
 and that the API's container carries no toolchain it does not use at runtime.
 
 The build sandbox is not deployed by an operator. The control plane creates one — or takes a ready
-one made ahead of time — when someone starts work and deletes it when they are done; an operator
-only ever builds and publishes the image it is created from.
+one made ahead of time — when someone starts work and deletes it when they are done; a release only
+ever builds and publishes the image it is created from, and points the control plane and the worker
+at it.
 
 ```mermaid
 flowchart TD

@@ -42,6 +42,8 @@ variables:
 stages:
   - stage: Build
     displayName: Build the images
+    # A manual run on any other branch builds and deploys nothing.
+    condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
     jobs:
       - job: Build
         timeoutInMinutes: 90
@@ -60,36 +62,38 @@ stages:
               powerShellErrorActionPreference: continue
               powerShellIgnoreLASTEXITCODE: true
               inlineScript: |
-                $version = (Get-Content VERSION -TotalCount 1).Trim()
-
-                # Tagged by commit and version only. Both web apps redeploy themselves when
-                # `latest` moves, so nothing built here reaches production before the approval.
+                # Every tag here is new, and none is one production runs or a webhook watches, so
+                # nothing built here reaches production before the approval.
+                # `--no-logs`: az still waits for the build and fails with it, but streaming the
+                # build's log through a pipe on Windows dies on its first non-ANSI character.
                 Write-Host '##[section]Portal'
                 Set-Location portal
-                az acr build --registry $(registry) --image "$(portalRepository):$(Build.SourceVersion)" --image "$(portalRepository):$version" .
-                if ($LASTEXITCODE -ne 0) { throw 'The portal image did not build.' }
+                az acr build --registry $(registry) --no-logs --image "$(portalRepository):$(Build.SourceVersion)" .
+                if ($LASTEXITCODE -ne 0) { throw "The portal image did not build. Its log is under the registry's task runs." }
 
                 Write-Host '##[section]Control plane'
                 Set-Location ../backend
-                az acr build --registry $(registry) --image "$(backendRepository):$(Build.SourceVersion)" --image "$(backendRepository):$version" .
-                if ($LASTEXITCODE -ne 0) { throw 'The control plane image did not build.' }
+                az acr build --registry $(registry) --no-logs --image "$(backendRepository):$(Build.SourceVersion)" .
+                if ($LASTEXITCODE -ne 0) { throw "The control plane image did not build. Its log is under the registry's task runs." }
 
-                # The sandbox image is tagged with the git hash of `sandbox/`, so it is rebuilt only
-                # when that folder changes, and an unchanged one never moves the running sandboxes.
+                # The sandbox image is tagged with the git hash of `sandbox/`, so it is built only
+                # when that folder changes, and a tag production runs is never built over.
                 Write-Host '##[section]Sandbox'
                 Set-Location ../sandbox
                 $sandboxTag = 'tree-' + (git rev-parse HEAD:sandbox).Trim()
-                az acr repository show -n $(registry) --image "$(sandboxRepository):$sandboxTag" --output none 2>$null
-                if ($LASTEXITCODE -eq 0) {
+                $built = az acr repository show-tags -n $(registry) --repository $(sandboxRepository) --query "contains(@, '$sandboxTag')" -o tsv
+                if ($LASTEXITCODE -ne 0) { throw 'Could not read the sandbox image tags, so nothing was built.' }
+                if ($built -eq 'true') {
                   Write-Host "Unchanged: $(sandboxRepository):$sandboxTag is already built."
                 } else {
-                  az acr build --registry $(registry) --file Dockerfile.sandbox --image "$(sandboxRepository):$sandboxTag" --image "$(sandboxRepository):$version" .
-                  if ($LASTEXITCODE -ne 0) { throw 'The sandbox image did not build.' }
+                  az acr build --registry $(registry) --no-logs --file Dockerfile.sandbox --image "$(sandboxRepository):$sandboxTag" .
+                  if ($LASTEXITCODE -ne 0) { throw "The sandbox image did not build. Its log is under the registry's task runs." }
                 }
 
   - stage: Deploy
     displayName: Deploy to production
     dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
     jobs:
       - deployment: Deploy
         environment: citizen-prod
@@ -140,7 +144,8 @@ stages:
                       Write-Host "Worker         $liveWorker -> $login/$(backendRepository)@$backend"
                       Write-Host "Sandbox image  $liveRef -> $sandboxRef (changes: $sandboxChanges)"
                       Write-Host ''
-                      Write-Host 'Rollback, if a later step fails (control plane and worker first, then the portal):'
+                      Write-Host 'Rollback, if a later step fails (control plane and worker first, then the portal).'
+                      Write-Host 'These are the values before this attempt: after a failed attempt, use that attempt''s lines.'
                       Write-Host "  az acr import -n $(registry) --source $login/$(backendRepository)@$liveBackend -t $(backendRepository):latest --force"
                       Write-Host "  az webapp config appsettings set -g $(resourceGroup) -n $(backendApp) --settings SANDBOX__IMAGE_REF=$liveRef --output none"
                       Write-Host "  az containerapp update -n $(workerApp) -g $(resourceGroup) --image $liveWorker --set-env-vars SANDBOX__IMAGE_REF=$liveRef --output none"
@@ -180,7 +185,7 @@ stages:
                     powerShellIgnoreLASTEXITCODE: true
                     inlineScript: |
                       # Alembic loads the control plane's full settings, so it runs with the live ones.
-                      # Each value is masked in this job's log first: a settings error prints them.
+                      # Values of 8 characters or more are masked for the rest of this job.
                       $json = az webapp config appsettings list -g $(resourceGroup) -n $(backendApp) -o json
                       if ($LASTEXITCODE -ne 0) { throw 'Could not read the control plane settings.' }
                       foreach ($setting in (($json -join "`n") | ConvertFrom-Json)) {
@@ -190,8 +195,12 @@ stages:
                       }
 
                       Set-Location backend
-                      uv run --frozen --no-dev alembic upgrade head
-                      if ($LASTEXITCODE -ne 0) { throw 'The migration failed. Nothing else has changed.' }
+                      $output = uv run --frozen --no-dev alembic upgrade head 2>&1 | ForEach-Object { "$_" }
+                      $failed = $LASTEXITCODE -ne 0
+                      # A settings error quotes cut-down pieces of the values it was given, which no
+                      # mask matches, so those quotes are removed before anything is printed.
+                      $output -replace 'input_value=.*?, input_type=', 'input_value=(hidden), input_type=' | Write-Host
+                      if ($failed) { throw 'The migration failed. Nothing else has changed.' }
                       uv run --frozen --no-dev alembic current
 
                 - task: AzureCLI@3
@@ -203,9 +212,9 @@ stages:
                     powerShellErrorActionPreference: continue
                     powerShellIgnoreLASTEXITCODE: true
                     inlineScript: |
-                      $started = [DateTime]::UtcNow.ToString('s')
                       az acr import -n $(registry) --source "$(registry).azurecr.io/$(portalRepository)@$(portalDigest)" -t "$(portalRepository):latest" --force
                       if ($LASTEXITCODE -ne 0) { throw 'Could not move the portal to the new image. Nothing else has changed.' }
+                      $started = [DateTime]::UtcNow.ToString('s')
                       az webapp restart -g $(resourceGroup) -n $(portalApp)
 
                       # A health check cannot tell which image serves. App Service's own record of a
@@ -231,9 +240,9 @@ stages:
                     powerShellErrorActionPreference: continue
                     powerShellIgnoreLASTEXITCODE: true
                     inlineScript: |
-                      $started = [DateTime]::UtcNow.ToString('s')
                       az acr import -n $(registry) --source "$(registry).azurecr.io/$(backendRepository)@$(backendDigest)" -t "$(backendRepository):latest" --force
                       if ($LASTEXITCODE -ne 0) { throw 'Could not move the control plane to the new image. The new portal works against the old control plane.' }
+                      $started = [DateTime]::UtcNow.ToString('s')
                       if ('$(sandboxChanges)' -eq 'True') {
                         # Writing the setting restarts the app onto the new image. `--output none`
                         # because `appsettings set` prints every setting, secrets included.
