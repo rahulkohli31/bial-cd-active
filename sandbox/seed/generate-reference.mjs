@@ -103,7 +103,7 @@ const HEAD = `\
 `
 
 /** The head block, then the source line-commented. The one definition of the rule. */
-export function render(source) {
+function render(source) {
   const lines = source.split(/\r?\n/)
   // A text file ends in a newline, so the split leaves one empty element behind it. Dropping it
   // keeps the output from ending in a stray `//` and lets the file end in a newline of its own.
@@ -124,7 +124,7 @@ function pinned(dependencies) {
 
 /** The install command: the dependencies at their exact versions, and the source as one string
  * per line, each a JSON string literal so no character of the source can end it early. */
-export function adoptScript(source, dependencies) {
+function adoptScript(source, dependencies) {
   const listed = (items) => items.map((item) => `  ${JSON.stringify(item)},`).join('\n')
   return `\
 #!/usr/bin/env node
@@ -162,10 +162,12 @@ if (existsSync(TARGET)) {
   process.exit(1)
 }
 
+// Inside the platform's ten-minute limit on an install command: npm is stopped here, not left
+// running after that limit ends this script.
 const install = spawnSync(
   'npm',
   ['install', '--save-exact', '--no-audit', '--no-fund', '--loglevel=error', ...PACKAGES],
-  { stdio: 'inherit' },
+  { stdio: 'inherit', timeout: 540_000 },
 )
 if (install.status !== 0) {
   const reason = install.error ? \` (\${install.error.message})\` : ''

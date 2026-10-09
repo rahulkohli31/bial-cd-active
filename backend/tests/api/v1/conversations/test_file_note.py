@@ -188,18 +188,21 @@ async def test_each_change_to_the_files_writes_one_note_with_the_whole_current_l
     assert "No file is attached to this conversation now." in third
 
 
-async def test_the_latest_note_is_read_for_this_user_and_from_file_notes_only(
+async def test_the_latest_note_is_read_for_this_user_this_chat_and_from_file_notes_only(
     db_session,
 ) -> None:
     user = await UserFactory.create(db_session)
     other = await UserFactory.create(db_session)
     conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.BUILD)
+    sibling = await ConversationFactory.create(db_session, user.id, kind=ChatKind.BUILD)
 
-    async def _hidden(owner: uuid.UUID, text: str, kind: str) -> None:
+    async def _hidden(
+        owner: uuid.UUID, text: str, kind: str, chat_id: uuid.UUID = conv.id
+    ) -> None:
         await append_batch(
             db_session,
             user_id=owner,
-            conversation_id=conv.id,
+            conversation_id=chat_id,
             messages=[ModelRequest(parts=[UserPromptPart(content=text)])],
             entry_kind=MessageEntryKind.SYSTEM_EVENT,
             kind=ChatKind.BUILD,
@@ -209,10 +212,12 @@ async def test_the_latest_note_is_read_for_this_user_and_from_file_notes_only(
 
     await _hidden(other.id, "someone else's note", FILE_NOTE_KIND)
     await _hidden(user.id, "a deploy diagnosis", DEPLOY_DIAGNOSTIC_KIND)
+    await _hidden(user.id, "another chat's note", FILE_NOTE_KIND, sibling.id)
     assert await _latest_file_note(db_session, user_id=user.id, conversation_id=conv.id) is None
 
     await _hidden(user.id, "the first list", FILE_NOTE_KIND)
     await _hidden(user.id, "the second list", FILE_NOTE_KIND)
     await _hidden(other.id, "someone else's later note", FILE_NOTE_KIND)
+    await _hidden(user.id, "another chat's later note", FILE_NOTE_KIND, sibling.id)
     latest = await _latest_file_note(db_session, user_id=user.id, conversation_id=conv.id)
     assert latest == "the second list"

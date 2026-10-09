@@ -561,10 +561,12 @@ if (existsSync(TARGET)) {
   process.exit(1)
 }
 
+// Inside the platform's ten-minute limit on an install command: npm is stopped here, not left
+// running after that limit ends this script.
 const install = spawnSync(
   'npm',
   ['install', '--save-exact', '--no-audit', '--no-fund', '--loglevel=error', ...PACKAGES],
-  { stdio: 'inherit' },
+  { stdio: 'inherit', timeout: 540_000 },
 )
 if (install.status !== 0) {
   const reason = install.error ? ` (${install.error.message})` : ''

@@ -603,6 +603,15 @@ describe('currentFlights', () => {
     )
   })
 
+  it('reads a compressed file, which needs the decompressors the reader passes', async () => {
+    lake.blobs.set(
+      objectName('20260907'),
+      parquetFile(COLUMNS, [[version('URNO-1', '2026-09-07T02:00:00Z', 'LANDED')]], 'GZIP'),
+    )
+
+    expect(statusByFlight(await currentFlights<Row>(READ))).toEqual(new Map([['URNO-1', 'LANDED']]))
+  })
+
   it('never downloads a zero-byte entry, and reads a file with no rows as no flights', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const failedLoad = objectName('20260903')

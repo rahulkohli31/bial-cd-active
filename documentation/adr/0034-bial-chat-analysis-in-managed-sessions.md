@@ -36,8 +36,9 @@ reader over a file; the other runs Python against the chat's files. Both run one
 registered whether or not the chat holds a file, and the rules for using them are part of the chat's
 fixed instructions, so a file attached mid-chat changes neither and the cached prompt survives it.
 The files the chat holds now are named by a hidden note the platform adds to the conversation each
-time that list changes. A reply that never opens a file makes no call to the session at all; with
-no session service configured, a call answers that files cannot be opened right now.
+time that list changes. While no file is attached, neither tool reaches the session, and a reply
+that never opens a file makes no call to it at all; with no session service configured, a call
+answers that files cannot be opened right now.
 
 **Every BIAL Chat reply is bounded**: a ceiling on model requests, a wall clock, a time
 limit on each run of code, and one run at a time. Either ceiling ends the reply in one plain

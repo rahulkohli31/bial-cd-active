@@ -227,12 +227,12 @@ async def test_a_generic_run_asks_for_the_lowest_effort(
     assert settings["anthropic_thinking"]["type"] == "adaptive"
 
 
-async def test_with_no_runtime_and_no_file_the_file_tools_are_there_and_answer_unavailable(
+async def test_with_no_file_the_file_tools_are_there_and_the_reply_finishes(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
-    """No analysis runtime is bound here, which is a supported deployment. The two tools are
-    registered from the first message anyway, so a file arriving later changes nothing cached;
-    a call to one answers `unavailable` and the reply still finishes."""
+    """The two tools are registered from the first message, so a file arriving later changes
+    nothing cached. With no file, a call answers that nothing is attached without reaching the
+    analysis runtime (none is bound here), and the reply still finishes."""
     user, conversation = await _generic_chat(db_session)
     seen: dict[str, list[str]] = {}
 
@@ -255,7 +255,7 @@ async def test_with_no_runtime_and_no_file_the_file_tools_are_there_and_answer_u
             }
             return
         seen["returns"] = returns
-        yield "I can't open your files right now. Please try again in a few minutes."
+        yield "42"
 
     set_chat_model(FunctionModel(stream_function=_stream))
 
@@ -264,7 +264,7 @@ async def test_with_no_runtime_and_no_file_the_file_tools_are_there_and_answer_u
     await _settle(_fresh_engine, conversation.id)
 
     assert seen["tools"] == sorted([ATTACHMENT_READ_TOOL, ANALYSIS_RUN_TOOL])
-    assert seen["returns"][0].startswith("error: unavailable")
+    assert seen["returns"][0].startswith("No file this tool can open is attached")
     assert _fresh_engine.peek(conversation.id).status == "completed"
 
 

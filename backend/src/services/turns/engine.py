@@ -1011,8 +1011,8 @@ class _TurnState:
     #: request in that same turn has to reproduce, so a turn of many tool steps would re-break
     #: its own prefix at every step — strictly worse than the lapse the sentence answers.
     nudged_to_look: bool = False
-    #: How many model requests this turn has sent. Counted only on the arm that carries the
-    #: turn-scoped system message, because counting is how that arm's trigger fires.
+    #: How many model requests this turn has sent. Counted only on the Plan run, which carries
+    #: the turn-scoped system message, because counting is how its trigger fires.
     requests_sent: int = 0
 
     def read_the_app(self, reading: AppState) -> None:
@@ -1320,9 +1320,9 @@ class TurnEngine:
         change; only the plan-card path opts in (see the mutation guard in `_run_write`).
 
         `attachments` is the conversation's code-lane files. The ROUTE resolves them
-        because only the route holds the database session and the object store together; the
-        engine holds the container and the model's context, which is where both halves of the
-        delivery happen. None until someone attaches a spreadsheet."""
+        because only the route holds the database session and the object store together, and
+        it writes the hidden note that names them to the model; the engine places them in the
+        container or BIAL Chat's session. None until someone attaches a spreadsheet."""
         claim_conversation(conversation.id)
         try:
             await persist_user_turn()
@@ -1764,15 +1764,20 @@ class TurnEngine:
                         # nothing; with one it lands after the last of these, so everything
                         # ahead of the marker is byte-identical for every citizen.
                         instructions=static_instruction_parts(state.kind),
-                        # THE TURN-SCOPED SYSTEM MESSAGE, ON THIS ARM ONLY. A Plan chat cannot
+                        # THE TURN-SCOPED SYSTEM MESSAGE, FOR PLAN ONLY. A Plan chat cannot
                         # change the app, but it answers questions about one that other chats
-                        # keep changing, and nothing else on this arm reads the app.
-                        capabilities=[
-                            TurnScopedSystemMessage(
-                                should_send=state.another_request_and_still_no_reading,
-                                on_sent=state.note_the_nudge,
-                            )
-                        ],
+                        # keep changing, and nothing else on this arm reads the app. BIAL Chat
+                        # has no app to read.
+                        capabilities=(
+                            [
+                                TurnScopedSystemMessage(
+                                    should_send=state.another_request_and_still_no_reading,
+                                    on_sent=state.note_the_nudge,
+                                )
+                            ]
+                            if state.kind is ChatKind.PLAN
+                            else []
+                        ),
                         output_type=output_type,
                         usage=turn_usage,
                         event_stream_handler=self._event_handler(state),

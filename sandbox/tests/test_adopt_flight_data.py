@@ -28,6 +28,8 @@ SCRIPT = _SANDBOX / "scripts" / "adopt-flight-data.mjs"
 SEED = _SANDBOX / "seed"
 DOCKERFILE = _SANDBOX / "Dockerfile.sandbox"
 PROMPT_BLOCKS = _SANDBOX.parent / "backend" / "src" / "core" / "prompt_blocks.py"
+CONNECTOR_TOOLS = _SANDBOX.parent / "backend" / "src" / "services" / "agent" / "connector_tools.py"
+CONSTANTS = _SANDBOX.parent / "backend" / "src" / "services" / "orchestrator" / "constants.py"
 REFERENCE = _SANDBOX / "template" / "lib" / "flight-data.reference.ts"
 
 _NPM_STUB = """\
@@ -165,3 +167,33 @@ def test_the_image_puts_it_where_the_backend_and_the_reference_say() -> None:
 
     assert f'FLIGHT_DATA_ADOPT_PATH = "{destination}"' in PROMPT_BLOCKS.read_text(encoding="utf-8")
     assert f"node {destination}" in REFERENCE.read_text(encoding="utf-8")
+
+
+def test_every_name_the_schema_answer_gives_the_module_is_one_it_exports() -> None:
+    """The schema answer summarises the module instead of the agent opening it, so a rename in
+    the seed would leave the agent importing a name that is gone. Column names count as the
+    values of the exported column constants."""
+    answer = CONNECTOR_TOOLS.read_text(encoding="utf-8")
+    section = answer[
+        answer.index("What the current version of the module exports") : answer.index(
+            "The seven pitfalls it handles"
+        )
+    ]
+    claimed = set(re.findall(r"`([A-Za-z_]\w*)", section))
+    module = (SEED / "flight-data.ts").read_text(encoding="utf-8")
+    exported = set(re.findall(r"^export (?:async )?(?:function|const|type) (\w+)", module, re.M))
+    column_values = set(re.findall(r"^export const \w+ = '(\w+)'", module, re.M))
+
+    assert len(claimed & exported) >= 15, claimed
+    assert claimed <= exported | column_values, claimed - exported - column_values
+
+
+def test_npm_is_stopped_before_the_platform_ends_the_command() -> None:
+    """The platform's cut kills `node` alone, so an npm still running then would carry on with no
+    parent; the script's own limit has to fall first."""
+    script_ms = int(re.search(r"timeout: ([\d_]+)", SCRIPT.read_text(encoding="utf-8"))[1])
+    match = re.search(
+        r"^RUN_COMMAND_SLOW_TIMEOUT_S = (\d+)", CONSTANTS.read_text(encoding="utf-8"), re.M
+    )
+    assert match is not None
+    assert script_ms < int(match[1]) * 1000

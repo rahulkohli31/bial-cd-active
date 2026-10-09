@@ -916,10 +916,10 @@ _PROJECT_SHAPES = {
 _PINNED_PROJECT_DIGESTS = {
     (ChatKind.PLAN, "bare"): "a41533ca3dae98348080ec5f02c93867258eb56047c021048cfa4143ed24826a",
     (ChatKind.PLAN, "rich"): "a47473065af840edb50f8e306d5c95523dd27353647fc1b08bb9db7d83e2fc49",
-    (ChatKind.BUILD, "bare"): "8d7a08a97226719c30170769098e09df2afe2da1ceaf15e6d2349424fa613f96",
-    (ChatKind.BUILD, "rich"): "a8d63fa2a1ded3bddd91a42202fc8502500ec7fc8517cbb1025bc14152b1102f",
+    (ChatKind.BUILD, "bare"): "d212b5072362972d508ca57e23566995dc65e28659dfe80bb9a5879014a35981",
+    (ChatKind.BUILD, "rich"): "573d465c4c82a717e2bb559b404184b32973af84b8144d6c123c2b1e3f903b0c",
 }
-_PINNED_GENERIC_DIGEST = "0ca936e961be185d9a000f4b2d3f24d8a122185e8c540d8be8c07b5fb132a937"
+_PINNED_GENERIC_DIGEST = "0fba3c9f78a6a5479ec13e58ad92c9f50144573e334b814fad4712e9d0c36539"
 _CLAUSE = (
     "you cannot change their files, and you can open a file or run code only through a tool "
     "you have been given."

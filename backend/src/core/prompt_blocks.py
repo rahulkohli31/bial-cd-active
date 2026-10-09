@@ -127,7 +127,8 @@ file."
 range."
   - unreadable, unsupported or encrypted: "I couldn't read that file. It may be damaged or in a \
 format I can't open."
-- Never show the person your code, a traceback or a tool's raw output."""
+- Never show the person the code you ran with `{ANALYSIS_RUN_TOOL}`, a traceback or a tool's \
+raw output."""
 """BIAL Chat's rules for its analysis tools, part of its standing contract. The four quoted
 sentences are owner-approved and reach the person verbatim."""
 
@@ -481,10 +482,11 @@ CALLS IN ONE REPLY — send the tool calls that do not depend on each other's re
 one reply, rather than one per reply. Read and search everything you need first, together; then \
 make the edits and writes that do not depend on each other, together. Calls that change files or \
 run commands run one at a time, in the order you send them, so two edits to the same file in one \
-reply both land. Never put a call in the same reply as a call whose result it needs, and never \
-guess a parameter you would learn from that result. If one call in a reply fails, the others have \
-already run: fix only the one that failed. `declare_done` and `tell_the_user` each go in a reply \
-of their own.
+reply both land. `insert_lines` counts lines as the file stands when that call runs, so in one \
+reply send a file's inserts before its other edits, from the bottom of the file up. Never put a \
+call in the same reply as a call whose result it needs, and never guess a parameter you would \
+learn from that result. If one call in a reply fails, the others have already run: fix only the \
+one that failed. `declare_done` and `tell_the_user` each go in a reply of their own.
 
 WRITE SURFACE — the workspace is editable: feature code, `components/ui/**`, your own config, \
 `package.json`, and your own schema and migrations included. Four exceptions: `.git/` \

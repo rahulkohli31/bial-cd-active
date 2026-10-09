@@ -3,33 +3,24 @@
 WHY THIS EXISTS. `sandbox/template/lib/flight-data.reference.ts` is a rendering of
 `sandbox/seed/flight-data.ts`: the head block, then every source line behind a `// `. The source
 lives outside the template because the template deliberately pre-installs none of the four
-packages the example imports, so a live import there would not compile and an app that reads no
-flight data would stop being byte-identical to today. That split buys real verification — the
-source is typechecked under the template's own `strict` settings and unit-tested next door — and
-it costs exactly one thing: a generator whose output nobody regenerates drifts into a lie that
-still passes. This file is what stops that.
+packages the example imports, so a live import there would not compile. That split buys real
+verification — the source is typechecked under the template's own `strict` settings and
+unit-tested next door — and costs one thing: a generator whose output nobody regenerates drifts
+into a lie that still passes.
 
 The second failure it guards is sharper. The template's `lint` script IS `tsc --noEmit` across the
-whole tree, so a reference file that failed to comment out cleanly would fail EVERY citizen's lint
-at once, in apps that never asked for flight data. An earlier hand-written draft did exactly that:
-it was wrapped in one `/* ... */` block and the JSDoc blocks inside closed the wrapper early.
+whole tree, so a reference file that failed to comment out cleanly — a `/* ... */` wrapper closed
+early by the JSDoc inside it — would fail EVERY citizen's lint at once.
 
-WHICH IMPLEMENTATION OF THE COMMENTING RULE THIS TEST TRUSTS, AND WHY. `generate-reference.mjs` is
-the only implementation. This test does NOT re-derive the rule in Python: two implementations of
-one rule drift, and the drift would be invisible precisely because both sides would still agree
-with themselves. It shells out to `node generate-reference.mjs --stdout`, which writes the exact
-bytes it would write to the file and touches nothing, and compares. The generator's second output,
-the image's install command `sandbox/scripts/adopt-flight-data.mjs`, is compared the same way
-through `--stdout adopt`. That needs `node` and nothing
-else — no Docker, no `npm install`, no `node_modules` (the generator imports only `node:fs`,
-`node:path` and `node:url`). A missing `node` is a clean skip, as with Docker elsewhere in this
-harness.
+THE TEST TRUSTS ONE IMPLEMENTATION OF THE COMMENTING RULE. It does not re-derive the rule in
+Python, where two implementations would drift while each agreed with itself. It shells out to
+`node generate-reference.mjs --stdout` (and `--stdout adopt` for the image's install command,
+`sandbox/scripts/adopt-flight-data.mjs`), which prints the exact bytes it would write, and
+compares. That needs `node` and nothing else; a missing `node` is a clean skip.
 
-The cost of that skip is covered rather than accepted: the structural checks below run
-unconditionally on the shipped bytes alone and assert the property that actually breaks other
-people's builds — every body line is a line comment, and there is no block-comment wrapper
-anywhere. So a box with no Node still catches the failure that would ship; only the
-currency comparison waits for a box that has one.
+The structural checks below run without Node, on the shipped bytes alone: every body line is a
+line comment and there is no block-comment wrapper anywhere. So a box with no Node still catches
+the failure that would ship; only the currency comparison waits for one that has it.
 """
 
 from __future__ import annotations

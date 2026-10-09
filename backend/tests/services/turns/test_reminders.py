@@ -522,6 +522,35 @@ async def test_the_sentence_never_reaches_a_stored_row(
     )
 
 
+async def test_a_bial_chat_reply_is_never_handed_the_sentence(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """BIAL Chat shares Plan's run arm but has no app, so the sentence could only mislead it.
+
+    Mutation check: arm `TurnScopedSystemMessage` for every kind on that arm and this goes red."""
+    model, seen = _capturing([[("run_python", '{"code": "print(6 * 7)"}')], "42."], inline=True)
+    user = await UserFactory.create(db_session)
+    conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.GENERIC)
+    await _fresh_engine.start_turn(
+        conversation=conv,
+        user_id=user.id,
+        prompt="what is six times seven?",
+        history=[],
+        prompt_context=_CTX,
+        app_id=None,
+        project_id=None,
+        manager=SessionManager(),
+        model=model,
+        session_factory=session_factory,
+        persist_user_turn=_noop_persist,
+        sandbox_client=FakeSandboxClient(),
+    )
+    await _settle(_fresh_engine, conv.id)
+
+    assert len(seen) == 2, f"the script makes two requests; the model saw {len(seen)}"
+    assert [_system_parts(request) for request in seen] == [[], []]
+
+
 async def test_a_build_turn_is_handed_neither_the_sentence_nor_its_pin(
     _fresh_engine, db_session, session_factory
 ) -> None:

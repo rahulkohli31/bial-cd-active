@@ -424,6 +424,21 @@ async def test_a_file_the_session_does_not_hold_is_named_and_never_reaches_it(
     assert session.tool_calls == 1
 
 
+async def test_run_python_in_a_chat_with_no_file_never_reaches_the_runtime(
+    runtime, storage
+) -> None:
+    """Every BIAL Chat carries the tool, so a chat with nothing attached starts no session."""
+    session = AnalysisSession(
+        conversation_id=uuid.uuid4(), files=(), storage=storage, runtime=runtime
+    )
+
+    out = await _call(session, "run_python", code="print(6 * 7)")
+
+    assert "No file this tool can open is attached" in out
+    assert runtime.calls == []
+    assert session.tool_calls == 1
+
+
 async def test_a_long_description_comes_back_whole(runtime, storage) -> None:
     """A workbook of a dozen ordinary sheets describes itself in well over 20,000 characters."""
     manifest = json.dumps({"ok": True, "file": "q3.xlsx", "sheets": ["x" * 60] * 1_000})

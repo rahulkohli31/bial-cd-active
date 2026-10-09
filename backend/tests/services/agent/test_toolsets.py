@@ -422,12 +422,14 @@ async def test_plan_and_build_ignore_an_analysis_session(kind: ChatKind) -> None
     assert set(await _tools_of(surface)) == set(await _tools_of(without))
 
 
-async def test_plans_attachment_read_still_runs_alongside_other_calls() -> None:
+async def test_plans_attachment_reads_run_one_at_a_time() -> None:
+    """Plan is told to send its reads together, and each one is a reader process beside the
+    dev server in the same container."""
     surface = toolsets_for_kind(
         ChatKind.PLAN, workspace_from_read_deps, reader_of=_reader_from_read_deps
     )
 
-    assert (await _tools_of(surface))["read_attachment"].tool_def.sequential is False
+    assert (await _tools_of(surface))["read_attachment"].tool_def.sequential is True
 
 
 async def test_the_kinds_differ_by_which_toolsets_they_are_handed_and_by_nothing_else() -> None:

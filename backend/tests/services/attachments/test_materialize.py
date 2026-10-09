@@ -392,8 +392,8 @@ def test_the_listing_names_the_file_and_both_of_its_addresses() -> None:
     anything. The third half — do not write your own parser — is standing text and lives with
     the rest of the rules in `agent/mode_prompts.ATTACHMENT_RULES`.
 
-    ★ EVERY FILE GETS TWO ADDRESSES because Build has no `read_attachment` tool (R15: it runs,
-    and may edit, the reader through `run_command`), and `run_command` executes inside the app
+    ★ EVERY FILE GETS TWO ADDRESSES because Build has no `read_attachment` tool (it runs, and
+    may edit, the reader through `run_command`), and `run_command` executes inside the app
     folder — where `.attachments/` does not exist. The listing is kind-blind by design, so it
     gives both and the rules say which is for what.
 

@@ -1397,15 +1397,16 @@ def _capturing_model() -> tuple[FunctionModel, list[dict[str, Any]]]:
     return FunctionModel(stream_function=_stream), seen
 
 
-async def test_a_plan_run_asks_for_adaptive_thinking_at_the_shared_effort(
-    _fresh_engine, db_session, session_factory
+@pytest.mark.parametrize("kind", [ChatKind.PLAN, ChatKind.BUILD], ids=lambda kind: kind.value)
+async def test_plan_and_build_runs_ask_for_adaptive_thinking_at_the_shared_effort(
+    _fresh_engine, db_session, session_factory, kind: ChatKind
 ) -> None:
-    """Asserted on what the run HANDED the model, not on the constant: a settings site that
-    stopped passing the thinking knobs altogether would still read the constant in
-    `constants.py` while every turn ran with reasoning off."""
+    """Asserted on what each run HANDED the model, not on the constant. The Build fork has its
+    own model-settings site, so a change made at one site and not the other would otherwise go
+    unnoticed. The Build model writes nothing, so the self-heal loop never starts."""
     engine = _fresh_engine
     model, seen = _capturing_model()
-    _, conv, _ = await _start(engine, db_session, session_factory, model, kind=ChatKind.PLAN)
+    _, conv, _ = await _start(engine, db_session, session_factory, model, kind=kind)
     await _settle(engine, conv.id)
 
     state = engine.peek(conv.id)
@@ -1421,28 +1422,6 @@ async def test_a_plan_run_asks_for_adaptive_thinking_at_the_shared_effort(
     assert ADAPTIVE_THINKING == {"type": "adaptive", "display": "summarized"}
 
 
-async def test_a_build_run_asks_for_the_same_thinking_and_effort(
-    _fresh_engine, db_session, session_factory
-) -> None:
-    """The Build fork runs its own node loop with its own model-settings site, which is exactly
-    how the two could drift: a change made in one place and not the other is invisible until a
-    build starts thinking like a chat.
-
-    The model here reads nothing and writes nothing, so the mutation guard returns before the
-    verify pass — an ordinary chat turn that happened to hold the write tools. That keeps this
-    test about the settings and not about the self-heal loop, which `test_write_turn.py` owns."""
-    engine = _fresh_engine
-    model, seen = _capturing_model()
-    _, conv, _ = await _start(engine, db_session, session_factory, model, kind=ChatKind.BUILD)
-    await _settle(engine, conv.id)
-
-    state = engine.peek(conv.id)
-    assert state is not None and state.status == "completed"
-    assert len(seen) == 1
-    assert seen[0]["anthropic_thinking"] == ADAPTIVE_THINKING
-    assert seen[0]["anthropic_effort"] == PLAN_AND_BUILD_EFFORT
-
-
 async def test_both_runs_ask_the_provider_to_cache_the_prefix_they_resend(
     _fresh_engine, db_session, session_factory
 ) -> None:
@@ -1450,7 +1429,7 @@ async def test_both_runs_ask_the_provider_to_cache_the_prefix_they_resend(
 
     The two settings sites already drifted once — build had all three from the day it was written
     and plan had none — so both are asserted here rather than one each, and on what the run HANDED
-    the model rather than on the constants, exactly as the two effort tests above do.
+    the model rather than on the constants, exactly as the effort test above does.
 
     Mutation check: drop any one of the three lines from either site and this goes red naming the
     arm and the key.
