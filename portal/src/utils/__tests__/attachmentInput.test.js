@@ -120,7 +120,7 @@ describe('resolveMediaType', () => {
 // asserted in `attachmentInput-no-converter.test.js`, against the real module, not here.
 
 describe('ACCEPT_ATTR', () => {
-  it('offers both lanes and their extension tokens, and nothing needing conversion', () => {
+  it('offers both lanes and their extension tokens, and not plain text', () => {
     expect(ACCEPT_ATTR).toContain('image/png')
     expect(ACCEPT_ATTR).toContain('application/pdf')
     expect(ACCEPT_ATTR).toContain('text/csv')
@@ -130,9 +130,8 @@ describe('ACCEPT_ATTR', () => {
     for (const ext of ['.csv', '.tsv', '.xlsx', '.docx', '.pptx']) {
       expect(ACCEPT_ATTR).toContain(ext)
     }
-    // A withdrawal and two legacy formats: absent, so the picker never offers them.
+    // A withdrawal: absent, so the picker never offers it.
     expect(ACCEPT_ATTR).not.toContain('.txt')
-    expect(ACCEPT_ATTR).not.toContain('.doc,')
   })
 
   it('★ THE AGREEMENT: every extension this composer resolves, the picker also offers', () => {

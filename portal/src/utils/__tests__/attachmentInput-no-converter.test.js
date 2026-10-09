@@ -23,7 +23,6 @@ const EXCEL_MEDIA_TYPE =
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
 const file = (name, type, size = 1024) => ({ name, type, size })
-const UNSUPPORTED = /isn't supported/
 
 describe('formats are admitted by what code can read, never by a conversion step', () => {
   it('offers the three OOXML types and their extension tokens', () => {
@@ -41,19 +40,39 @@ describe('formats are admitted by what code can read, never by a conversion step
     expect(ACCEPT_ATTR).toContain('image/png')
   })
 
-  it('still refuses the legacy binary formats, which no reader here can open', () => {
-    // The advice must not send a citizen to a format that is also refused, so it is read
-    // separately from the echoed name.
-    for (const f of [
-      file('old.ppt', 'application/vnd.ms-powerpoint'),
-      file('legacy.doc', 'application/msword'),
-      file('sheet.xls', 'application/vnd.ms-excel'),
-      file('deck.ppt', ''),
+  it('still refuses the legacy binary formats, naming the file and the format to re-save it as', () => {
+    // Nothing here opens a pre-2007 file, so they stay refused. The way forward is followable
+    // because the OOXML twin is accepted.
+    for (const [f, message] of [
+      [
+        file('old.ppt', 'application/vnd.ms-powerpoint'),
+        '"old.ppt" is an older PowerPoint format. Open it in PowerPoint, re-save it as .pptx, and attach it again.',
+      ],
+      [
+        file('legacy.doc', 'application/msword'),
+        '"legacy.doc" is an older Word format. Open it in Word, re-save it as .docx, and attach it again.',
+      ],
+      [
+        file('sheet.xls', 'application/vnd.ms-excel'),
+        '"sheet.xls" is an older Excel format. Open it in Excel, re-save it as .xlsx, and attach it again.',
+      ],
+      [
+        file('deck.ppt', ''),
+        '"deck.ppt" is an older PowerPoint format. Open it in PowerPoint, re-save it as .pptx, and attach it again.',
+      ],
     ]) {
-      const res = validateAttachmentFiles([f], 0)
-      expect(res.error, `"${f.name}" was accepted`).toMatch(UNSUPPORTED)
-      const advice = res.error.replace(/^"[^"]*"/, '')
-      expect(advice).not.toMatch(/save as|\.doc\b|\.ppt\b|\.xls\b/i)
+      expect(validateAttachmentFiles([f], 0)).toEqual({ error: message })
+    }
+  })
+
+  it('reads only the last extension, in any case', () => {
+    expect(validateAttachmentFiles([file('REPORT.DOC', '')], 0)).toEqual({
+      error: '"REPORT.DOC" is an older Word format. Open it in Word, re-save it as .docx, and attach it again.',
+    })
+    // `.doc` inside a longer name, or no real extension at all, is not a legacy file.
+    expect(validateAttachmentFiles([file('report.doc.docx', '')], 0)).toEqual({ ok: true })
+    for (const name of ['archive.doc.zip', 'doc', 'report.doc.']) {
+      expect(validateAttachmentFiles([file(name, '')], 0).error, name).toMatch(/isn't supported/)
     }
   })
 

@@ -516,12 +516,22 @@ describe('★ the attachment pipeline stays ours', () => {
   it('refuses a format this platform does not accept, in our words', async () => {
     const onUrgent = vi.fn()
     draw({ onUrgent })
-    // A `.ppt`, not a `.pptx`: the modern deck is accepted now — code reads it in the sandbox —
-    // while the pre-2007 binary format stays refused, because opening one would mean hosting a
-    // converter, which is a standing scope boundary.
-    drop(new File(['x'], 'slides.ppt', { type: 'application/vnd.ms-powerpoint' }))
+    // A zip: no allowlist here has ever accepted one, so the library's own accept filter turns it
+    // away before our adapter runs, and that arm carries no file name.
+    drop(new File(['x'], 'archive.zip', { type: 'application/zip' }))
     await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
     expect(onUrgent.mock.calls[0]?.[0]).toMatch(/isn't supported|is not supported/i)
+  })
+
+  it('refuses a legacy Office file by name rather than with the nameless generic sentence', async () => {
+    // Mutation receipt: take `.ppt` out of the accept string and the library's filter turns it away
+    // first, so this goes red on the generic sentence.
+    const onUrgent = vi.fn()
+    draw({ onUrgent })
+    drop(new File(['x'], 'slides.ppt', { type: 'application/vnd.ms-powerpoint' }))
+    await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
+    expect(onUrgent.mock.calls[0]?.[0]).toMatch(/^"slides\.ppt" is an older PowerPoint format/)
+    expect(screen.queryByTestId('composer-chips')).toBeNull()
   })
 
   describe('★ every refusal reaches the citizen on every path', () => {
@@ -534,7 +544,7 @@ describe('★ the attachment pipeline stays ours', () => {
     // our own adapter throws on SIZE and on the per-message cap (`adapter-error`, carrying our
     // sentence). A switch that handles one and returns on the other is silent for half of what a
     // citizen can do, and that silence is indistinguishable from the file having been accepted.
-    const badFormat = () => new File(['x'], 'slides.ppt', { type: 'application/vnd.ms-powerpoint' })
+    const badFormat = () => new File(['x'], 'archive.zip', { type: 'application/zip' })
     const tooBig = () =>
       new File([new Uint8Array(IMAGE_MAX_MB * 1024 * 1024 + 1)], 'huge.png', { type: 'image/png' })
 
