@@ -79,8 +79,21 @@ ANALYSIS_RUN_TOOL = "run_python"
 """BIAL Chat's one way to compute over an attached file, named here for the same reason as the
 reader above: the tool registers it, the prompt names it, and the transcript labels its step."""
 
+FILE_NOTE_HEADING = "FILES ATTACHED NOW"
+"""The first line of the note the platform writes into a conversation each time its attached
+files change. The file rules name it, so the model can tell the latest list apart."""
+
+LATEST_FILE_NOTE_RULE = f"""\
+The platform writes a note headed {FILE_NOTE_HEADING} into the conversation each time the \
+attached files change, and the latest one lists the files attached now. A file not in it has been \
+removed and cannot be opened, but what you found in it earlier still stands. With no such note, \
+no file is attached. Pictures and PDFs are not listed: they reach you inside the message that \
+carried them."""
+"""How the model finds the current files, in every chat kind's file rules."""
+
 ANALYSIS_RULES = f"""\
-HOW TO WORK WITH THESE FILES
+HOW TO WORK WITH ATTACHED FILES
+- {LATEST_FILE_NOTE_RULE}
 - Read a file with `{ATTACHMENT_READ_TOOL}` before computing on it, then compute with \
 `{ANALYSIS_RUN_TOOL}`, opening the file in your code by the same path.
 - Start from what the reader reports, and load only the sheets or columns the question needs.
@@ -90,8 +103,6 @@ searched only when you did.
 - The Python session can be renewed between replies, so values from an earlier reply may be gone: \
 recompute rather than assume.
 - If a file is reported missing, read it again with `{ATTACHMENT_READ_TOOL}`.
-- The list above shows the files attached now. One the person removed is not in it and cannot be \
-opened, but what you found in it earlier still stands.
 - Answer in text; tables are fine. Asked for a chart or a file to download, say this chat answers \
 in text only.
 - Never state what a file contains unless you have read it.
@@ -106,8 +117,8 @@ range."
   - unreadable, unsupported or encrypted: "I couldn't read that file. It may be damaged or in a \
 format I can't open."
 - Never show the person your code, a traceback or a tool's raw output."""
-"""BIAL Chat's rules for its analysis tools, sent after the file listing only when those tools
-are registered. The four quoted sentences are owner-approved and reach the person verbatim."""
+"""BIAL Chat's rules for its analysis tools, part of its standing contract. The four quoted
+sentences are owner-approved and reach the person verbatim."""
 
 APPLY_SCHEMA_CHANGE_TOOL = "apply_schema_change"
 """The ONE sanctioned channel for a schema change, and the ONE spelling of it.

@@ -95,7 +95,6 @@ from src.api.v1.conversations.schemas import (
 from src.config import settings
 from src.core.error_signature import error_signature
 from src.core.integrity_types import BaselineIdentity
-from src.core.prompt_blocks import ANALYSIS_RUN_TOOL, ATTACHMENT_READ_TOOL
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.harness_counter import HarnessCounter
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
@@ -104,7 +103,7 @@ from src.db.models.user import User
 from src.services.agent.agent import ChatDeps, chat_agent, static_instruction_parts
 from src.services.agent.attachment_tools import AttachmentReader
 from src.services.agent.capabilities import TurnScopedSystemMessage
-from src.services.agent.mode_prompts import PromptContext, analysis_listing
+from src.services.agent.mode_prompts import PromptContext
 from src.services.agent.read_tools import (
     LiveSandboxWorkspace,
     ReadOnlyWorkspace,
@@ -1199,26 +1198,12 @@ def _reader_of(ctx: RunContext[ChatDeps]) -> AttachmentReader:
 
 
 def _analysis_of(ctx: RunContext[ChatDeps]) -> AnalysisSession:
-    """The ChatDeps accessor BIAL Chat's analysis tools resolve through. Fail-first: the tools are
-    registered only when the reply carries a session handle."""
+    """The ChatDeps accessor BIAL Chat's analysis tools resolve through. Fail-first: every BIAL
+    Chat reply carries a session handle."""
     analysis = ctx.deps.analysis
     if analysis is None:
         raise RuntimeError("analysis tool resolved on a reply with no analysis session")
     return analysis
-
-
-_ANALYSIS_TOOLS: Final = frozenset({ATTACHMENT_READ_TOOL, ANALYSIS_RUN_TOOL})
-
-
-def _has_called_analysis(history: list[ModelMessage]) -> bool:
-    """Whether the chat already holds an analysis tool call. Such a chat keeps the tools: the
-    model API refuses history carrying tool calls when no tool is defined."""
-    return any(
-        isinstance(part, ToolCallPart) and part.tool_name in _ANALYSIS_TOOLS
-        for message in history
-        if isinstance(message, ModelResponse)
-        for part in message.parts
-    )
 
 
 def _steps_of_the_cut_run(captured: list[ModelMessage]) -> list[ModelMessage]:
@@ -1653,27 +1638,17 @@ class TurnEngine:
             # the model needs either rides a TOOL RESULT (persisted, at the absolute tail) or the
             # per-run INSTRUCTION, which is not part of history at all.
             #
-            # THE ATTACHED FILES RIDE THE INSTRUCTION because their paths are a fact about THIS
-            # container: a stored transcript naming them would outlive the container it described
-            # and name paths a later one may spell differently.
+            # The attached files are named by a hidden note the route persisted ahead of the
+            # prompt, so it replays as it was sent.
             #
             # BIAL Chat has no container; its files go to a session of their own, and only once a
-            # tool first asks for one.
-            if state.kind is ChatKind.GENERIC and (
-                state.attachments is not None or _has_called_analysis(history)
-            ):
+            # tool first asks for one. The handle starts nothing until then.
+            if state.kind is ChatKind.GENERIC:
                 state.analysis = AnalysisSession(
                     conversation_id=state.conversation_id,
                     files=state.attachments.files if state.attachments is not None else (),
                     storage=state.attachments.storage if state.attachments is not None else None,
                     runtime=get_analysis_runtime(),
-                )
-                prompt_context = replace(
-                    prompt_context, analysis_listing=analysis_listing(state.analysis.files)
-                )
-            elif state.attachments is not None:
-                prompt_context = replace(
-                    prompt_context, attachment_listing=state.attachments.listing()
                 )
             # WHAT WAS AGREED, READ OUT OF THE CONVERSATION ITSELF. No column, no
             # table, no project field: the agreement is the arguments of the last honourable
@@ -1752,15 +1727,14 @@ class TurnEngine:
                     # that forgot it would register the tool for nobody while every registration
                     # test — which calls `toolsets_for_kind` directly — stayed green.
                     #
-                    # THE READER IS OFFERED ONLY WHEN THERE IS SOMETHING TO READ. A tool named
-                    # `read_attachment` on a chat with no attachment is an invitation to invent a
-                    # path and then explain the failure; `toolsets_for_kind` takes the accessor as
-                    # optional for exactly this, and registration is per-run.
+                    # THE FILE TOOLS ARE OFFERED FROM THE FIRST MESSAGE, file or no file: a tool
+                    # list that changed when a file arrived would rewrite everything cached after
+                    # it.
                     toolsets = toolsets_for_kind(
                         state.kind,
                         _workspace_of,
-                        reader_of=_reader_of if state.attachments is not None else None,
-                        analysis_of=_analysis_of if state.analysis is not None else None,
+                        reader_of=_reader_of,
+                        analysis_of=_analysis_of,
                         connected_systems=prompt_context.connected_systems,
                         app_state_of=_app_state_of,
                         # WHAT THE TOOL ANSWERED, HEARD BY THE TURN. The change notice and the
@@ -2137,7 +2111,7 @@ class TurnEngine:
         db: AsyncSession,
         run: Awaitable[T],
     ) -> T:
-        """Await `run`, held to the wall clock when this reply works on files.
+        """Await `run`, held to the wall clock on every BIAL Chat reply.
 
         Its request ceiling rides the run's own `usage_limits`. Either ceiling keeps the steps
         taken so far, then ends the reply in the ceiling sentence; the bill follows on the

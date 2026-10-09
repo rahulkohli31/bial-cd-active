@@ -31,13 +31,15 @@ session, a deleted attachment is removed, and the reader is uploaded again. Azur
 after an idle cool-down without warning, and the next call quietly opens an empty one; the listing
 is how a reply notices, and the cost is a re-copy, never a file.
 
-**The model gets two tools, and only in a chat that needs them.** One runs the shipped reader over
-a file; the other runs Python against the chat's files. Both run one at a time. They are registered
-when the chat holds such a file or has already used them, because the model API refuses a history
-carrying tool calls when no tool is defined. A reply that never opens a file makes no call to the
-session at all.
+**The model gets two tools, in every BIAL Chat from its first message.** One runs the shipped
+reader over a file; the other runs Python against the chat's files. Both run one at a time. They are
+registered whether or not the chat holds a file, and the rules for using them are part of the chat's
+fixed instructions, so a file attached mid-chat changes neither and the cached prompt survives it.
+The files the chat holds now are named by a hidden note the platform adds to the conversation each
+time that list changes. A reply that never opens a file makes no call to the session at all; with
+no session service configured, a call answers that files cannot be opened right now.
 
-**Every reply that works on files is bounded**: a ceiling on model requests, a wall clock, a time
+**Every BIAL Chat reply is bounded**: a ceiling on model requests, a wall clock, a time
 limit on each run of code, and one run at a time. Either ceiling ends the reply in one plain
 sentence and keeps the steps taken so far.
 

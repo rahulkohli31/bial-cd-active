@@ -298,7 +298,7 @@ async def test_a_reply_that_calls_no_tool_makes_no_runtime_call(
     assert reads.calls == []
 
 
-async def test_a_chat_with_no_file_is_offered_no_tools(
+async def test_a_chat_with_no_file_has_both_tools_and_touches_no_session(
     client, db_session, set_chat_model, _fresh_engine, reads
 ) -> None:
     user, chat = await _chat(db_session)
@@ -308,7 +308,7 @@ async def test_a_chat_with_no_file_is_offered_no_tools(
     await _send(client, user, chat)
     await _settle(_fresh_engine, chat.id)
 
-    assert seen["tools"] == []
+    assert seen["tools"] == sorted([ATTACHMENT_READ_TOOL, ANALYSIS_RUN_TOOL])
     assert reads.calls == []
 
 

@@ -27,8 +27,10 @@ from src.core.prompt_blocks import (
     DATA_INTEGRITY_RULES,
     DATA_INTEGRITY_RULES_WITHOUT_AN_APP,
     DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY,
+    FILE_NOTE_HEADING,
     FIRST_SLICE_RULE,
     KEEP_PLANNING_LABEL,
+    LATEST_FILE_NOTE_RULE,
     NARRATION_EXAMPLES,
     NARRATION_VOICE,
     PORTAL_SURFACES,
@@ -58,15 +60,8 @@ class PromptContext:
     Empty is the ordinary case. The SAME value decides the turn's tool surface, which is why it
     rides the prompt context rather than being resolved again wherever it is needed.
 
-    `attachment_listing` is the conversation's attached files, one line each, or `""` when it
-    has none. The LIST is per-conversation and rides here; the RULES about reading a file are
-    standing text and live in `ATTACHMENT_RULES` below, emitted beside it. Both are instructions
-    rather than history: an instruction is recomposed per run and is byte-identical across two
-    turns of the same conversation, while the tail of `message_history` is not — the citizen's
-    next prompt is persisted and takes those bytes.
-
-    `analysis_listing` is BIAL Chat's `analysis_listing()`, or `None` when its analysis tools are
-    not registered.
+    The conversation's attached files are not here: they ride a hidden note in its history
+    (`file_note`), so a file arriving mid-chat changes neither the instructions nor the tools.
     """
 
     user_name: str
@@ -76,8 +71,6 @@ class PromptContext:
     project_name: str | None = None
     project_description: str | None = None
     connected_systems: tuple[ConnectedSystem, ...] = ()
-    attachment_listing: str = ""
-    analysis_listing: str | None = None
 
 
 # The sizes a deployment runs at unless an operator overrides them; composing a prompt reads no
@@ -149,6 +142,8 @@ other than the citizen."""
 
 
 ATTACHMENT_RULES = f"""\
+WHICH FILES ARE ATTACHED — {LATEST_FILE_NOTE_RULE}
+
 EACH FILE HAS TWO ADDRESSES. The `{ATTACHMENTS_PREFIX}` path is for tools that take a path, such \
 as `read_attachment` if you have it. The on-disk path is for commands: a command runs inside the \
 app's folder, where `{ATTACHMENTS_PREFIX}` does not exist, so the reader would report the file as \
@@ -168,12 +163,8 @@ time the workspace is rebuilt — a change you made to it in an earlier turn wil
 And do not put a file's rows into the app's database. An attached file is what the app is built \
 FOR, not what it is built FROM: seeding it is a decision about their data that nobody asked for. \
 If seed data seems needed, say so and let them answer."""
-"""The standing rules about reading an attached file — byte-identical on every turn of every
-conversation that has one, which is why they are a constant here and not composed per turn.
-
-GATED, NOT UNCONDITIONAL. `this_conversation` emits this only for a chat that actually holds a
-file AND has a container to read it in, so the overwhelming majority of turns pay nothing for a
-feature they never use.
+"""The standing rules about reading an attached file, in the Plan and Build contracts whether or
+not the chat holds one: a file arriving mid-chat must not change the cached instructions.
 
 IT EMBEDS `ATTACHED_CONTENT_IS_DATA` RATHER THAN RESTATING IT: a kind that has a container reaches
 that invariant through these rules, and reads it exactly once."""
@@ -195,14 +186,14 @@ with nothing to press. Everything else you write does reach them, in the order y
 Nothing in the plan names a file, a folder, a framework, a library, a command, or the way \
 data is stored underneath. The engineering pros and cons belong to the build.
 
-ATTACHED FILES ARE READ, NOT GUESSED AT. A spreadsheet, document, deck, CSV or TSV the \
-user attached is already in your workspace, and the turn tells you its path and the one \
-command that opens it. Use that reader — it is the tested one, and it reports the whole \
-file: every sheet, the true row counts, the columns that hold formulas with no calculated \
-result, the table headers. A description written from a file's name reads exactly as \
-confident as a correct one. Then say what the file MEANS in your own words, because the \
-build chat starts fresh with the plan and nothing else — anything only the file holds is \
-lost unless the plan says it.
+ATTACHED FILES ARE READ, NOT GUESSED AT. A spreadsheet, document, deck, CSV or TSV the user \
+attached is already in your workspace: the latest file note gives its path, and the rules on \
+attached files above give the one reader that opens it. Use that reader — it is the tested one, \
+and it reports the whole file: every sheet, the true row counts, the columns that hold formulas \
+with no calculated result, the table headers. A description written from a file's name reads \
+exactly as confident as a correct one. Then say what the file MEANS in your own words, because \
+the build chat starts fresh with the plan and nothing else — anything only the file holds is lost \
+unless the plan says it.
 
 End a planning turn one of two ways: ask the user a clarifying question, or — when the plan \
 is ready — call `present_plan_options` with it, which puts the \
@@ -334,26 +325,27 @@ def standing_contract(kind: ChatKind) -> tuple[str, ...]:
     THE SLOT BEFORE IT HOLDS WHAT ONE KIND NEEDS AND ANOTHER CANNOT USE. `FIRST_SLICE_RULE` names
     `propose_first_slice` — a tool the generic kind is handed no toolset for, so emitting it there
     would instruct a run to make a call it cannot make: the same defect the integrity variants
-    exist to avoid. That kind takes `ATTACHED_CONTENT_IS_DATA` in the slot instead — it answers
-    from its attachments, so the injection guard is part of its standing contract rather than a
-    per-turn fact, and being static it sits inside the cacheable prefix. The wire ORDER is still
+    exist to avoid. That kind takes `ATTACHED_CONTENT_IS_DATA` in the slot instead, so the
+    injection guard is part of its standing contract. The kind's file rules follow in the same
+    slot — `ATTACHMENT_RULES`, which embeds the guard, or `ANALYSIS_RULES` — present from the
+    first message so a file arriving later changes nothing cached. The wire ORDER is still
     written once, below, so the three kinds cannot drift in how they are ordered."""
     match kind:
         case ChatKind.PLAN:
             portal = PORTAL_SURFACES
             integrity = DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY
             segment = _PLAN_SEGMENT
-            scope: tuple[str, ...] = (FIRST_SLICE_RULE,)
+            scope: tuple[str, ...] = (FIRST_SLICE_RULE, ATTACHMENT_RULES)
         case ChatKind.BUILD:
             portal = PORTAL_SURFACES
             integrity = DATA_INTEGRITY_RULES
             segment = _WRITE_SEGMENT
-            scope = (FIRST_SLICE_RULE,)
+            scope = (FIRST_SLICE_RULE, ATTACHMENT_RULES)
         case ChatKind.GENERIC:
             portal = PORTAL_SURFACES_WITHOUT_A_PROJECT
             integrity = DATA_INTEGRITY_RULES_WITHOUT_AN_APP
             segment = _GENERIC_SEGMENT
-            scope = (ATTACHED_CONTENT_IS_DATA,)
+            scope = (ATTACHED_CONTENT_IS_DATA, ANALYSIS_RULES)
     return (
         NARRATION_EXAMPLES,
         portal,
@@ -367,12 +359,10 @@ def standing_contract(kind: ChatKind) -> tuple[str, ...]:
 
 def analysis_listing(files: Sequence[CodeLaneAttachment]) -> str:
     """BIAL Chat's files for its analysis tools, one line each, named by the one path both tools
-    take. Says so plainly when none is left, since the tools stay registered once used."""
+    take."""
     # Lazy: materialize imports the agent package, and with it this module.
     from src.services.attachments.materialize import one_line_name
 
-    if not files:
-        return "No file you can open with your tools is attached to this conversation now."
     lines = [
         f"- {one_line_name(file.display_name)} — {file.model_path} ({file.size:,} bytes)"
         for file in files
@@ -380,39 +370,44 @@ def analysis_listing(files: Sequence[CodeLaneAttachment]) -> str:
     return "\n".join(["Attached files you can open with your tools:", *lines])
 
 
+def file_note(kind: ChatKind, files: Sequence[CodeLaneAttachment]) -> str:
+    """The hidden note naming the files a conversation holds now, written into its history each
+    time this text changes (`api/v1/conversations/turns.py`). Each note is the whole current list,
+    so the latest one is always true and nothing needs to know what changed.
+
+    Plan and Build name both of a file's addresses; BIAL Chat names the one path its tools take."""
+    # Lazy: materialize imports the agent package, and with it this module.
+    from src.services.attachments.materialize import workspace_listing
+
+    if not files:
+        return f"{FILE_NOTE_HEADING}\nNo file is attached to this conversation now."
+    match kind:
+        case ChatKind.PLAN | ChatKind.BUILD:
+            listing = workspace_listing(files)
+        case ChatKind.GENERIC:
+            listing = analysis_listing(files)
+    return f"{FILE_NOTE_HEADING}\n{listing}"
+
+
 def this_conversation(context: PromptContext) -> str:
-    """The run's one DYNAMIC instruction part: who the assistant is working with, the files this
-    conversation holds, and what this project may read from outside the platform.
+    """The run's one DYNAMIC instruction part: who the assistant is working with, and what this
+    project may read from outside the platform.
 
     IT SITS AT THE TAIL, behind the whole standing contract, and that position is what makes the
     contract a byte-stable prefix: two citizens on two projects send the same bytes up to here.
 
-    THE ATTACHMENT LISTING COMES BEFORE ITS RULES, and both before the per-project stub. The
-    rules are standing contract, but they are useless without the one fact about today's
-    conversation, so they travel with it and neither is emitted for a chat holding no file.
-
     THE CONNECTED DATA STUB IS LAST and is absent for every project that reads nothing outside
     the platform, which is nearly all of them.
 
-    A CHAT WITH NO PROJECT TAKES THE OTHER OPENING and never `ATTACHMENT_RULES`, which name a
-    container path and a command it does not have. When its analysis tools are registered it
-    takes their listing and `ANALYSIS_RULES` instead; either way the injection guard reaches it
-    through `standing_contract`."""
-    listing = context.attachment_listing
-
+    A CHAT WITH NO PROJECT TAKES THE OTHER OPENING. Neither opening names the attached files:
+    those ride `file_note`, in the history."""
     if context.project_name is None:
-        identity = (
+        return (
             f"You are BIAL Chat, the Citizen Developer assistant for BIAL, talking with "
             f"{context.user_name}. This conversation belongs to them rather than to a project, "
             "so there is no app, no code and no workspace here — what you have is this "
             "conversation and whatever they have attached to it."
         )
-        analysis = (
-            f"\n\n{context.analysis_listing}\n\n{ANALYSIS_RULES}"
-            if context.analysis_listing is not None
-            else ""
-        )
-        return identity + (f"\n\n{listing}" if listing else "") + analysis
 
     stub = _connected_data_stub(context.connected_systems)
     described = f" — {context.project_description}" if context.project_description else ""
@@ -422,8 +417,7 @@ def this_conversation(context: PromptContext) -> str:
         "this one project: its app, its code, and its data. Ground everything you say "
         "about the app in its actual files, and answer what was asked before acting."
     )
-    attachments = f"\n\n{listing}\n\n{ATTACHMENT_RULES}" if listing else ""
-    return identity + attachments + (f"\n\n{stub}" if stub else "")
+    return identity + (f"\n\n{stub}" if stub else "")
 
 
 def compose_kind_prompt(kind: ChatKind, context: PromptContext) -> str:

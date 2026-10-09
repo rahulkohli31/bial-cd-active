@@ -475,8 +475,10 @@ async def test_plan_kind_model_sees_no_write_tools(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
     """The HTTP-level no-overrides gating proof: through the REAL route, engine, and
-    toolsets, a Plan turn's model-visible tool list is exactly the read surface plus the
-    plan-confirmation tool — no write_file / edit_file / insert_lines / declare_done.
+    toolsets, a Plan turn's model-visible tool list is exactly the read surface, the attachment
+    reader and the plan-confirmation tool — no write_file / edit_file / insert_lines /
+    declare_done. The reader is there with no file attached: a tool list that grew when a file
+    arrived would rewrite the cache.
 
     `present_plan_options` belongs in the expected set below: Ask and Plan collapsed into one
     `ChatKind.PLAN`, and `toolsets_for_kind` hands every Plan-kind run the confirmation tool
@@ -497,6 +499,7 @@ async def test_plan_kind_model_sees_no_write_tools(
         "list_files",
         "search_files",
         "run_command",
+        "read_attachment",
         "present_plan_options",
         # tell_the_user / propose_first_slice / check_the_app are shared by BOTH kinds. Exact-set
         # on purpose: a tool meant for both arms that reached only one is drift a subset check
