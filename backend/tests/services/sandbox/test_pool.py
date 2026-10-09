@@ -454,6 +454,47 @@ async def test_a_size_of_zero_creates_without_asking_the_ledger(world) -> None:
     assert await _ledger() == {member: SandboxPoolState.READY}
 
 
+async def test_a_connector_start_creates_its_own_with_the_identity_and_claims_nothing(
+    world, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A ready container has no data identity and Azure attaches one only at creation, so a
+    connector project that claimed one would open and then fail to read its data.
+
+    Mutation check: drop the connector miss and the start claims the ready row, and its app is
+    handed the lake's coordinates in a container that holds no identity."""
+    from src.config import settings as app_settings
+    from src.services.lake.config import LakeConfig
+
+    resource_id = "/subscriptions/s/resourcegroups/rg/providers/x/y/the-lake-identity"
+    monkeypatch.setattr(
+        app_settings,
+        "connector_lake",
+        LakeConfig(
+            url="https://alakeaccount.blob.core.windows.net/acontainer/AOS/reports/",
+            identity_client_id="52b74947-0621-46e2-a523-a6b466f47c33",
+            identity_resource_id=resource_id,
+        ),
+    )
+    member = await _ready(world)
+    url_name, _ = connector_env_names(next(iter(CONNECTORS)))
+    env = {**_app_env(uuid.uuid4()), url_name: "https://lake.example/data/"}
+
+    stopwatch = Stopwatch()
+    with timed_by(stopwatch):
+        handle = await world.client.provision_new(
+            str(uuid.uuid4()), a_fresh_sandbox_name(), app_env=env
+        )
+
+    assert (stopwatch.claimed, stopwatch.miss_reason, stopwatch.ready_count) == (
+        False,
+        "connector",
+        None,
+    )
+    assert world.aca.created == [handle.app_name]
+    assert world.aca.identities[handle.app_name] == resource_id
+    assert await _ledger() == {member: SandboxPoolState.READY}
+
+
 async def test_a_shared_view_claims_and_is_restamped_with_the_viewer_as_owner(
     world, fake_storage: FakeStorage
 ) -> None:

@@ -4297,7 +4297,8 @@
           "no_ready",
           "unhealthy",
           "claim_failed",
-          "size_zero"
+          "size_zero",
+          "connector"
         ],
         "title": "SandboxStartMiss",
         "type": "string"

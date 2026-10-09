@@ -687,6 +687,27 @@ def test_every_reason_a_start_gives_for_creating_is_one_its_row_can_hold() -> No
     assert set(get_args(Miss)) == {miss.value for miss in SandboxStartMiss}
 
 
+async def test_a_connector_start_is_recorded_as_never_asking_the_pool(
+    db_session: AsyncSession, books: SessionFactory
+) -> None:
+    """The newest reason reaches the database's own type, not only the model's enum."""
+    user = await UserFactory.create(db_session, email="st-connector-miss@rvaiglobal.com")
+    app = await AppRegistryFactory.create(db_session, user_id=user.id)
+    record = StartRecord()
+    record.admitted(SandboxStartKind.REOPEN, user_id=user.id, books=books)
+    await record.open(app_id=app.id, env={"BIAL_APP_ID": "x"})
+    record.missed("connector", ready_count=None)
+
+    await record.close(SandboxStartOutcome.SERVED)
+
+    [row] = await _rows(db_session, user.id)
+    assert (row.claimed, row.miss_reason, row.ready_count) == (
+        False,
+        SandboxStartMiss.CONNECTOR,
+        None,
+    )
+
+
 @pytest.mark.parametrize(
     ("granted", "project_type"),
     [(True, SandboxProjectType.CONNECTOR), (False, SandboxProjectType.PLAIN)],

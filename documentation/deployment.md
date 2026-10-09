@@ -216,11 +216,10 @@ environment on top of the live ones, and an image swap briefly needs twice as ma
 environment's limits cover twice the largest size plus the peak number of live sandboxes before
 raising a size.
 
-**Every size stays at zero until the release notes say otherwise.** A data-connector project reads
-tenant data through an identity that is attached when its container is created, and a ready
-sandbox has no project yet, so it cannot carry it. Until a release lets a connector project's claim
-obtain that identity, a connector project that claimed a ready sandbox would start its app and then
-fail to read its data.
+**A data-connector project never takes a ready sandbox.** It reads tenant data through an identity
+that is attached when its container is created, and a ready sandbox has no project yet, so it
+cannot carry it. Its start creates its own sandbox with that identity instead, so a connector
+project opens no faster with the pool on, and raising a size needs nothing more for it.
 
 **The release that introduced this is deployed in one order.** It changed how every workspace is
 named and found, and an older backend or worker meeting the newer one's records loses citizens'
@@ -297,9 +296,10 @@ that never opens its record, which no other check here would find.
 **9. The pool, once a size is above zero.** Within a few minutes the ready sandboxes number the
 configured size, and the worker's per-minute pass logs each tick. A start made then appears in the
 report as having claimed a ready sandbox, its create stage shrunk to the time of the claim; a start
-made with none ready appears with the reason it created one. Through a working day that includes a
-sandbox image deploy, the below-size alarm is quiet, or the worker's log explains each one by a
-refused create, a new sandbox that never answered, or a create a restart interrupted.
+made with none ready, or for a data-connector project, appears with the reason it created one.
+Through a working day that includes a sandbox image deploy, the below-size alarm is quiet, or the
+worker's log explains each one by a refused create, a new sandbox that never answered, or a create a
+restart interrupted.
 
 **10. BIAL Chat's analysis sessions cannot reach anything, before they are switched on.** As an
 identity holding the session-executor role, run code in a session of the pool that tries a public

@@ -48,6 +48,7 @@ class SandboxStartMiss(enum.StrEnum):
     UNHEALTHY = "unhealthy"
     CLAIM_FAILED = "claim_failed"
     SIZE_ZERO = "size_zero"
+    CONNECTOR = "connector"
 
 
 class SandboxStartOutcome(enum.StrEnum):
