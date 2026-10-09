@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.3] - 2026-10-09
+
+A file that cannot be opened is now refused in words that say what is wrong and what to do about
+it. A Word, Excel or PowerPoint file that is not really one, such as a placeholder or a file
+renamed to `.docx`, is told so. An older `.doc`, `.xls` or `.ppt` file is told by name to open it
+in the matching application and re-save it in the newer format. Both used to get a sentence that
+named neither the problem nor the way forward.
+
+### Fixed
+
+- **A file named `.docx`, `.xlsx` or `.pptx` that is not an Office file is refused with a reason:**
+  "is not a Word document, whatever its name says. Open it in Word, re-save it as .docx, and attach
+  it again." It used to say only that the file "could not be read as an Office file".
+- **An older `.doc`, `.xls` or `.ppt` file is refused by name, with the way forward,** instead of
+  the general "isn't supported" sentence, which listed "document" among the things that work. The
+  file picker now also shows these three kinds of file, so they can be chosen and told what to do.
+
 ## [1.9.2] - 2026-10-08
 
 BIAL Chat can now answer questions about Word, Excel, PowerPoint, CSV and TSV files. A person
