@@ -172,13 +172,12 @@ from src.services.orchestrator.constants import (
     ADAPTIVE_THINKING,
     ANALYSIS_REQUEST_LIMIT,
     ANALYSIS_WALL_CLOCK_S,
-    BUILD_EFFORT,
     CACHE_TTL,
     CRASH_EDGE_CONSECUTIVE_POLLS,
     GENERIC_EFFORT,
     MAX_OUTPUT_TOKENS,
     MODEL_TURN_CEILING,
-    PLAN_EFFORT,
+    PLAN_AND_BUILD_EFFORT,
     READINESS_MAX_POLLS,
     READINESS_POLL_S,
     RUN_COMMAND_SLOW_TIMEOUT_S,
@@ -1268,10 +1267,8 @@ def _effort_for(kind: ChatKind) -> AnthropicEffort:
     through here — it is a different run shape with its own settings block — so this answers for
     the single-request arm only, which is where the two non-writing kinds meet."""
     match kind:
-        case ChatKind.PLAN:
-            return PLAN_EFFORT
-        case ChatKind.BUILD:
-            return BUILD_EFFORT
+        case ChatKind.PLAN | ChatKind.BUILD:
+            return PLAN_AND_BUILD_EFFORT
         case ChatKind.GENERIC:
             return GENERIC_EFFORT
 
@@ -2885,7 +2882,7 @@ class TurnEngine:
             model_settings=AnthropicModelSettings(
                 max_tokens=MAX_OUTPUT_TOKENS,
                 anthropic_thinking=ADAPTIVE_THINKING,
-                anthropic_effort=BUILD_EFFORT,
+                anthropic_effort=PLAN_AND_BUILD_EFFORT,
                 anthropic_cache_instructions=CACHE_TTL,
                 anthropic_cache_tool_definitions=CACHE_TTL,
                 anthropic_cache=CACHE_TTL,

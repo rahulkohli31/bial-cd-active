@@ -274,8 +274,8 @@ ADAPTIVE_THINKING: Final[BetaThinkingConfigParam] = {"type": "adaptive", "displa
 The deployed model REFUSES a numeric budget outright: its provider profile disallows budget
 thinking, and the library raises before the request rather than letting the provider return a
 400, directing callers to adaptive thinking plus an effort level. So the two knobs are this and
-the effort below — a shape the owner's ruling ("medium for planning, high for building") maps
-onto directly, rather than two token counts nobody could defend.
+the effort below — a shape the owner's ruling on effort maps onto directly, rather than token
+counts nobody could defend.
 
 `display` IS LOAD-BEARING AND MUST STAY NAMED. The SDK's own type stub documents it as
 defaulting to `summarized`; this deployment behaves as `omitted` when it is absent, returning a
@@ -295,10 +295,10 @@ GENERIC_EFFORT: Final[AnthropicEffort] = "low"
 """How hard the model thinks in a BIAL Chat turn — the lowest level available.
 
 THINKING STAYS ON, and that is a decision rather than an oversight. Switching it off is legal at
-this level, unlike the two above, and it would be cheaper again — but a question about a document
-is exactly the shape that benefits from some reasoning, the quality cost has not been measured,
-and the paragraph above names what goes wrong silently when thinking is off. A measurable change
-follows a measurement; it does not precede one."""
+this level, unlike at the Plan and Build level, and it would be cheaper again — but a question
+about a document is exactly the shape that benefits from some reasoning, the quality cost has not
+been measured, and the paragraph above names what goes wrong silently when thinking is off. A
+measurable change follows a measurement; it does not precede one."""
 
 # --- BIAL Chat file analysis: the bounds on one reply ------------------------------------
 
@@ -332,15 +332,8 @@ to hand the model, and the read answers `too_large`."""
 ANALYSIS_CODE_LIMIT: Final = 100_000
 """Characters of code one `run_python` call may send."""
 
-PLAN_EFFORT: Final[AnthropicEffort] = "medium"
-"""How hard the model thinks in a planning turn (owner's ruling)."""
-
-BUILD_EFFORT: Final[AnthropicEffort] = "high"
-"""How hard the model thinks in a build turn (owner's ruling).
-
-Higher than planning because a build is where the thinking is spent on something that has to
-work: the model is reading real files, choosing an edit, and answering a compiler. A plan is a
-conversation about what to build, and the person is still in it."""
+PLAN_AND_BUILD_EFFORT: Final[AnthropicEffort] = "medium"
+"""How hard the model thinks in a planning or build turn (owner's ruling)."""
 
 CACHE_TTL: Literal["1h"] = "1h"
 """TTL for every Anthropic prompt-cache breakpoint the loop sets (`anthropic_cache_instructions`,

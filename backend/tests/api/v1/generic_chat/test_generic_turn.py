@@ -202,8 +202,8 @@ async def test_a_second_generic_turn_while_one_is_mid_reply_is_refused(
 async def test_a_generic_run_asks_for_the_lowest_effort(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
-    """Mutation receipt: point `_effort_for`'s generic arm at `PLAN_EFFORT` and this goes red
-    while the plan and build arms stay green."""
+    """Mutation receipt: point `_effort_for`'s generic arm at `PLAN_AND_BUILD_EFFORT` and this goes
+    red while the plan and build arms stay green."""
     user, conversation = await _generic_chat(db_session)
     seen: dict[str, object] = {}
 
