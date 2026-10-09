@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.4] - 2026-10-09
+
+A flight-data app opens with its data again while the pool of ready workspaces is on. A ready
+workspace is made before anyone asks for it, so it cannot carry the identity that reads BIAL's
+flight data. A flight-data app that took one opened without data access and said "The flight data
+could not be read". A flight-data project now always gets a workspace of its own, made with that
+identity; every other app still opens from the pool.
+
+> **Before deploying:** run the migrations before the new backend starts. This release adds one,
+> for the new start reason below.
+
+### Fixed
+
+- **A flight-data project never takes a ready workspace from the pool.** Its start creates its own
+  workspace with the data identity, so it opens as fast as it did with the pool off, and the pool
+  keeps serving every other project. The superadmin report of sandbox starts records these starts
+  with a new reason, `connector`.
+
 ## [1.9.3] - 2026-10-09
 
 A file that cannot be opened is now refused in words that say what is wrong and what to do about
