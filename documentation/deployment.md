@@ -44,15 +44,19 @@ flowchart LR
   CR --> APP["Container Apps<br/>deployed application"]
 ```
 
-Three images are built by an operator from tracked Dockerfiles: the control plane, the portal edge,
-and the sandbox image. The fourth thing that runs — a deployed application — is not built from the
+Three images are built from tracked Dockerfiles: the control plane, the portal edge, and the sandbox
+image. `azure-pipelines.yml` releases production from `main` on the build host: it builds them,
+waits for an approval, migrates the database, then moves the portal, the control plane and the
+worker onto the new images. A release that needs the control plane stopped, or a migration applied
+only after the new image serves, is still run by an operator. The fourth thing that runs — a deployed application — is not built from the
 repository at all. It is built from the immutable snapshot captured when its author submitted it
 for approval, which is what makes an approved application reproducible: the thing deployed is the
 thing that was approved, not a rebuild of whatever the workspace looks like now.
 
-The sandbox image is **built and published but never deployed** by an operator. The control plane
-and the worker create sandboxes from it at runtime, and an operator's part is to point both at the
-new image by its immutable tag (see "The pool of ready sandboxes").
+The sandbox image is **built and published but never deployed**. The control plane and the worker
+create sandboxes from it at runtime, and a release points both at the new image by its immutable tag
+(see "The pool of ready sandboxes"). The pipeline names that tag after the content of the sandbox
+folder, so a release that leaves the folder unchanged moves nothing.
 
 ### The build host runs Windows, and this constrains the code
 
