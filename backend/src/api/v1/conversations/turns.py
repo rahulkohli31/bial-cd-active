@@ -28,7 +28,7 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from pydantic_ai.models import Model
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.api.deps import CurrentUser, DbSession
+from src.api.deps import CurrentUser, DbSession, OptionalAnalysis
 from src.api.deps_csrf import RequireCsrf
 
 # The generic chat's code-lane refusal, imported rather than re-spelled: the upload door and the
@@ -386,6 +386,7 @@ async def start_turn(
     storage: StorageDep,
     manager: SessionManagerDep,
     sandbox: OptionalSandbox,
+    analysis: OptionalAnalysis,
 ) -> TurnStartResponse | JSONResponse:
     # ★ THIS ROUTE CREATES NO CONVERSATION: the row exists a round trip before this call.
     #
@@ -526,17 +527,24 @@ async def start_turn(
     # restore carries it, which means a recycled container comes back without it. The message's
     # own ids are passed as well, so a row whose conversation link was never stamped is still
     # found (the column is nullable on purpose).
+    #
+    # A generic chat takes its own linked rows only: its session is named by the chat, so a file
+    # named here but linked to another chat must never be placed in it.
+    sent_ids = set(body.message.attachment_ids)
     code_lane = await code_lane_attachments(
         db,
         user_id=user.id,
         conversation_id=conversation_id,
         attachment_ids=body.message.attachment_ids,
+        this_chat_only=project_id is None,
     )
-    # THE SEND DOOR ASKS AGAIN WHAT THE UPLOAD DOOR ASKED. An id uploaded against a plan or
-    # build chat can still be named in a generic turn, so admission at upload does not settle
-    # admission at send — and a chat with no container has nothing to open a spreadsheet with.
-    # Same sentence, same code, one source.
-    if project_id is None and code_lane:
+    # THE SEND DOOR ASKS AGAIN WHAT THE UPLOAD DOOR ASKED, about this message's files only: a
+    # plain question in a chat that already holds spreadsheets needs no runtime to be answered.
+    if (
+        project_id is None
+        and analysis is None
+        and any(file.attachment_id in sent_ids for file in code_lane)
+    ):
         raise AppApiError(400, GENERIC_ATTACHMENT_LANES_SENTENCE, code=GENERIC_LANE_REFUSED_CODE)
     delivery = (
         AttachmentDelivery(files=tuple(code_lane), storage=storage)
@@ -640,7 +648,6 @@ async def start_turn(
             ),
         )
         app_id = await _app_id_for_project(db, user.id, project_id)
-    sent_ids = set(body.message.attachment_ids)
 
     turn_id = await start_conversation_turn(
         db=db,

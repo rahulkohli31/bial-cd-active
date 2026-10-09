@@ -23,8 +23,9 @@ worker, has several problems for exactly this kind of work:
 
 **Taskiq is adopted, with a Redis broker**, to run scheduled reconciliation work. The
 queue's passengers are scheduled reconcilers and retention passes — deploy
-reconciliation, the sandbox sweep, and the conversation retention pass — not request
-work moved off the hot path. Long-running
+reconciliation, the sandbox sweep, the pass that keeps the pool of ready sandboxes at
+its size, the purge of old sandbox start timings, and the conversation retention pass —
+not request work moved off the hot path. Long-running
 work that a request cannot finish in time follows a different pattern instead: claim a
 database row, run the work as a detached task that owns its own database session, and
 have the client poll for the result.
@@ -162,3 +163,5 @@ handler twice.
 - ADR-0015 (the worker's deployment as the backend image's second run target)
 - ADR-0029 and ADR-0030 (the scheduled sandbox sweep, this queue's most demanding
   passenger, and what ADR-0029 withdrew around it)
+- ADR-0032 (the pool of ready sandboxes, whose per-minute pass creates containers from
+  this queue)

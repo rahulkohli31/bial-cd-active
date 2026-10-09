@@ -17,7 +17,6 @@ from __future__ import annotations
 import re
 import uuid
 
-from src.services.build_sessions import app_name_for
 from src.services.deploy.names import (
     image_reference,
     image_tag,
@@ -25,6 +24,7 @@ from src.services.deploy.names import (
     revision_name,
     revision_suffix,
 )
+from src.services.sandbox.base import app_name_for
 
 # ACA container-app names: 2–32 chars, lowercase alphanumeric with internal hyphens, must
 # start with a letter and end alphanumeric.

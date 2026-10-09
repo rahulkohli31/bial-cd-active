@@ -38,6 +38,7 @@ from src.db.models.project_connector import ConnectorWindowKind, ProjectConnecto
 from src.db.models.user_limit import UserLimit
 from src.services.agent.mode_prompts import PromptContext, compose_kind_prompt
 from src.services.build_sessions import SessionManager
+from src.services.build_sessions.sandbox_starts import StartRecord
 from src.services.messages.projection import (
     AssistantTextItem,
     PlanOptionsItem,
@@ -87,6 +88,10 @@ def wire(app, db_session, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     app.dependency_overrides[sandbox_dependency] = lambda: sbx
     app.dependency_overrides[sandbox_or_none_dependency] = lambda: sbx
     return SimpleNamespace(app=app, manager=manager, sbx=sbx)
+
+
+async def _not_on_the_books(self: StartRecord, **_env: object) -> None:
+    return None
 
 
 def _streaming_text(text: str):
@@ -674,6 +679,9 @@ async def test_a_plan_chat_deleted_before_its_answer_is_written_still_answers_st
     monkeypatch.setattr(
         "src.api.v1.conversations.transition.record_build_started", _plan_chat_deleted_first
     )
+    # The nested delete and the turn's sandbox start share this test's one session, and a start
+    # row's own commit would land in the middle of the delete's flush.
+    monkeypatch.setattr(StartRecord, "open", _not_on_the_books)
 
     resp = await client.post(_build_url(plan_chat), headers=headers, json={"chatId": str(minted)})
     await _settle(_fresh_engine, minted)

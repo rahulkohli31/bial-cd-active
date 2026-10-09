@@ -330,11 +330,7 @@ describe('showing the outcome', () => {
     h.readTurnStream.mockImplementation(turn.impl)
     renderThread()
     await runBuild(turn) // pushes the one step the pill counts
-    // Settle it. A step left `pending` converts to `running`, and a RUNNING group reports only
-    // its count — "a count of problems while the run is still going describes something that may
-    // yet be recovered from" (ActivityGroup's own rule). The citizen presses Stop between two
-    // steps, not mid-write, so the sealed group is the shape this contradiction actually appears
-    // in — and it is the only shape where the pill has a verdict to contradict.
+    // Stop lands between two steps here; the next test stops one mid-write.
     await turn.frame(T_STEP('Scaffolding your app…', { state: 'ok' }))
 
     await turn.frame(T_BUILD_END({ turnId: 't1', status: 'stopped', reason: 'stopped_by_user' }))
@@ -347,6 +343,27 @@ describe('showing the outcome', () => {
     // Neither half may call it a failure. The pill never did; the sentence is what changed.
     expect(pill.textContent).not.toMatch(/failed/i)
     expect(card.textContent).not.toMatch(/failed/i)
+  })
+
+  it('a step still running at Stop stops spinning and reads as stopped', async () => {
+    // The engine never resolves the tool call a Stop cut short, so the step ends the turn pending.
+    const turn = scriptTurn('t1')
+    h.readTurnStream.mockImplementation(turn.impl)
+    renderThread()
+    await runBuild(turn)
+    expect(screen.getByTestId('activity-group-now')).toBeTruthy()
+
+    fireEvent.click(await screen.findByTestId('stop-turn'))
+    await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith('thread-1', 't1'))
+    await turn.frame(T_BUILD_END({ turnId: 't1', status: 'stopped', reason: 'stopped_by_user' }))
+    await turn.end('completed')
+
+    await waitFor(() =>
+      expect(screen.getByTestId('activity-group-trigger').textContent).toContain('stopped before it finished'),
+    )
+    expect(screen.queryByTestId('activity-group-now')).toBeNull()
+    const glyph = screen.getByTestId('activity-glyphs').querySelector('[data-kind="tool-activity"]')
+    expect(glyph?.getAttribute('data-state')).toBe('pending')
   })
 
   it('still warns when the terminal explicitly says the snapshot did not commit', async () => {

@@ -3869,6 +3869,18 @@
             "title": "Appid",
             "type": "string"
           },
+          "startId": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startid"
+          },
           "status": {
             "const": "provisioning",
             "default": "provisioning",
@@ -3877,7 +3889,8 @@
           }
         },
         "required": [
-          "appId"
+          "appId",
+          "startId"
         ],
         "title": "RelaunchPreviewResponse",
         "type": "object"
@@ -4126,6 +4139,192 @@
         "title": "SandboxReconcileResponse",
         "type": "object"
       },
+      "SandboxStartKind": {
+        "enum": [
+          "reopen",
+          "new_project",
+          "chat",
+          "switch",
+          "shared_view"
+        ],
+        "title": "SandboxStartKind",
+        "type": "string"
+      },
+      "SandboxStartKindSummary": {
+        "description": "The starts of one kind: how many, how they ended, how many took a ready container, why\nthe rest did not, and how long each stage took. A start neither served nor failed is still\nunder way, or one whose first page no watcher saw.",
+        "properties": {
+          "claimed": {
+            "title": "Claimed",
+            "type": "integer"
+          },
+          "failed": {
+            "title": "Failed",
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SandboxStartKind"
+          },
+          "medians": {
+            "$ref": "#/components/schemas/SandboxStartMedians"
+          },
+          "misses": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "propertyNames": {
+              "$ref": "#/components/schemas/SandboxStartMiss"
+            },
+            "title": "Misses",
+            "type": "object"
+          },
+          "served": {
+            "title": "Served",
+            "type": "integer"
+          },
+          "starts": {
+            "title": "Starts",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "starts",
+          "served",
+          "failed",
+          "claimed",
+          "misses",
+          "medians"
+        ],
+        "title": "SandboxStartKindSummary",
+        "type": "object"
+      },
+      "SandboxStartMedians": {
+        "description": "Median milliseconds of each stage over the starts that reached it, and of the whole start,\ndoor to first page, over the starts that served. `None` where no start had it.",
+        "properties": {
+          "admissionMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Admissionms"
+          },
+          "browserVisibleMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browservisiblems"
+          },
+          "createMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Createms"
+          },
+          "devStartMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Devstartms"
+          },
+          "firstPageMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Firstpagems"
+          },
+          "settingsMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Settingsms"
+          },
+          "totalMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totalms"
+          }
+        },
+        "required": [
+          "admissionMs",
+          "settingsMs",
+          "createMs",
+          "devStartMs",
+          "firstPageMs",
+          "browserVisibleMs",
+          "totalMs"
+        ],
+        "title": "SandboxStartMedians",
+        "type": "object"
+      },
+      "SandboxStartMiss": {
+        "description": "Why a start created a container rather than claiming a ready one.",
+        "enum": [
+          "no_ready",
+          "unhealthy",
+          "claim_failed",
+          "size_zero"
+        ],
+        "title": "SandboxStartMiss",
+        "type": "string"
+      },
+      "SandboxStartsResponse": {
+        "description": "`GET /v1/admin/sandbox-starts` → 200 — sandbox start times, per kind of start.",
+        "properties": {
+          "kinds": {
+            "items": {
+              "$ref": "#/components/schemas/SandboxStartKindSummary"
+            },
+            "title": "Kinds",
+            "type": "array"
+          },
+          "since": {
+            "format": "date-time",
+            "title": "Since",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kinds",
+          "since"
+        ],
+        "title": "SandboxStartsResponse",
+        "type": "object"
+      },
       "SandboxTagBackfillResponse": {
         "description": "What one identity backfill pass did to the pre-existing fleet.\n\nTHE BUCKETS SUM: `scanned == alreadyTagged + stamped + skippedNoRow + failed`. `skippedNoRow`\ncontainers WERE stamped (`kind` + `backfilled_at`) but match no app row — a sandbox name keeps\nonly 28 of 32 hex chars, so it is not invertible — and stay unowned rather than guessed at.\n`unowned` is that same population, RECOUNTED EVERY PASS, deliberately outside the sum: a\ncontainer `alreadyTagged` on pass 2 makes `skippedNoRow` read zero and `scanned` look clean —\nthe trap `unowned` alone still catches. Counts only; failures travel to the logs by name.",
         "properties": {
@@ -4359,13 +4558,26 @@
               }
             ],
             "title": "Snapshottakenat"
+          },
+          "startId": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startid"
           }
         },
         "required": [
           "appId",
           "previewUrl",
           "ready",
-          "snapshotTakenAt"
+          "snapshotTakenAt",
+          "startId"
         ],
         "title": "SharedPreviewResponse",
         "type": "object"
@@ -7285,6 +7497,90 @@
         ]
       }
     },
+    "/v1/admin/sandbox-starts": {
+      "get": {
+        "description": "How long sandbox starts take, per kind of start: how many there were, how they ended, how\nmany took a ready container and why the rest did not, and the median of each stage.\n\nTotals and medians only: a start row names who started which app and when, so no route\nreturns one. `days` bounds the window, which cannot reach past the rows' own retention.",
+        "operationId": "sandbox_starts_v1_admin_sandbox_starts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 7,
+              "title": "Days",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxStartsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Super-admin privileges required"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Sandbox Starts",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/v1/admin/users": {
       "get": {
         "description": "Keyset page of the roster, newest-first, optionally filtered by a case-insensitive\nemail/display-name substring. Each row carries raw + effective limits, the suspension\nmarker, and today's folded token spend. Overrides and usage are fetched for the PAGE in one\nquery each — the usage read is a single `GROUP BY user_id` aggregate keyed to the IST day,\nnever a per-row N+1.",
@@ -9303,7 +9599,7 @@
     },
     "/v1/build-sessions/projects/{project_id}/renew": {
       "post": {
-        "description": "A screen that can frame this project is still open; hold its container.\n\nPRESENCE IS THE SIGNAL, AND SILENCE IS DEPARTURE. Nothing is sent when a citizen leaves —\nnavigating away, closing the tab, sleeping the machine and losing the network all simply stop\nthe renewals, so all four are one event with no code of their own and nothing that can fail to\narrive. What remains is a short stay that lapses, which is what a departure was always meant\nto produce.\n\nA POST, WITH CSRF, for the same reason `workspace-check` is one: it is not a free read. It\nwrites a deadline onto coordination state, and a deadline a third-party page could push\nforward from a citizen's browser is a deadline an attacker can use to run up a bill.\n\nTHE CONTAINER IS NEVER NAMED ON THE WIRE. The server resolves which container this project\nowns from its own app row — `app_name_for` is the same forward mapping the sandbox is named\nby — and the write is refused inside Redis when the record names anything else. A caller that\ncould supply a name could hold somebody else's container open.\n\n200 ON ALL THREE OUTCOMES. `not_this_container` is the ordinary reading a moment after\nsomebody opens a second project, and `nothing_running` is what a screen polling through a\nteardown sees; neither is an error, and neither is something to show anybody. A lease that\ngenuinely lapsed reaches the citizen through `preview-state`, which is the one route allowed\nto say a preview is gone.",
+        "description": "A screen that can frame this project is still open; hold its container.\n\nPRESENCE IS THE SIGNAL, AND SILENCE IS DEPARTURE. Nothing is sent when a citizen leaves —\nnavigating away, closing the tab, sleeping the machine and losing the network all simply stop\nthe renewals, so all four are one event with no code of their own and nothing that can fail to\narrive. What remains is a short stay that lapses, which is what a departure was always meant\nto produce.\n\nA POST, WITH CSRF, for the same reason `workspace-check` is one: it is not a free read. It\nwrites a deadline onto coordination state, and a deadline a third-party page could push\nforward from a citizen's browser is a deadline an attacker can use to run up a bill.\n\nTHE CONTAINER IS NEVER NAMED ON THE WIRE. The server resolves this project's app from its own\napp row and asks the registry record whether it holds that app's container; the write is\nrefused inside Redis when the record names anything else by then. A caller that could supply\na name could hold somebody else's container open.\n\n200 ON ALL THREE OUTCOMES. `not_this_container` is the ordinary reading a moment after\nsomebody opens a second project, and `nothing_running` is what a screen polling through a\nteardown sees; neither is an error, and neither is something to show anybody. A lease that\ngenuinely lapsed reaches the citizen through `preview-state`, which is the one route allowed\nto say a preview is gone.",
         "operationId": "renew_presence_v1_build_sessions_projects__project_id__renew_post",
         "parameters": [
           {
@@ -11819,6 +12115,115 @@
           }
         },
         "summary": "Record Observation",
+        "tags": [
+          "observations"
+        ]
+      }
+    },
+    "/v1/observations/start-visible": {
+      "post": {
+        "description": "Attach the browser's click-to-visible time to one of the caller's own sandbox starts.\n\nThe first report wins. A start that is someone else's, that does not exist, or that already\nhas its time is refused alike and nothing changes, so the refusal says nothing about whether\na start exists.",
+        "operationId": "record_start_visible_v1_observations_start_visible_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "How long the caller waited, in milliseconds, from the click that began one of their own\nsandbox starts to its app showing in their browser. `startId` is the id the server handed back\nfor that start; the duration is a whole number above zero and within the route's ceiling.",
+                "properties": {
+                  "durationMs": {
+                    "title": "Durationms",
+                    "type": "integer"
+                  },
+                  "startId": {
+                    "format": "uuid",
+                    "title": "Startid",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "startId",
+                  "durationMs"
+                ],
+                "title": "StartVisibleRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A start id that is not a UUID, or a duration outside its bound"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "CSRF check failed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No start of the caller's is waiting for a time under this id"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many observations"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Record Start Visible",
         "tags": [
           "observations"
         ]

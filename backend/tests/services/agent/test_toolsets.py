@@ -43,6 +43,7 @@ from src.services.agent.toolsets import (
     toolsets_for_kind,
     workspace_from_read_deps,
 )
+from src.services.analysis.placement import AnalysisSession
 from src.services.build_sessions.integrity import BASELINE_COMMIT_SUBJECT
 from src.services.messages.projection import CONNECTOR_SCHEMA_TOOL
 from src.services.orchestrator.deps import SandboxSession
@@ -383,6 +384,54 @@ async def test_the_generic_surface_is_empty_and_needs_no_sandbox_accessor() -> N
         ).toolsets
         == []
     )
+
+
+def _never_called_analysis(_ctx: RunContext[Any]) -> AnalysisSession:
+    raise AssertionError("building a surface resolves no session")
+
+
+def _never_called_sandbox(_ctx: RunContext[Any]) -> SandboxSession:
+    raise AssertionError("building a surface resolves no sandbox")
+
+
+async def _tools_of(surface: ToolSurface[Any]) -> dict[str, Any]:
+    tools: dict[str, Any] = {}
+    for toolset in surface.toolsets:
+        tools.update(await toolset.get_tools(_a_run_context()))
+    return tools
+
+
+async def test_a_generic_chat_given_a_session_gets_only_the_two_analysis_tools() -> None:
+    """Both run alone, so one session never holds two executions, and neither changes an app.
+
+    Mutation check: drop `sequential=True` from either toolset and the last assertion goes red."""
+    surface = toolsets_for_kind(
+        ChatKind.GENERIC, _never_called_workspace, analysis_of=_never_called_analysis
+    )
+    tools = await _tools_of(surface)
+
+    assert set(tools) == {"read_attachment", "run_python"}
+    assert surface.may_write is False
+    assert all(tool.tool_def.description for tool in tools.values())
+    assert all(tool.tool_def.sequential for tool in tools.values())
+
+
+@pytest.mark.parametrize("kind", _TOOL_BEARING_KINDS, ids=[k.value for k in _TOOL_BEARING_KINDS])
+async def test_plan_and_build_ignore_an_analysis_session(kind: ChatKind) -> None:
+    sandbox_of = _never_called_sandbox if kind is ChatKind.BUILD else None
+    surface = toolsets_for_kind(
+        kind, _never_called_workspace, sandbox_of, analysis_of=_never_called_analysis
+    )
+
+    assert set(await _tools_of(surface)) == set(await registered_tool_definitions(kind))
+
+
+async def test_plans_attachment_read_still_runs_alongside_other_calls() -> None:
+    surface = toolsets_for_kind(
+        ChatKind.PLAN, workspace_from_read_deps, reader_of=_reader_from_read_deps
+    )
+
+    assert (await _tools_of(surface))["read_attachment"].tool_def.sequential is False
 
 
 async def test_the_kinds_differ_by_which_toolsets_they_are_handed_and_by_nothing_else() -> None:

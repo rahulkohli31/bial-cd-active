@@ -17,8 +17,9 @@ import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-libra
 import { MemoryRouter, Routes, Route, useParams, useNavigate, useLocation } from 'react-router-dom'
 import {
   PLAN_CARD_ID, primeTurn, send, sendAndConfirm,
-  inWorkspace,
+  inWorkspace, planReply, T_WORKSPACE,
 } from './_builderSession.jsx'
+import { startWaitsFrom } from './_observeBeacons'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), getBuild: vi.fn(),
@@ -323,6 +324,35 @@ describe('BuilderPage — the preview is handed the first-view stop-clock', () =
     expect(sent).toHaveLength(1)
     expect(sent[0].name).toBe('project_to_app_visible_ms')
     expect(sent[0].value).toBeGreaterThanOrEqual(0)
+  })
+})
+
+describe('BuilderPage — the turn that starts the workspace is timed', () => {
+  /** Show the app: the reveal callback the mount actually handed the pane. */
+  function theAppShows() {
+    const { onRevealed } = h.previewProps[h.previewProps.length - 1]
+    onRevealed()
+  }
+
+  it('\u2605 reports the wait from the send to the app showing, against the start the turn named', async () => {
+    // Mutation check: stop handing the ready frame's start id to the clock and this goes red.
+    primeTurn(h, [{ ...T_WORKSPACE('ready'), startId: 's-turn' }, ...planReply()])
+    renderHandoff()
+    await screen.findByRole('button', { name: /^Build this plan$/ })
+
+    theAppShows()
+
+    expect(startWaitsFrom(h.authFetch)).toEqual([{ startId: 's-turn', durationMs: expect.any(Number) }])
+  })
+
+  it('reports nothing for a turn that attached to a workspace already running', async () => {
+    primeTurn(h, [T_WORKSPACE('ready'), ...planReply()])
+    renderHandoff()
+    await screen.findByRole('button', { name: /^Build this plan$/ })
+
+    theAppShows()
+
+    expect(startWaitsFrom(h.authFetch)).toEqual([])
   })
 })
 

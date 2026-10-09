@@ -32,7 +32,7 @@ import structlog
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
-from src.api.deps import CurrentUser, DbSession
+from src.api.deps import CurrentUser, DbSession, OptionalAnalysis
 from src.api.v1.attachments.schemas import UploadResponse
 from src.api.v1.conversations._shared import PDF_MEDIA_TYPE
 from src.core.errors import AppApiError
@@ -117,10 +117,10 @@ GENERIC_ATTACHMENT_LANES_SENTENCE: Final = (
     "isn't accepted in this chat."
 )
 """THE GENERIC CHAT'S OWN REFUSAL. `ATTACHMENT_LANES_SENTENCE` promises to open a spreadsheet,
-document or deck with code, and a generic conversation has no sandbox to keep that promise — so
-it gets a sentence that never makes it. Its portal twin is `GENERIC_ATTACHMENT_LANES_SENTENCE` in
-`portal/src/utils/attachmentInput.ts`, under the same byte-identical requirement as its sibling
-sentence above."""
+document or deck with code, and a generic conversation keeps that promise only when the analysis
+runtime is configured — without it, it gets a sentence that never makes it. Its portal twin is
+`GENERIC_ATTACHMENT_LANES_SENTENCE` in `portal/src/utils/attachmentInput.ts`, under the same
+byte-identical requirement as its sibling sentence above."""
 
 GENERIC_LANE_REFUSED_CODE: Final = "GENERIC_CHAT_ATTACHMENT_REFUSED"
 
@@ -166,8 +166,10 @@ _attachment_limiter = rate_limit(
 Storage = Annotated[ObjectStorage, Depends(storage_dependency)]
 
 
-def _validate_attachment_bytes(media_type: str, b64: Any) -> str | None:
+def _validate_attachment_bytes(media_type: str, b64: Any, lanes_sentence: str) -> str | None:
     """Validate a MODEL-LANE upload (image/PDF) against the allowlist + magic bytes.
+
+    `lanes_sentence` closes the unsupported-type refusal, chosen by what the chat can open.
 
     THE CODE LANE IS NOT CHECKED HERE, and that is the point rather than a gap. `ALLOWED_MEDIA` is
     the magic-byte gate, and it is applied on both paths that end at the model — this route and the
@@ -180,7 +182,7 @@ def _validate_attachment_bytes(media_type: str, b64: Any) -> str | None:
     if not isinstance(b64, str) or not b64:
         return "Invalid attachment: missing bytes."
     if media_type not in ALLOWED_MEDIA:
-        return f"Unsupported attachment type: {media_type}. {ATTACHMENT_LANES_SENTENCE}"
+        return f"Unsupported attachment type: {media_type}. {lanes_sentence}"
     # 24 base64 chars → 18 bytes: enough for any magic prefix + the WebP form-type at offset 8.
     try:
         prefix = base64.b64decode(b64[:24])
@@ -410,7 +412,11 @@ def _assert_pdf_is_whole_and_unlocked(data: bytes, name: str) -> None:
     ),
 )
 async def upload_attachment(
-    request: Request, user: CurrentUser, db: DbSession, storage: Storage
+    request: Request,
+    user: CurrentUser,
+    db: DbSession,
+    storage: Storage,
+    analysis: OptionalAnalysis,
 ) -> JSONResponse:
     # The wire ceiling — refuse a huge body before buffering it. Not the size cap; see the
     # constant for why the two are different questions.
@@ -435,6 +441,21 @@ async def upload_attachment(
     media_type = body.get("mediaType")
     if not isinstance(media_type, str):
         raise AppApiError(400, "mediaType is required.")
+    # Parsed ONCE here, before the branch, so every upload kind shares the same contract. The
+    # optional conversation link is resolved owner-scoped here too (a bad conversationId 404s
+    # before any bytes are parsed or stored — no orphaned object on the reject path).
+    name = _attachment_name(body.get("name"))
+    conversation_id, conversation_kind = await _resolve_conversation_link(
+        db, user.id, body.get("conversationId")
+    )
+    # A generic chat opens a code-lane file only through the analysis runtime. Without it the file
+    # is refused before a single byte is decoded, and no refusal promises to open one.
+    opens_code_lane = analysis is not None if conversation_kind is ChatKind.GENERIC else True
+    if is_code_lane(media_type) and not opens_code_lane:
+        raise AppApiError(400, GENERIC_ATTACHMENT_LANES_SENTENCE, code=GENERIC_LANE_REFUSED_CODE)
+    lanes_sentence = (
+        ATTACHMENT_LANES_SENTENCE if opens_code_lane else GENERIC_ATTACHMENT_LANES_SENTENCE
+    )
     # THE `text/*` REFUSAL INVERTS FOR THE TWO DELIMITED FORMATS. It used to refuse every
     # text type, because text rode inside the prompt rather than being uploaded. That lane is
     # gone: every attachment is now an uploaded file with a stored identity, which is what lets a
@@ -445,18 +466,7 @@ async def upload_attachment(
     # lane; the surviving reason is that no client requirement names it, and every format costs a
     # reader arm, refusal copy, a test and a line in the help page.
     if media_type.startswith("text/") and not is_code_lane(media_type):
-        raise AppApiError(400, f"That file type is not supported. {ATTACHMENT_LANES_SENTENCE}")
-    # Parsed ONCE here, before the branch, so every upload kind shares the same contract. The
-    # optional conversation link is resolved owner-scoped here too (a bad conversationId 404s
-    # before any bytes are parsed or stored — no orphaned object on the reject path).
-    name = _attachment_name(body.get("name"))
-    conversation_id, conversation_kind = await _resolve_conversation_link(
-        db, user.id, body.get("conversationId")
-    )
-    # A code-lane file is refused for a GENERIC conversation before a single byte is decoded —
-    # the conversation's kind and the declared media type are enough to answer this.
-    if conversation_kind == ChatKind.GENERIC and is_code_lane(media_type):
-        raise AppApiError(400, GENERIC_ATTACHMENT_LANES_SENTENCE, code=GENERIC_LANE_REFUSED_CODE)
+        raise AppApiError(400, f"That file type is not supported. {lanes_sentence}")
     # THE THREE ADMISSION ARMS COLLAPSE INTO TWO. Office and deck each had their own,
     # because each ran a different server-side conversion before storing: docx/xlsx were extracted
     # to Markdown, and a deck was rendered to PDF by a converter that was never deployed. Both are
@@ -468,11 +478,11 @@ async def upload_attachment(
     # also the narrow everything below relies on, which is why it is a guard rather than a branch.
     if not isinstance(b64, str) or not b64:
         raise AppApiError(400, "Invalid attachment: missing bytes.")
-    # WHICH LANE, decided once. The model reads images and PDFs itself; code in the workspace
-    # reads everything else. Neither branch is a list of extensions the other has to stay in step
-    # with — `is_code_lane` is the single answer both use.
+    # WHICH LANE, decided once. The model reads images and PDFs itself; code reads everything
+    # else. Neither branch is a list of extensions the other has to stay in step with —
+    # `is_code_lane` is the single answer both use.
     if not is_code_lane(media_type):
-        err = _validate_attachment_bytes(media_type, b64)
+        err = _validate_attachment_bytes(media_type, b64, lanes_sentence)
         if err is not None:
             raise AppApiError(400, err)
     try:

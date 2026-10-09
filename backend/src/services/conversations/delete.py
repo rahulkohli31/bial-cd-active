@@ -80,7 +80,7 @@ async def gather_and_delete_conversation(
     both the commit and the post-commit blob sweep.
     Owner-scoped by `user_id` — attachments hang off `user_id`, not the
     conversation, so the caller must pass the owning user id, not trust the row."""
-    payloads = (
+    payloads: Sequence[list[Any]] = (
         (
             await db.execute(
                 sa.select(Message.payload).where(
@@ -129,7 +129,7 @@ async def gather_and_delete_conversations(
     if not conversation_ids:
         return []
 
-    payload_rows = (
+    payload_rows: Sequence[list[Any]] = (
         (
             await db.execute(
                 sa.select(Message.payload).where(

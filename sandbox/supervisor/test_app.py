@@ -219,7 +219,7 @@ def test_the_denylist_does_not_refuse_ordinary_work(monkeypatch: pytest.MonkeyPa
 def test_health_is_open_and_ok() -> None:
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"ok": True}
+    assert r.json() == {"ok": True, "configured": True}
 
 
 def test_missing_bearer_is_401() -> None:
@@ -622,16 +622,20 @@ def test_the_identity_header_is_redacted_from_observable_output() -> None:
     assert "keep this ordinary text" in red
 
 
-def test_the_injected_table_is_the_only_source_of_both_derived_views() -> None:
-    """The allowlist and the redaction set are DERIVED, so they cannot disagree with the table.
+def test_the_injected_table_is_the_only_source_of_every_derived_view() -> None:
+    """The allowlist, the redaction set and the configurable names are DERIVED, so they cannot
+    disagree with the table.
 
     Asserted rather than assumed because the whole safety argument for widening the scrub is that
-    adding a row is the only way in — if either view were maintained by hand, a row could be
+    adding a row is the only way in — if any view were maintained by hand, a row could be
     admitted without being redacted, or redacted without being admitted."""
-    from app import _INJECTED_ENV, _INJECTED_KEYS, _SECRET_ENV_NAMES
+    from app import _INJECTED_ENV, _INJECTED_KEYS, _PER_PROJECT_ENV_NAMES, _SECRET_ENV_NAMES
 
     assert _INJECTED_KEYS == tuple(row.name for row in _INJECTED_ENV)
     assert _SECRET_ENV_NAMES == tuple(row.name for row in _INJECTED_ENV if row.secret)
+    assert _PER_PROJECT_ENV_NAMES == frozenset(
+        row.name for row in _INJECTED_ENV if row.per_project
+    )
     assert "IDENTITY_HEADER" in _SECRET_ENV_NAMES
     assert "IDENTITY_ENDPOINT" not in _SECRET_ENV_NAMES
 
@@ -2337,3 +2341,331 @@ def test_no_assigned_base_path_means_nothing_to_detect(
     sup._publish_locked("clean", (), None)
     sup._detect_base_path_tampering()
     assert sup._Compile.state == "clean"
+
+
+# --- a pool member takes its project's settings once, after its claim -------------------------
+import logging  # noqa: E402
+
+import httpx  # noqa: E402
+
+_PROJECT_SETTING_NAMES = frozenset(
+    {
+        "BIAL_APP_ID",
+        "BIAL_BLOB_CONTAINER_URL",
+        "BIAL_BLOB_SAS",
+        "BIAL_DATABASE_URL",
+        "BIAL_DICE_URL",
+        "BIAL_DICE_CLIENT_ID",
+    }
+)
+_POOL_PASSWORD = "P00lMemberRolePassw0rd"  # noqa: S105 — a test fixture, not a real credential
+_POOL_DSN = f"postgresql://bialrole_pool:{_POOL_PASSWORD}@db-pool.example:5432/bialapp_pool"
+_POOL_SAS = "sv=2021-08-06&sr=c&sp=rwdl&sig=P00lMemberSignature"
+_POOL_SETTINGS = {
+    "BIAL_APP_ID": "app-pool-1",
+    "BIAL_DATABASE_URL": _POOL_DSN,
+    "BIAL_BLOB_SAS": _POOL_SAS,
+}
+_CONFIGURE_REFUSED = (
+    'configure takes {"env": {...}} naming only per-project settings, each a non-empty string'
+)
+
+
+@pytest.fixture(autouse=True)
+def _a_fresh_pool_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """`/configure` writes into this process's real environment and latches module state, and
+    every test in this file shares the process: each starts as a container with no pool flag and
+    no project settings, and whatever a configure wrote is removed afterwards."""
+    monkeypatch.delenv("BIAL_POOL_MEMBER", raising=False)
+    monkeypatch.setattr(sup._Configure, "accepted", False)
+    before = dict(os.environ)
+    for name in _PROJECT_SETTING_NAMES:
+        os.environ.pop(name, None)
+    yield
+    for name in set(os.environ) - set(before):
+        del os.environ[name]
+    os.environ.update(before)
+
+
+def _configure(env: object, headers: dict[str, str] | None = None) -> httpx.Response:
+    return client.post(
+        "/configure", json={"env": env}, headers=AUTH if headers is None else headers
+    )
+
+
+def test_configure_hands_a_pool_member_its_settings_and_the_redactor_blanks_the_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The settings land in the supervisor's own environment, which the child scrub and the
+    redactor both read at call time: that is the whole delivery path, with no restart."""
+    monkeypatch.setenv("BIAL_POOL_MEMBER", "1")
+
+    r = _configure(_POOL_SETTINGS)
+
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+    child = _child_env()
+    assert child["BIAL_APP_ID"] == "app-pool-1"
+    assert child["BIAL_DATABASE_URL"] == _POOL_DSN
+    assert child["BIAL_BLOB_SAS"] == _POOL_SAS
+    assert "BIAL_POOL_MEMBER" not in child
+    red = _redact(
+        f"connecting to {_POOL_DSN}\n"
+        f"password authentication failed (pw={_POOL_PASSWORD})\n"
+        f"GET https://acct/app?{_POOL_SAS}\n"
+        "keep this ordinary text"
+    )
+    assert red.splitlines() == [
+        "connecting to ***",
+        "password authentication failed (pw=***)",
+        "GET https://acct/app?***",
+        "keep this ordinary text",
+    ]
+
+
+def test_configure_accepts_exactly_the_six_project_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BIAL_POOL_MEMBER", "1")
+    assert sup._PER_PROJECT_ENV_NAMES == _PROJECT_SETTING_NAMES
+    settings = {name: f"value-of-{name.lower()}" for name in sorted(_PROJECT_SETTING_NAMES)}
+
+    assert _configure(settings).status_code == 200
+
+    child = _child_env()
+    for name, value in settings.items():
+        assert child[name] == value
+
+
+def test_dev_start_after_configure_hands_the_delivered_settings_to_the_dev_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BIAL_POOL_MEMBER", "1")
+    monkeypatch.setattr(sup._Dev, "proc", None)
+    monkeypatch.setattr(sup._Dev, "ready", False)
+    monkeypatch.setattr(sup, "_dev_port_bound", lambda *a: False)
+    captured: dict[str, object] = {}
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> _FakeProc:
+        captured.update(kwargs)
+        return _FakeProc(None)
+
+    monkeypatch.setattr(sup.subprocess, "Popen", fake_popen)
+    assert _configure(_POOL_SETTINGS).status_code == 200
+
+    r = client.post("/dev/start", json={}, headers=AUTH)
+
+    assert r.status_code == 200
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["BIAL_APP_ID"] == "app-pool-1"
+    assert env["BIAL_DATABASE_URL"] == _POOL_DSN
+    assert env["BIAL_BLOB_SAS"] == _POOL_SAS
+    assert "BIAL_POOL_MEMBER" not in env
+
+
+def test_a_second_configure_is_refused_and_the_first_values_stay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BIAL_POOL_MEMBER", "1")
+    assert _configure(_POOL_SETTINGS).status_code == 200
+
+    r = _configure(
+        {
+            "BIAL_APP_ID": "app-pool-2",
+            "BIAL_DATABASE_URL": "postgresql://u:AnotherRolePassw0rd@db-other.example/x",
+        }
+    )
+
+    assert r.status_code == 409
+    assert r.json() == {"detail": "already configured"}
+    assert os.environ["BIAL_APP_ID"] == "app-pool-1"
+    assert os.environ["BIAL_DATABASE_URL"] == _POOL_DSN
+
+
+def test_two_concurrent_configures_cannot_both_be_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The check and the write are one step under a lock. The check is slowed here so that,
+    without the lock, both calls read "unconfigured" before either writes, and both succeed."""
+    monkeypatch.setenv("BIAL_POOL_MEMBER", "1")
+    real_check = sup._configured
+
+    def slow_check() -> bool:
+        answer = real_check()
+        time.sleep(0.2)
+        return answer
+
+    monkeypatch.setattr(sup, "_configured", slow_check)
+    statuses: dict[str, int] = {}
+
+    def send(app_id: str) -> None:
+        own_client = TestClient(app)
+        r = own_client.post("/configure", json={"env": {"BIAL_APP_ID": app_id}}, headers=AUTH)
+        statuses[app_id] = r.status_code
+
+    threads = [threading.Thread(target=send, args=(f"app-race-{i}",)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(statuses.values()) == [200, 409]
+    winner = next(app_id for app_id, status in statuses.items() if status == 200)
+    assert os.environ["BIAL_APP_ID"] == winner
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "SUPERVISOR_TOKEN",
+        "PATH",
+        "BIAL_BASE_PATH",
+        "BIAL_PORTAL_ORIGIN",
+        "BIAL_APPS_HOSTNAME",
+        "IDENTITY_ENDPOINT",
+        "IDENTITY_HEADER",
+        "BIAL_POOL_MEMBER",
+        "NODE_OPTIONS",
+    ],
+)
+def test_configure_refuses_a_name_outside_the_project_settings_and_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Delivered settings land in the supervisor's own environment, so any other name could
+    replace the bearer, the child's PATH or runtime flags, the path the app is served under, or
+    the pool flag itself. The valid names beside it prove the refusal is all or nothing."""
+    monkeypatch.setenv("BIAL_POOL_MEMBER", "1")
+    original = os.environ.get(name)
+
+    r = _configure({**_POOL_SETTINGS, name: "--require=/workspace/app/attacker.js"})
+
+    assert r.status_code == 422
+    assert r.json() == {"detail": _CONFIGURE_REFUSED}
+    assert os.environ.get(name) == original
+    for delivered in _POOL_SETTINGS:
+        assert delivered not in os.environ
+    assert client.get("/health").json() == {"ok": True, "configured": False}
+    # The refusal does not use up the one configure this process accepts.
+    assert _configure(_POOL_SETTINGS).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(
+            json.dumps({"env": {"BIAL_DATABASE_URL": _POOL_DSN, "PATH": "/x"}}), id="refused-name"
+        ),
+        pytest.param(json.dumps({"env": {_POOL_DSN: "x"}}), id="the-secret-as-a-name"),
+        pytest.param(json.dumps({"env": {"BIAL_DATABASE_URL": [_POOL_DSN]}}), id="not-a-string"),
+        pytest.param(
+            json.dumps({"env": {"BIAL_DATABASE_URL": _POOL_DSN, "BIAL_APP_ID": ""}}),
+            id="an-empty-value",
+        ),
+        pytest.param(
+            json.dumps({"env": {"BIAL_DATABASE_URL": _POOL_DSN + "\x00"}}),
+            id="a-value-no-environment-can-hold",
+        ),
+        pytest.param(json.dumps({"env": _POOL_DSN}), id="settings-that-are-not-a-map"),
+        pytest.param(
+            json.dumps({"env": {"BIAL_DATABASE_URL": _POOL_DSN}, "also": 1}), id="a-key-beside-env"
+        ),
+        pytest.param(json.dumps({"BIAL_DATABASE_URL": _POOL_DSN}), id="no-env-wrapper"),
+        pytest.param(json.dumps([_POOL_DSN]), id="not-an-object"),
+        pytest.param('{"env": {"BIAL_DATABASE_URL": "' + _POOL_DSN, id="truncated-json"),
+        pytest.param("[" * 1_000_000 + _POOL_DSN, id="nested-past-the-stack"),
+    ],
+)
+def test_a_refused_configure_answers_a_fixed_string_and_leaks_none_of_its_body(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    body: str,
+) -> None:
+    """A refusal must not become the leak: FastAPI's own validation 422 repeats the input it
+    rejected, and this input is a database URL."""
+    monkeypatch.setenv("BIAL_POOL_MEMBER", "1")
+    caplog.set_level(logging.DEBUG)
+
+    r = client.post(
+        "/configure", content=body, headers={**AUTH, "Content-Type": "application/json"}
+    )
+
+    assert r.status_code == 422
+    assert r.json() == {"detail": _CONFIGURE_REFUSED}
+    printed = capsys.readouterr()
+    for trace in (r.text, caplog.text, printed.out, printed.err):
+        assert _POOL_PASSWORD not in trace
+        assert "db-pool.example" not in trace
+    assert "BIAL_DATABASE_URL" not in os.environ
+    assert client.get("/health").json() == {"ok": True, "configured": False}
+
+
+def test_an_empty_configure_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BIAL_POOL_MEMBER", "1")
+
+    r = _configure({})
+
+    assert r.status_code == 422
+    assert r.json() == {"detail": _CONFIGURE_REFUSED}
+    assert client.get("/health").json() == {"ok": True, "configured": False}
+
+
+@pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer nope"}])
+def test_configure_without_the_bearer_is_refused(
+    monkeypatch: pytest.MonkeyPatch, headers: dict[str, str]
+) -> None:
+    monkeypatch.setenv("BIAL_POOL_MEMBER", "1")
+
+    r = _configure(_POOL_SETTINGS, headers=headers)
+
+    assert r.status_code == 401
+    assert "BIAL_DATABASE_URL" not in os.environ
+    assert client.get("/health").json() == {"ok": True, "configured": False}
+
+
+@pytest.mark.parametrize("flag", [None, "", "0", "true", "yes", " 1"])
+def test_a_container_created_with_its_settings_refuses_configure(
+    monkeypatch: pytest.MonkeyPatch, flag: str | None
+) -> None:
+    """Only the exact flag makes a pool member. Anything else was given its settings at creation,
+    and a configure there would replace what a running app was started with."""
+    if flag is not None:
+        monkeypatch.setenv("BIAL_POOL_MEMBER", flag)
+
+    r = _configure(_POOL_SETTINGS)
+
+    assert r.status_code == 409
+    assert r.json() == {"detail": "already configured"}
+    assert "BIAL_DATABASE_URL" not in os.environ
+    assert client.get("/health").json() == {"ok": True, "configured": True}
+
+
+def test_health_reports_a_pool_member_unconfigured_until_it_takes_its_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BIAL_POOL_MEMBER", "1")
+    assert client.get("/health").json() == {"ok": True, "configured": False}
+
+    assert _configure(_POOL_SETTINGS).status_code == 200
+
+    assert client.get("/health").json() == {"ok": True, "configured": True}
+
+
+def test_dev_start_on_an_unconfigured_pool_member_is_refused_without_spawning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """412, not 409: the control plane reads a 409 from `dev/start` as "already running"."""
+    monkeypatch.setenv("BIAL_POOL_MEMBER", "1")
+    monkeypatch.setattr(sup._Dev, "proc", None)
+    monkeypatch.setattr(sup, "_dev_port_bound", lambda *a: False)
+
+    def refuse_spawn(*args: object, **kwargs: object) -> None:
+        raise AssertionError("an unconfigured pool member must not start the app")
+
+    monkeypatch.setattr(sup.subprocess, "Popen", refuse_spawn)
+
+    r = client.post("/dev/start", json={}, headers=AUTH)
+
+    assert r.status_code == 412
+    assert r.json() == {"detail": "not configured yet"}

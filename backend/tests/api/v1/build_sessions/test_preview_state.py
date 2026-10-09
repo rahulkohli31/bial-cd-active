@@ -32,7 +32,7 @@ from src.services.build_sessions.locks import (
     write_start_failure,
     write_starting_marker,
 )
-from src.services.build_sessions.manager import SessionManager, app_name_for
+from src.services.build_sessions.manager import SessionManager
 from src.services.redis import (
     BUILD_COORDINATION_UNAVAILABLE_MSG,
     REGISTRY_STATE_ENDING,
@@ -42,21 +42,24 @@ from src.services.redis import (
 )
 from src.services.redis.keys import (
     REGISTRY_FIELD_ALIAS,
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_SERVING_SINCE,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
     REGISTRY_FIELD_WAITING_SINCE,
     starting_key,
 )
 from src.services.sandbox import DevStatus, SandboxError, SandboxHandle, SandboxNotReadyError
-from src.services.sandbox.base import new_alias
+from src.services.sandbox.base import app_name_for, new_alias
 from src.services.storage import StorageError, StorageNotFoundError, snapshot_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory
-from tests.fakes import FakeSandboxClient, detached_work_done
+from tests.fakes import FakeSandboxClient, a_name_unrelated_to_its_app, detached_work_done
 
 
 async def _user_project(db: AsyncSession, email: str):
@@ -261,20 +264,54 @@ async def test_a_live_container_for_this_project_is_alive_with_a_framable_url(
     assert body["servingSince"] is not None
 
 
-async def test_a_container_from_before_aliases_is_framed_at_the_address_it_serves(
+async def test_a_container_named_unrelated_to_its_app_is_alive_at_the_address_its_name_gives(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
-    """A record with no alias is a container the sweep is about to retire; until then it serves
-    at its own name, and framing anything else would show a blank preview over a healthy one."""
-    user, project = await _user_project(db_session, "ps-legacy-alias@rvaiglobal.com")
+    """★ The record names the app; the name is whatever the container was given, and the
+    address the pane frames follows the container, not the app.
+
+    Mutation check: compare the derived name and this project reads asleep over a serving app;
+    build the address from the derived name and the pane frames a container that is not there."""
+    user, project = await _user_project(db_session, "ps-unrelated@rvaiglobal.com")
+    app_id = await _built(db_session, user, project)
+    name = a_name_unrelated_to_its_app()
+    await _register_container(
+        fake_redis, user.id, name, state=REGISTRY_STATE_READY, serving_since=SERVED
+    )
+    await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_APP_ID, str(app_id))
+
+    body = await _probe(client, user, project)
+
+    assert body["state"] == "alive"
+    assert body["previewUrl"] == f"https://citizenapps.bialairport.com/a/{name}"
+
+
+async def test_a_colleagues_view_recorded_under_this_projects_app_is_not_its_preview(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """A view in this user's slot of an app with the same id is a colleague's restore, never
+    this project's own running build."""
+    user, project = await _user_project(db_session, "ps-view@rvaiglobal.com")
     app_id = await _built(db_session, user, project)
     await _register_container(
-        fake_redis, user.id, app_name_for(app_id), state=REGISTRY_STATE_READY, serving_since=SERVED
+        fake_redis,
+        user.id,
+        a_name_unrelated_to_its_app(),
+        state=REGISTRY_STATE_READY,
+        serving_since=SERVED,
+    )
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_ID: str(app_id),
+            REGISTRY_FIELD_SHARED_OWNER_ID: str(uuid.uuid4()),
+            REGISTRY_FIELD_SHARED_PROJECT_ID: str(uuid.uuid4()),
+        },
     )
 
     body = await _probe(client, user, project)
 
-    assert body["previewUrl"] == f"https://citizenapps.bialairport.com/a/{app_name_for(app_id)}"
+    assert (body["state"], body["previewUrl"]) == ("asleep", None)
 
 
 async def test_whoever_holds_the_workspace_this_project_reads_asleep_and_restorable(
@@ -1195,13 +1232,13 @@ async def _a_saved_project(db: AsyncSession, store, email: str):
     return user, project, app_id
 
 
-def _the_live_container(app_id: uuid.UUID) -> SandboxHandle:
+def _the_live_container(app_name: str) -> SandboxHandle:
     """What `attach_existing` hands back for a container that is already up — the handle that
     makes the next relaunch take the ATTACH arm instead of restoring."""
     return SandboxHandle(
         fqdn="live.example",
         token="tok",  # noqa: S106 - a fake, never a real bearer
-        app_name=app_name_for(app_id),
+        app_name=app_name,
         preview_url="https://live.example",
         ready=True,
     )
@@ -1225,7 +1262,7 @@ async def test_a_page_less_attach_is_non_destructive_and_the_triple_holds(
     # handle is set BEFORE either baseline is read: set it after, and "before" and "after"
     # would differ in what the fake can answer rather than in the reading under test.
     assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
-    wire.sbx.attach_handle = _the_live_container(app_id)
+    wire.sbx.attach_handle = _the_live_container(wire.sbx.restored[-1])
 
     save_state_url = f"/v1/build-sessions/projects/{project.id}/save-state"
     before_save_state = (await client.get(save_state_url, headers=auth_headers(user))).json()
@@ -1293,7 +1330,7 @@ async def test_an_attach_that_cannot_confirm_anything_refuses_rather_than_restor
     # A cold relaunch first, so a real container is up and registered for this app: without it
     # the attach below would be the certain-absent case rather than the unknown one.
     assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
-    wire.sbx.attach_handle = _the_live_container(app_id)
+    wire.sbx.attach_handle = _the_live_container(wire.sbx.restored[-1])
 
     save_state_url = f"/v1/build-sessions/projects/{project.id}/save-state"
     before_save_state = (await client.get(save_state_url, headers=auth_headers(user))).json()
@@ -1394,7 +1431,7 @@ async def test_a_cold_relaunch_whose_root_shows_no_page_keeps_the_container_it_j
     assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
     assert wire.sbx.torn_down == [], "the restored container was destroyed for answering 404"
-    assert wire.sbx.restored == [app_name_for(app_id)], "guard the premise: this was the cold arm"
+    assert len(wire.sbx.restored) == 1, "guard the premise: this was the cold arm"
     # NOTHING WATCHED IT PAINT, so nothing may claim it did.
     assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE) == ""
     settled = await _probe(client, user, project)
@@ -1468,7 +1505,7 @@ async def test_an_attached_container_whose_root_shows_no_page_loses_its_proof_no
         "guard the premise: there has to be a standing proof for the retraction to take back"
     )
     assert (await _probe(client, user, project))["state"] == "alive"
-    wire.sbx.attach_handle = _the_live_container(app_id)
+    wire.sbx.attach_handle = _the_live_container(wire.sbx.restored[-1])
     torn_down_before = list(wire.sbx.torn_down)
     # The agent deleted the page, or the route it is mid-edit stopped compiling. The container is
     # the same one that was serving a moment ago — nothing about it is gone.
@@ -1539,7 +1576,7 @@ async def test_a_supervisor_blip_never_retracts_a_proof_the_container_already_ea
     assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
     standing = await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE)
     assert standing, "guard the premise: the container earned a proof on the way up"
-    wire.sbx.attach_handle = _the_live_container(app_id)
+    wire.sbx.attach_handle = _the_live_container(wire.sbx.restored[-1])
 
     async def the_supervisor_did_not_answer(handle: SandboxHandle) -> DevStatus:
         raise SandboxError("the supervisor did not answer")

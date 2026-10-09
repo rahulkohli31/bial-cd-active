@@ -49,10 +49,10 @@ ALLOWED: dict[str, str] = {
     ),
     "api/v1/attachments/router.py": (
         "WHICH LANES THIS CHAT'S DOOR ADMITS, asked before any bytes are stored. A generic chat "
-        "has no sandbox, so a file whose only reader is a script running in one cannot be "
-        "accepted there — and the refusal has to name what this chat CAN take, which the "
-        "code-lane sentence's offer to open it with code cannot. It decides nothing about what "
-        "the model may do or is told; the toolset and the prompt are untouched by it."
+        "opens a code-lane file only through the analysis runtime, so without one the file "
+        "cannot be accepted there — and the refusal has to name what this chat CAN take, which "
+        "the code-lane sentence's offer to open it with code cannot. It decides nothing about "
+        "what the model may do or is told; the toolset and the prompt are untouched by it."
     ),
     "api/v1/conversations/turns.py": (
         "WHETHER THIS TURN RESOLVES A CONTAINER AT ALL, which is the one question the route has "

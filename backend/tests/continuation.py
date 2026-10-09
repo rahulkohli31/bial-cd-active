@@ -118,7 +118,7 @@ class Chat:
 
     async def stored_messages(self) -> list[Any]:
         """Every message a payload carries, in seq order: what a later turn could replay."""
-        payloads = (
+        payloads: Sequence[list[Any]] = (
             await self.db.scalars(
                 sa.select(Message.payload)
                 .where(Message.conversation_id == self.conversation.id)

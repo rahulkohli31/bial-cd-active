@@ -6,6 +6,15 @@ import type { BuildSessionStatus } from '../utils/buildSessionTypes'
 import type { PreviewLifeState } from '../utils/buildSessionApi'
 import type { CompileState } from '../utils/compileState'
 import { isRecord } from '../utils/apiError'
+import {
+  MOUNTED_TYPE,
+  PAINTING_TYPE,
+  PING_TYPE,
+  framedPathOf,
+  isFrameReportFor,
+  isFromFrame,
+  originOf,
+} from '../utils/frameReport'
 
 // Device-card widths drive the preview's REAL rendered pixel width (an inline style on
 // the wrapper, not a Tailwind max-width class) so the framed cross-origin doc's own media
@@ -76,58 +85,9 @@ const ALIVE_PINGS_BEFORE_STALL = 12
 const VOUCH_RETRY_LIMIT = 3
 const HEARTBEAT_MS = 15000
 
-// THE WIRE, matched by value on both sides (`sandbox/template/instrumentation-client.ts`).
-const MOUNTED_TYPE = 'bial:app-mounted'
-const PAINTING_TYPE = 'bial:app-painting'
-const PING_TYPE = 'bial:ping'
 // The starter page's question and this pane's answer, matched by value in `sandbox/template/app/page.tsx`.
 const TURN_ASK_TYPE = 'bial:turn-ask'
 const TURN_TYPE = 'bial:turn'
-
-// The path an address frames, without its trailing slash, for the identity half of the beacon
-// check below. Malformed fails closed to null, exactly as `originOf` does.
-function framedPathOf(url: string | null): string | null {
-  try {
-    if (!url) return null
-    return new URL(url).pathname.replace(/\/+$/, '')
-  } catch {
-    return null
-  }
-}
-
-/** Is this inbound frame message the document at `framedPath` speaking for itself, with this
- *  `type`? Shape and identity — provenance (origin and window) is the listener's job and is
- *  checked first. Every generated app shares one origin, so the window check alone says "an app";
- *  the path the message reports is what says "the app at this address", and a frame that
- *  navigated itself to another app reports that app's path and is not revealed as this one. An
- *  address framed at the origin's root (framed path `''`) accepts any path — there is nothing to
- *  discriminate under it, and that is the shape the origin check alone already covers. */
-function isFrameReportFor(data: unknown, type: string, framedPath: string | null): boolean {
-  if (!isRecord(data) || data.type !== type) return false
-  if (framedPath === null || typeof data.path !== 'string') return false
-  const reported = data.path.replace(/\/+$/, '')
-  return reported === framedPath || reported.startsWith(`${framedPath}/`)
-}
-
-// The scheme://host[:port] of an absolute preview URL, or null if unset/malformed. Used to
-// VALIDATE inbound postMessage origins. A malformed value fails closed (null → no frame
-// trusted, every inbound message rejected).
-function originOf(url: string | null): string | null {
-  try {
-    if (!url) return null
-    const origin = new URL(url).origin
-    // An opaque origin (a data: URL, about:blank, or a sandboxed iframe without
-    // allow-same-origin) doesn't throw and doesn't return null — new URL(...).origin
-    // is the STRING "null" for it (confirmed: new URL('data:text/html,x').origin ===
-    // "null"). That string is truthy, so without this check it would pass the
-    // `!previewOriginRef.current` guard below and every opaque-origin document's
-    // postMessage (whose real e.origin is also the string "null") would be trusted.
-    // Folded into the same fails-closed return as a malformed URL.
-    return origin === 'null' ? null : origin
-  } catch {
-    return null
-  }
-}
 
 // While the sandbox provisions and the agent builds, there is no live app to frame yet.
 const LOADING_TEXT: Partial<Record<BuildSessionStatus, string>> = {
@@ -505,9 +465,7 @@ export default function LivePreview({
   // ref is legitimately null while the pane is reconnecting or terminal, and across every
   // reload-nonce remount; messages arriving then are dropped, where origin alone used to forward
   // them. That is accepted knowingly — in those states the app document is gone, so nothing can be
-  // posting. `frameWindow` is bound and null-guarded rather than compared inline because
-  // `e.source !== ref.current?.contentWindow` reads correct while being one character (`!==` ->
-  // `!=`) away from accepting every source-less message: null == undefined.
+  // posting. Both halves live in `isFromFrame`.
   //
   // The forwarded payload feeds the browser client-error arm of self-heal: passing this gate
   // proves only WHERE the bytes came from, so the receiver narrows their shape downstream.
@@ -533,10 +491,9 @@ export default function LivePreview({
   turnRunningRef.current = turnRunning
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
-      if (!previewOriginRef.current || e.origin !== previewOriginRef.current) return
       const frame = frameRef.current
       const frameWindow = frame?.contentWindow
-      if (!frame || !frameWindow || e.source !== frameWindow) return
+      if (!frame || !isFromFrame(e, previewOriginRef.current, frameWindow)) return
       // THE BEACON, consumed here and forwarded nowhere: it is this pane's evidence, not a report.
       // It is recorded against the key of the element that SENT it — read off the committed DOM,
       // never off a value computed in render, which can run a key ahead of the iframe that is

@@ -70,7 +70,7 @@ function watchModelCalls(page: Page): { count: () => number } {
 // Retargeted at the shipped state rather than deleted — the invariant they exist for (a rejected
 // attachment never reaches the model) is flag-independent.
 test.describe('deck attachment rejections (client-side)', () => {
-  test('legacy .ppt gets the generic unsupported-type message, not advice it cannot follow', async ({ page }) => {
+  test('legacy .ppt is refused by name, with the format to re-save it as', async ({ page }) => {
     const model = watchModelCalls(page)
     await openComposer(page)
 
@@ -80,18 +80,10 @@ test.describe('deck attachment rejections (client-side)', () => {
       buffer: Buffer.from('legacy-binary-ppt'),
     })
 
-    // THE DEAD END this test used to pin the wrong side of: with decks off, "save as .pptx"
-    // sent the user to a file the allowlist refuses too. The generic message is the honest
-    // one — it names what IS accepted, so there is a next step.
-    await expect(page.getByText(/isn't supported/)).toBeVisible()
-    await expect(page.getByText(/save as \.pptx/i)).toHaveCount(0)
-    // The `not.toContainText(/pdf/i)` assertion that lived here has moved to
-    // attachmentInput-deck.test.js: it pinned "never reveal the internal deck→PDF
-    // conversion," and the generic copy legitimately lists PDF as an ACCEPTED type. With
-    // decks off there is no conversion to reveal.
+    await expect(page.getByText(/"legacy\.ppt" is an older PowerPoint format/)).toBeVisible()
 
     // No chip was added and no assistant turn was generated.
-    await expect(page.getByText('legacy.ppt')).toHaveCount(0)
+    await expect(page.getByTestId('composer-chips')).toHaveCount(0)
     expect(model.count(), 'a rejected attachment must never reach the model').toBe(0)
   })
 

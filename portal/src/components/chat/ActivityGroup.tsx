@@ -85,12 +85,13 @@ function toolCallArgs(
 /**
  * The converter's state, mapped onto the shared row atom's vocabulary. Exported because the row
  * draws the same mapping, and two copies of a state map drift the first time a state is added.
- * An absent state is a step that has not reported yet, which is 'started' — same as 'running'.
+ * An unresolved step is 'started' only while its message is still being written; once the reply
+ * is over nothing will resolve it, so it is 'pending'.
  */
-export function rowState(state: ActivityState | undefined): ToolActivityState {
+export function rowState(state: ActivityState | undefined, streaming: boolean): ToolActivityState {
   if (state === 'ok') return 'ok'
   if (state === 'failed') return 'failed'
-  return 'started'
+  return streaming ? 'started' : 'pending'
 }
 
 interface GroupFacts {
@@ -165,9 +166,10 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
    * IS THIS THE MESSAGE THE TURN IS STILL WRITING?
    *
    * The library's own message status, which is `running` only while the thread is running AND this
-   * is the last message — so it is a fact about the TURN, which is what the peek below needs and
-   * what nothing inside a group can supply. It is read here rather than plumbed as a prop because
-   * the surface already owns it: it hands `isRunning` to the runtime, and the runtime derives this.
+   * is the last message — so it is a fact about the TURN, which is what the running count and the
+   * peek below need and what nothing inside a group can supply. It is read here rather than
+   * plumbed as a prop because the surface already owns it: it hands `isRunning` to the runtime,
+   * and the runtime derives this.
    */
   const streaming = useAuiState((s) => s.message.status?.type === 'running')
   const interruptedIds = useContext(InterruptedMessagesContext)
@@ -177,7 +179,7 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
     const args = group.indices
       .map((i) => toolCallArgs(parts[i]))
       .filter((a): a is Partial<ActivityArgs> => a !== undefined)
-    const running = args.filter((a) => (a.state ?? 'running') === 'running')
+    const running = streaming ? args.filter((a) => (a.state ?? 'running') === 'running') : []
     return {
       count: args.length,
       failures: args.filter((a) => a.state === 'failed').length,
@@ -190,7 +192,7 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
         args[args.length - 1]?.label ||
         UNRECOGNISED_STEP,
     }
-  }, [group.indices, parts])
+  }, [group.indices, parts, streaming])
 
   const [open, setOpen] = useState(false)
 
@@ -279,25 +281,26 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
           <span className="flex flex-shrink-0 items-center" data-testid="activity-glyphs">
             {group.indices.map((partIndex, i) => {
               const args = toolCallArgs(parts[partIndex])
-              const state = rowState(args?.state)
-              const live = state === 'started' || state === 'pending'
+              const state = rowState(args?.state, streaming)
               const StepIcon = stepIconFor(args?.label ?? '')
               return (
                 <span
                   key={partIndex}
                   className={`flex h-[22px] w-[22px] items-center justify-center rounded-[7px] border ring-2 ring-white ${
-                    live ? 'border-canvas-tileedge bg-canvas-tilelive' : 'border-bial-border bg-canvas-tile'
+                    state === 'started'
+                      ? 'border-canvas-tileedge bg-canvas-tilelive'
+                      : 'border-bial-border bg-canvas-tile'
                   }`}
                   style={i === 0 ? undefined : { marginLeft: '-7px' }}
                 >
-                  {/* A FAILED OR RUNNING STEP KEEPS ITS STATE GLYPH. The kind icon says what the
-                      agent was doing; a cross says it did not work and a spinner says it still is,
-                      and either outranks the kind — conveyed by SHAPE and not by colour alone
-                      (WCAG 1.4.1), which is the row atom's own rule. */}
-                  {state === 'failed' || live ? (
-                    <GlyphOnly state={state} />
-                  ) : (
+                  {/* ONLY A STEP THAT WORKED SHOWS ITS KIND. A cross says it did not work, a spinner
+                      that it still is, and a faded one that it never finished; each outranks the
+                      kind icon, and none relies on colour alone (WCAG 1.4.1), which is the row
+                      atom's own rule. */}
+                  {state === 'ok' ? (
                     <StepIcon size={12} aria-hidden="true" className="text-neutral" />
+                  ) : (
+                    <GlyphOnly state={state} />
                   )}
                 </span>
               )

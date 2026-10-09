@@ -21,6 +21,7 @@ import { useState, useEffect, useRef, useCallback, useMemo, type FC } from 'reac
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
 import Announcer, { useActivityAnnouncement } from './Announcer'
 import ChatThread from './ChatThread'
+import { appendText, putStep, streamingParts, type LivePart, type LiveTurn } from './liveTurnParts'
 import ChatRuntimeProvider from './runtime/ChatRuntimeProvider'
 import Composer, { type ComposerSubmission } from './Composer'
 import { SendRefusal } from './sendRefusal'
@@ -31,7 +32,7 @@ import TurnBanner from './TurnBanner'
 import { createConversation, discardNoticeText, listProjectConversations } from '../../utils/conversationApi'
 import type { ConversationHeader } from '../../utils/conversationApi'
 import type { Project } from '../../utils/projectApi'
-import { markAppVisible } from '../../utils/observe'
+import { markAppVisible, markStartClicked, markStartVisible } from '../../utils/observe'
 import { isConversationGone } from '../../utils/chatErrors'
 
 import { resolvePreviewAddress } from '../../utils/previewAddress'
@@ -44,6 +45,8 @@ import {
   mayHaveStopped,
   nextProbeCadence,
   presenceToRenew,
+  readIsStillWorthWaitingFor,
+  renewsOnThisTick,
   resolveWorkspaceState,
   spendProbeCadence,
 } from '../workspace/workspaceState'
@@ -163,34 +166,13 @@ export interface ConversationSurfaceProps {
  *  spent when it is still pressable. */
 type PlanOverrideValue = 'build' | 'refine'
 
-/** One entry of the live turn's ordered content — see `TurnSink.parts`. */
-type SinkPart = { kind: 'text'; text: string } | { kind: 'step'; toolCallId: string; step: StepItem }
-
-/** The turn-frame reducer's mutable accumulator, carried back out to the caller once the
- * stream settles (`streamAssistant`/`reattachToTurn`/`fireRelayTurn`'s shared shape). */
-interface TurnSink {
-  /**
-   * THE LIVE TURN, PROSE AND STEPS, IN THE ORDER IT PRODUCED THEM. Was a flat `text` string
-   * beside a step map (every step, then one text block); a reload interleaves them in part
-   * order — the two only agreed because prose beside a tool call was thrown away. Steps live
-   * HERE, not only in `turnSteps` state, because the TRANSCRIPT renders them now and the frame
-   * handler (empty dep list) can't read state changing under it; `turnSteps` still exists
-   * alongside for a different question (the pane phase).
-   */
-  parts: SinkPart[]
-  /** Does the model HAVE THE FLOOR right now (the server's `working` flag)?
-   *
-   *  NOT "is it reasoning", which is what this said while the server narrowed it to that. The
-   *  server raises it whenever the model is being ASKED and nothing readable has arrived — which
-   *  now includes the gap after the last tool returns, the window a hung-looking transcript was
-   *  actually sitting in. Reading it as a reasoning signal here would under-render it.
-   *
-   *  IT IS NOT A PART, because the server never sends one and never will: reasoning text is
-   *  stored for the provider's next turn and is never framed. The flag is turned INTO a
-   *  content-free reasoning part at the TAIL of the streaming message by `streamingParts`,
-   *  because the library's status renderer is reached only when a message actually carries a
-   *  part of that kind — a boolean riding the turn renders nothing at all on its own. */
-  working: boolean
+/**
+ * The turn-frame reducer's mutable accumulator, carried back out to the caller once the stream
+ * settles (`streamAssistant`/`reattachToTurn`/`fireRelayTurn`'s shared shape). Steps live here as
+ * well as in `turnSteps` state, because the frame handler (empty dependency list) cannot read
+ * state that changes under it.
+ */
+interface TurnSink extends LiveTurn {
   terminal: 'completed' | 'failed' | 'stopped' | null
   reason: string | null
   snapshotCommitted: boolean | null
@@ -255,86 +237,6 @@ function newSink(): TurnSink {
     snapshotCommitted: null,
     turnId: null,
   }
-}
-
-/**
- * The parts of the STREAMING assistant message, in the order the turn produced them. ORDER
- * IS THE RENDER: `groupPartByType` coalesces ADJACENT steps into one group, so prose between
- * two steps seals the first and opens a second. Hidden steps are DROPPED, not positioned — a
- * gap would break that adjacency; the flag never covers reads or a failed step, both the
- * server's call. A NEW ARRAY EVERY TIME: the runtime caches on OBJECT IDENTITY (`convertMessage`
- * trap 4), so a mutated-in-place list would silently never re-render.
- */
-function streamingParts(sink: TurnSink): MessagePart[] {
-  const parts: MessagePart[] = []
-  for (const part of sink.parts) {
-    if (part.kind === 'text') {
-      // An empty text part renders no element, so an in-flight turn with steps and no prose
-      // yet is just its activity — which is exactly what should be on screen at that moment.
-      parts.push({ type: 'text', text: part.text })
-    } else if (!part.step.hidden) {
-      parts.push({ type: 'step', step: part.step })
-    }
-  }
-  // THE STATUS RIDES AT THE TAIL, and only while the model is actually thinking. It is
-  // synthesised rather than received: the server sends a boolean, never a reasoning part, so
-  // this is where the flag becomes something the thread can group and render. It carries no
-  // text — the shape has no field for any — which is what makes "status only, never the
-  // reasoning" structural rather than a promise.
-  //
-  // AT THE TAIL RATHER THAN THE HEAD, because `working` is not a turn-opening fact. It goes
-  // true again on every reasoning burst, and with adaptive thinking on, a build that loops
-  // through several tool calls thinks again between them — so pinning the row to index 0 put
-  // "Working on your app" ABOVE paragraphs and steps the citizen had already read, and the
-  // whole turn appeared to jump down the screen until the burst ended. ORDER IS THE RENDER,
-  // and the model is thinking HERE, at the end of what it has written so far.
-  //
-  // At the start of a turn `sink.parts` is empty, so this is still the first thing on screen —
-  // the case that mattered when the row was written is unchanged.
-  if (sink.working) parts.push({ type: 'reasoning' })
-  // THE STREAMING MESSAGE ALWAYS ENDS ON A TEXT PART, and the empty one is load-bearing twice
-  // over. It was implicit while this function appended the whole reply as one trailing block;
-  // once the parts became ordered it had to be said, because a turn that has only run steps so
-  // far now genuinely produces a step-only message.
-  //
-  //  1. `hasUpcomingMessage` — the library appends an optimistic assistant message with an id we
-  //     do not control the moment `isRunning` is true and the last message is not an assistant's
-  //     (convertMessage trap 3), and a message whose parts all convert to nothing is what makes
-  //     that reachable.
-  //  2. The transcript's step-only rule — a message made ONLY of steps is a STORED row that the
-  //     live message is re-telling, and it is dropped for the turn in flight. Without this the
-  //     live message matched that rule against itself and vanished mid-build.
-  //
-  // It renders no element either way, so it costs nothing on screen, and it is only appended
-  // when the newest part is not already text — a turn that has just written keeps its own block.
-  if (parts[parts.length - 1]?.type !== 'text') parts.push({ type: 'text', text: '' })
-  return parts
-}
-
-/** Append `text` to the block already open, or open a new one.
- *
- * A delta that arrives when the newest part is a STEP opens a block whatever the frame says:
- * appending to a sealed block would move that prose back above the step it was written after,
- * silently reordering the turn. */
-function appendText(sink: TurnSink, text: string, newBlock: boolean): void {
-  const newest = sink.parts[sink.parts.length - 1]
-  if (!newBlock && newest?.kind === 'text') {
-    newest.text += text
-    return
-  }
-  sink.parts.push({ kind: 'text', text })
-}
-
-/** Record a step at its position, or replace the one already there; `true` when it is new.
- *
- * The `finished` frame carries the same tool-call id as its `started` one and REPLACES it in
- * place: appending would stack a spinner beside its own result, and the activity group's live
- * count would climb while the same step re-rendered. */
-function putStep(sink: TurnSink, toolCallId: string, step: StepItem): boolean {
-  const at = sink.parts.findIndex((part) => part.kind === 'step' && part.toolCallId === toolCallId)
-  if (at === -1) sink.parts.push({ kind: 'step', toolCallId, step })
-  else sink.parts[at] = { kind: 'step', toolCallId, step }
-  return at === -1
 }
 
 export default function ConversationSurface({ chatId: chatIdProp, kind, projectId = null, project = null, onProjectUpdate, projectHasSavedBuild = null, onTitleDerived }: ConversationSurfaceProps) {
@@ -1039,8 +941,14 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
    * mid-turn RE-ATTACH on reload. A frame must not be interpreted two different ways depending
    * on which consumer happened to open the socket; `sink` carries the mutable accumulators
    * (the turn's ordered `parts`, the reasoning flag, the terminal status) back out to the caller.
+   * `began` hears the start a sent turn began; a re-attach has no click to time and passes none.
    */
-  const turnFrameHandler = useCallback((activeId: string, assistantId: string, sink: TurnSink) => {
+  const turnFrameHandler = useCallback((
+    activeId: string,
+    assistantId: string,
+    sink: TurnSink,
+    began?: (startId: string | null) => void,
+  ) => {
     // A NEW OBJECT FOR THE CHANGED MESSAGE, IDENTITY PRESERVED FOR EVERY OTHER — the runtime
     // caches the conversion on object identity, so an in-place mutation is invisible and the
     // transcript simply never re-renders (convertMessage trap 4). `.map` gives exactly that.
@@ -1103,7 +1011,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
           // dropped. Losing them would silently remove the self-heal narrative from a build
           // that reconnected.
           const diagnostics = sink.parts.filter(
-            (part): part is Extract<SinkPart, { kind: 'step' }> =>
+            (part): part is Extract<LivePart, { kind: 'step' }> =>
               part.kind === 'step' && part.toolCallId.startsWith(DIAGNOSTIC_KEY_PREFIX),
           )
           sink.parts = []
@@ -1147,6 +1055,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         paint()
       } else if (frame.type === 'workspace') {
         setTurnWorkspace({ state: frame.state, message: frame.message ?? null })
+        if (frame.state === 'ready') began?.(frame.startId ?? null)
         // `notice`, never `message`. The ordinary lifecycle pair carries a `message`
         // ("Getting your workspace ready…") on EVERY turn, and routing that here would post the
         // phase narration above the composer every time anyone sent anything. A notice is a
@@ -1320,6 +1229,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   ) => {
     const text = rawText.trim() || (attachments.length ? 'Please review the attached file(s).' : '')
     if (!text) return
+    const began = projectId ? markStartClicked(projectId) : undefined
 
     const stillHere = () => isAlive() && buildIdRef.current === activeId
     // READ BEFORE THE AWAITS BELOW, not after: `seqRef` is what tells a first message from a
@@ -1447,7 +1357,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       streamAbortRef.current?.abort()
       const controller = new AbortController()
       streamAbortRef.current = controller
-      const onFrame = turnFrameHandler(activeId, assistantId, sink)
+      const onFrame = turnFrameHandler(activeId, assistantId, sink, began)
       outcome = await readTurnStream({ conversationId: activeId, signal: controller.signal, onFrame })
       if (outcome === 'truncated' && !sink.terminal && !controller.signal.aborted) {
         // A dropped socket before the terminal: one resubscribe consolidates the turn so far
@@ -2031,6 +1941,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   // or a deep link straight into a chat, which never opened the project page that starts it.
   const handlePreviewRevealed = useCallback(() => {
     markAppVisible(projectId ?? null)
+    markStartVisible(projectId ?? null)
   }, [projectId])
   /* `completedLive` IS GONE FROM THIS SURFACE. It answered two questions with one boolean —
      "the container is up" and "a build finished successfully" — so the pane could not keep an
@@ -2173,9 +2084,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
     // the gesture where the user is asking to be brought up to date, it would answer with the
     // reading they already had.
     let latestProbe = 0
+    let newestProbeBeganAt: number | null = null
+    let lastRenewedAt: number | null = null
     let timer: ReturnType<typeof setInterval> | null = null
     // THE CADENCE THE ANSWERS HAVE DECIDED, and the delay the running timer was actually armed
-    // with. `starting` is asked about every three seconds instead of every forty-five,
+    // with. `starting` is asked about at the accelerated cadence rather than the background one,
     // because it is the one reading whose successor arrives with no gesture from anybody —
     // `nextProbeCadence` owns that decision, the bound on it, and the reasoning behind both
     // numbers, and the project surface's poll reads the same function so the two cannot drift.
@@ -2213,20 +2126,20 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       // reading it at fire time would call itself a background probe on a decision it had not
       // made yet.
       const accelerated = armed === STARTING_PROBE_MS
-      timer = setInterval(() => void probe(accelerated), armed)
+      timer = setInterval(() => void probe(accelerated, true), armed)
     }
     // `accelerated` is false for the mount probe and for both visibility handlers — a fresh
-    // surface and a deliberate human act are not the three-second timer, and neither should be
+    // surface and a deliberate human act are not the accelerated timer, and neither should be
     // denied the container reads a background tick makes.
-    const probe = async (accelerated = false) => {
+    const probe = async (accelerated = false, fromTimer = false) => {
       if (!live) return
       // A HIDDEN TAB STILL READS AND STILL RENEWS, and admits nothing else.
       //
       // This surface frames the app too, so it holds the container open exactly as the project
       // screen does — a chat route that went silent the moment somebody switched tabs would have
       // its citizen's app collected while they were reading something else for two minutes. The
-      // renewal decision is shared with the project surface (`presenceToRenew`) so the two
-      // surfaces cannot drift, and so neither can forget it.
+      // renewal decisions are shared with the project surface (`renewsOnThisTick`,
+      // `presenceToRenew`) so the two surfaces cannot drift, and so neither can forget them.
       //
       // WHAT STAYS VISIBLE-ONLY: `fetchCompileState` and `checkWorkspace` below. Each spends a
       // container call, and the second can restart the app's dev server; a hidden tab has nobody
@@ -2234,11 +2147,19 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       const hidden = document.visibilityState !== 'visible'
       // NOT AWAITED. The renewal holds the container open; this surface reports it and never
       // waits on it, so a slow renewal cannot delay the read the screen is rendering.
-      void renewPresence(projectId, presenceToRenew(hidden))
+      const now = Date.now()
+      if (renewsOnThisTick(accelerated, now, lastRenewedAt)) {
+        lastRenewedAt = now
+        void renewPresence(projectId, presenceToRenew(hidden))
+      }
+      if (fromTimer && readIsStillWorthWaitingFor(newestProbeBeganAt, now)) return
       const generation = ++latestProbe
+      newestProbeBeganAt = now
       const probeSettled = pressEnd.readBegins()
       try {
-        const state = await fetchPreviewState(projectId)
+        const state = await fetchPreviewState(projectId).finally(() => {
+          if (generation === latestProbe) newestProbeBeganAt = null
+        })
         // Superseded: a probe started after this one, so its answer is newer whatever order the
         // two responses arrived in. Bail before touching state OR the timer — an overtaken probe
         // calling `stopAsking()` would end the poll on a verdict that has already been replaced.
@@ -2246,9 +2167,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         // AN UNCHANGED ANSWER KEEPS ITS OLD OBJECT. `fetchPreviewState` parses a fresh object
         // every tick, so replacing unconditionally re-renders this whole surface — message list,
         // composer and toolbar — for a reading nobody's screen can tell apart from the one already
-        // up. `useWorkspaceState` has guarded this since it was written; the guard was never ported
-        // here, and the accelerated cadence turned that from one wasted render every 45 seconds
-        // into one every 3, through exactly the window a citizen is watching their app come up.
+        // up, on every accelerated tick through exactly the window a citizen is watching their app
+        // come up. `useWorkspaceState` holds its reading the same way.
         setPolledPreview((prev) =>
           prev && prev.projectId === projectId && samePreviewState(prev.state, state)
             ? prev
@@ -2281,7 +2201,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         // the call is an attach against a dead workspace; without the second it races the
         // stream and can move the pane backwards to an older reading.
         //
-        // AND NOT ON AN ACCELERATED TICK. The three-second cadence exists to catch a
+        // AND NOT ON AN ACCELERATED TICK. The accelerated cadence exists to catch a
         // `starting` workspace the moment it serves, and the tick that catches it is looking at a
         // container that came up seconds ago — still unpacking a snapshot, still booting a dev
         // server. A compile state read there is a container exec spent on a question whose answer
@@ -2343,12 +2263,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         // could not read — would pull a working preview off screen.
         //
         // IT DOES STILL SPEND FROM THE ACCELERATED WINDOW, though. `fetchPreviewState` throws on
-        // any non-2xx and on a dropped connection, so while only the success path could advance
-        // the count, a workspace that reached `starting` and then started erroring was probed
-        // every three seconds for the life of the tab — twenty requests a minute, with the bound
-        // that exists to stop a hung start never moving. `spendProbeCadence` draws from the window
-        // without deciding anything about the workspace; see its own note for why that asymmetry
-        // is the point.
+        // any non-2xx and on a dropped connection, so if only the success path could advance the
+        // count, a workspace that reached `starting` and then started erroring would be probed at
+        // the accelerated cadence for the life of the tab, with the bound that exists to stop a
+        // hung start never moving. `spendProbeCadence` draws from the window without deciding
+        // anything about the workspace; see its own note for why that asymmetry is the point.
         //
         // It ends an admitted press all the same, or a dead endpoint would hold the press forever.
         if (live && generation === latestProbe) probeSettled()

@@ -35,6 +35,7 @@ from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import ChatKind
 from src.services.build_sessions import locks, pass_history, reaper
 from src.services.build_sessions import manager as manager_module
+from src.services.build_sessions.inventory import OwnedApp
 from src.services.build_sessions.pass_history import CopyAttempt
 from src.services.messages.store import _INTERRUPTED_RESULT, dump_for_row
 from src.services.redis import REGISTRY_STATE_ENDING, REGISTRY_STATE_READY, get_redis
@@ -199,7 +200,10 @@ async def _sweep(chat: Chat, redis: aioredis.Redis, workspace: _Reclaimable):
     """The scheduled pass, with no in-process shield: what the worker would run."""
     app_name, app_id = await _the_app(chat, redis)
     return await reaper.sweep_all(
-        redis, workspace, live_users=set(), app_ids_by_name={app_name: app_id}
+        redis,
+        workspace,
+        live_users=set(),
+        app_ids_by_name={app_name: OwnedApp(app_id, chat.user.id)},
     )
 
 

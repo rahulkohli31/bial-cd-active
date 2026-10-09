@@ -21,8 +21,11 @@ The defence is the per-user limit in the moment, not a per-user filter afterward
 observability inside a single-tenant enterprise deployment; it must not become a way to
 profile a citizen.
 
-NO READ. The counters are read behind the superadmin gate at `GET /v1/admin/harness-counters`.
-This route has no sibling."""
+ONE WRITE USES THE IDENTITY: `POST /observations/start-visible` times one of the caller's own
+sandbox starts, and creates and reads back nothing.
+
+NO READ. The counters are read behind the superadmin gate at `GET /v1/admin/harness-counters`,
+the start times at `GET /v1/admin/sandbox-starts`."""
 
 # THE BOUND THIS ROUTE DOES NOT ENFORCE, said plainly rather than left to be discovered:
 # each name is bounded ALONE. Nothing here relates one to another, so `project_opened_chat`
@@ -46,16 +49,20 @@ This route has no sibling."""
 
 from __future__ import annotations
 
+import uuid
 from typing import Any, Final
 
+import sqlalchemy as sa
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
-from src.api.deps import CurrentUser
+from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
-from src.api.v1.observations.schemas import ObservationRequest
+from src.api.v1.build_sessions.schemas import STARTING_MARKER_TTL_SECONDS
+from src.api.v1.observations.schemas import ObservationRequest, StartVisibleRequest
 from src.core.errors import AppApiError
 from src.db.models.harness_counter import HarnessCounter
+from src.db.models.sandbox_start import SandboxStart
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses, raw_body_doc
 from src.services.build_sessions.counters import count
 from src.services.ratelimit import rate_limit
@@ -77,6 +84,10 @@ _REQUEST_BODY_DOC = raw_body_doc(ObservationRequest)
 # It is a poison bound, NOT a plausibility bound — a value under it is not thereby trustworthy.
 MAX_OBSERVED_MS: Final = 10 * 60 * 1000
 
+# The server stops holding a start as in flight once its starting marker expires, so a wait from
+# the click past that is a tab that slept rather than a start.
+MAX_START_VISIBLE_MS: Final = STARTING_MARKER_TTL_SECONDS * 1000
+
 # THE ALLOWLIST, and it is a mapping rather than a set because the ceiling is per name.
 #
 # AN OCCURRENCE COUNTER'S CEILING IS 1, because an occurrence IS one. A browser reporting
@@ -92,8 +103,9 @@ _CEILING_BY_NAME: Final[dict[str, int]] = {
     HarnessCounter.PROJECT_OPENED_CHAT.value: 1,
 }
 
-# Per-user rate limit. A whole project visit produces at most three of these, so this is roughly
-# twenty visits in five minutes — far above ordinary use, and still a bound.
+# Per-user rate limit, shared by both routes. A whole project visit produces at most four of
+# these, so this is roughly fifteen visits in five minutes — far above ordinary use, and still a
+# bound.
 OBSERVATION_RATE_LIMIT: Final = 60
 OBSERVATION_RATE_WINDOW_SECONDS: Final = 5 * 60
 
@@ -132,6 +144,17 @@ def _bounded_value(raw: Any, ceiling: int) -> int:
     return raw
 
 
+async def _json_object(request: Request, refusal: str) -> dict[str, Any]:
+    """The body as a JSON object, or a 400 `invalid_body` carrying `refusal`."""
+    try:
+        body: Any = await request.json()
+    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
+        raise AppApiError(400, refusal, code="invalid_body") from None
+    if not isinstance(body, dict):
+        raise AppApiError(400, refusal, code="invalid_body")
+    return body
+
+
 @router.post(
     "",
     status_code=201,
@@ -152,12 +175,7 @@ async def record_observation(request: Request, user: CurrentUser) -> JSONRespons
     about something that HAPPENED and must not disappear because a surrounding transaction did —
     and taking a request session here just to not use it would invite someone to write through it.
     """
-    try:
-        body: Any = await request.json()
-    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
-        raise AppApiError(400, "Observation name is required.", code="invalid_body") from None
-    if not isinstance(body, dict):
-        raise AppApiError(400, "Observation name is required.", code="invalid_body")
+    body = await _json_object(request, "Observation name is required.")
 
     name = body.get("name")
     if not isinstance(name, str):
@@ -172,3 +190,50 @@ async def record_observation(request: Request, user: CurrentUser) -> JSONRespons
     # records what happened, never who it happened to.
     await count(name, value=_bounded_value(body.get("value"), ceiling))
     return JSONResponse(status_code=201, content={"ok": True})
+
+
+@router.post(
+    "/start-visible",
+    response_model=OkResponse,
+    dependencies=[RequireCsrf, Depends(_observation_limiter)],
+    openapi_extra=raw_body_doc(StartVisibleRequest),
+    responses=error_responses(
+        (400, ErrorEnvelope, "A start id that is not a UUID, or a duration outside its bound"),
+        AUTH_401,
+        (403, ErrorEnvelope, "CSRF check failed"),
+        (404, ErrorEnvelope, "No start of the caller's is waiting for a time under this id"),
+        (429, ErrorEnvelope, "Too many observations"),
+    ),
+)
+async def record_start_visible(request: Request, user: CurrentUser, db: DbSession) -> JSONResponse:
+    """Attach the browser's click-to-visible time to one of the caller's own sandbox starts.
+
+    The first report wins. A start that is someone else's, that does not exist, or that already
+    has its time is refused alike and nothing changes, so the refusal says nothing about whether
+    a start exists."""
+    body = await _json_object(request, "A start id is required.")
+    raw_id = body.get("startId")
+    try:
+        start_id = uuid.UUID(raw_id) if isinstance(raw_id, str) else None
+    except ValueError:
+        start_id = None
+    if start_id is None:
+        raise AppApiError(400, "A start id is required.", code="invalid_body")
+    duration_ms = _bounded_value(body.get("durationMs"), MAX_START_VISIBLE_MS)
+
+    # The caller's id in the predicate is the isolation: without it anyone signed in could time
+    # anyone's start.
+    written = await db.scalar(
+        sa.update(SandboxStart)
+        .where(
+            SandboxStart.id == start_id,
+            SandboxStart.user_id == user.id,
+            SandboxStart.browser_visible_ms.is_(None),
+        )
+        .values(browser_visible_ms=duration_ms)
+        .returning(SandboxStart.id)
+    )
+    if written is None:
+        raise AppApiError(404, "Unknown start.", code="unknown_start")
+    await db.commit()
+    return JSONResponse(content={"ok": True})

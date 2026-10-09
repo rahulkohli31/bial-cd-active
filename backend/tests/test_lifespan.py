@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import MutableMapping
 from typing import Any
 
 import httpx
@@ -328,3 +329,32 @@ async def test_lifespan_fails_boot_when_the_embedding_guard_rejects_the_wiring(
     with pytest.raises(EmbeddingFoundryOnlyError):
         async with lifespan(app):
             pass  # pragma: no cover - never reached; the guard raises before the yield
+
+
+async def test_an_otlp_endpoint_in_the_environment_does_not_switch_on_telemetry_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hosting environment can inject `OTEL_EXPORTER_OTLP_*` into every container, and FastAPI
+    would start shipping request telemetry to it on its own. Export is a decision, not a side
+    effect of an upgrade or a host setting."""
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318")
+    app = create_app()
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    sent: list[str] = []
+    await inbox.put({"type": "lifespan.startup"})
+
+    async def receive() -> dict[str, Any]:
+        return await inbox.get()
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        sent.append(message["type"])
+        if message["type"] == "lifespan.startup.complete":
+            await inbox.put({"type": "lifespan.shutdown"})
+
+    await app({"type": "lifespan", "asgi": {"version": "3.0"}, "state": {}}, receive, send)
+
+    assert sent == ["lifespan.startup.complete", "lifespan.shutdown.complete"]
+    assert not isinstance(trace.get_tracer_provider(), TracerProvider)

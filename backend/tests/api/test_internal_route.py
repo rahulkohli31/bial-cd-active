@@ -81,6 +81,7 @@ async def _a_live_alias(
     await client._write_registry(
         holder,
         app_name=CONTAINER,
+        app_id=uuid.uuid4(),
         alias=alias,
         fqdn=f"{CONTAINER}.example",
         token_ref="ref",

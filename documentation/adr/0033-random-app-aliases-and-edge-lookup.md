@@ -3,11 +3,12 @@
 ## Context
 
 A preview, and a colleague's shared view of one, was served at an address carrying the name of its
-container. That name was derived from the application's identity, and a published application's
-address was built from the same identity, so anyone holding a published app's link could swap the
-prefix and open its owner's live preview. An interim security assessment reported this as
-unauthenticated access through an exposed sandbox identifier, and asked that identifiers be neither
-exposed nor reused.
+container. Until containers were named at random (ADR-0032) that name was derived from the
+application's identity, and a published application's address was built from the same identity, so
+anyone holding a published app's link could swap the prefix and open its owner's live preview.
+Random names closed that path but still put the container's name in every preview address. An
+interim security assessment reported this as unauthenticated access through an exposed sandbox
+identifier, and asked that identifiers be neither exposed nor reused.
 
 A random address answers only half of that. Anyone holding a preview's link still opens it, signed in
 or not. A preview is unreviewed work in progress running against its owner's own database, and it is
@@ -22,8 +23,10 @@ The edge therefore has to learn who is asking, and the control plane has to deci
 ## Decision
 
 **A preview's address carries a random alias.** The alias comes from a secure random generator
-(ADR-0006), is minted at the one step that creates a container, is new for every container and is
-never reused. Previews and shared views are served at `/a/<alias>/`.
+(ADR-0006), is minted when its container is created, is new for every container and is never
+reused. Previews and shared views are served at `/a/<alias>/`. A claim cannot change the path a
+container serves under, so a ready container made ahead of any project (ADR-0032) keeps the alias
+it was made with, and the claim records it for the person who takes it.
 
 **The alias lives in the registry record of the person whose workspace runs the container, with a
 reverse key that names that person.** For a shared view that person is the colleague holding it. The
@@ -131,7 +134,8 @@ presents it on the lookup and on the entry route. Rotating it is a coordinated r
   preview to another.
 - A preview already running when aliases were introduced has no alias. The scheduled sweep stops
   sparing a record without one, so it is written back and torn down, and the owner's next start
-  brings it back with an alias (ADR-0030).
+  brings it back with an alias (ADR-0030). A ready container made before the change has none either:
+  a claim lets it go and takes or makes another.
 - The portal changes before the control plane. The new edge works against the old control plane,
   which never refuses a pass, so previews stay open until the control plane restarts; a rollback
   takes the control plane back first. A browser that holds no pass when the gate arrives is sent
@@ -159,3 +163,4 @@ presents it on the lookup and on the entry route. Rotating it is a coordinated r
 - ADR-0006 (secure-random values for anything that functions as a secret)
 - ADR-0007 (the portal sign-in a pass is issued from, and the revocation it follows)
 - ADR-0030 (the scheduled sweep that retires previews from before this change)
+- ADR-0032 (ready containers made ahead, which get their alias when they are made)

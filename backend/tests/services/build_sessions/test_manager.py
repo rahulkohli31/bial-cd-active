@@ -13,8 +13,9 @@ heartbeat, adopt) and `finish_turn_sandbox` ends.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -25,6 +26,7 @@ from pydantic import SecretStr
 from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import src.db.base as db_base
 from src.api.v1.build_sessions.schemas import (
     RELAUNCH_PREVIEW_STAY_SECONDS,
     SURFACE_PRESENT_STAY_SECONDS,
@@ -32,8 +34,14 @@ from src.api.v1.build_sessions.schemas import (
 from src.config import settings
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, AppStatus
+from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
+from src.services.build_sessions import shutdown as shutdown_module
+from src.services.build_sessions.alarms import (
+    BUILD_WORKSPACE_CLAIMED_EVENT,
+    SERVING_PROOF_ABSENT_AT_TEARDOWN,
+)
 from src.services.build_sessions.appdata import (
     APP_SWITCHED_OFF_CODE,
     build_app_env,
@@ -42,9 +50,11 @@ from src.services.build_sessions.appdata import (
 from src.services.build_sessions.locks import (
     LockUnavailableError,
     heartbeat_is_alive,
+    liveness_lease_is_held,
     lock_is_held,
     read_registry,
     read_starting_marker,
+    renew_liveness_lease,
     stay_of_execution_is_current,
     write_heartbeat,
 )
@@ -56,9 +66,10 @@ from src.services.build_sessions.manager import (
     NoSnapshotToRelaunchError,
     SessionManager,
     SnapshotUnavailableError,
-    app_name_for,
 )
 from src.services.build_sessions.reaper import sweep_all
+from src.services.build_sessions.sandbox_starts import StartRecord
+from src.services.build_sessions.shutdown import OwedTeardown, ShutdownReason
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
@@ -67,6 +78,7 @@ from src.services.redis import (
 )
 from src.services.redis.keys import (
     REGISTRY_FIELD_ALIAS,
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -77,7 +89,7 @@ from src.services.redis.keys import (
     start_failure_key,
 )
 from src.services.sandbox import SandboxError, SandboxHandle
-from src.services.sandbox.base import new_alias
+from src.services.sandbox.base import app_name_for, new_alias
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import (
     StorageAuthError,
@@ -91,8 +103,11 @@ from tests.factories import (
     UserFactory,
 )
 from tests.fakes import (
+    AttachesWhatTheRecordNames,
     FakeSandboxClient,
     FakeStorage,
+    a_git_bundle,
+    a_manager_whose_ledger_is,
     a_sandbox_name,
     detached_work_done,
 )
@@ -114,6 +129,25 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
             image_ref="acr/img:latest",
         ),
     )
+
+
+@pytest.fixture
+def spawned(monkeypatch: pytest.MonkeyPatch) -> list[tuple[OwedTeardown, ShutdownReason]]:
+    """Every container a start hands to the shutdown routine, and why, recorded rather than run:
+    what the routine does once spawned is `test_shutdown.py`'s subject."""
+    recorded: list[tuple[OwedTeardown, ShutdownReason]] = []
+
+    def _record(owed: OwedTeardown, *, reason: ShutdownReason, **_aimed_at: object) -> None:
+        recorded.append((owed, reason))
+
+    monkeypatch.setattr(manager_module, "shut_it_down_in_the_background", _record)
+    return recorded
+
+
+def _handed_over(
+    spawned: list[tuple[OwedTeardown, ShutdownReason]],
+) -> list[tuple[str, bool, ShutdownReason]]:
+    return [(owed.app_name, owed.write_back, reason) for owed, reason in spawned]
 
 
 async def _end_the_turn(manager: SessionManager, session: BuildSession) -> None:
@@ -192,7 +226,9 @@ async def test_resolve_sandbox_attaches_when_registry_is_live(
         },
     )
     env = build_app_env(app_id)
-    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
+    handle = (
+        await manager._resolve_sandbox(client, user.id, app_id, env, record=StartRecord())
+    ).handle
     assert client.provisioned == [] and client.restored == []  # attached, no re-provision
     assert handle.app_name == app_name_for(app_id)
 
@@ -218,10 +254,11 @@ async def test_resolve_sandbox_restores_when_gone_but_snapshot_exists(
         },
     )
     env = build_app_env(app_id)
-    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
-    assert client.restored == [app_name_for(app_id)]  # attach gone + snapshot -> restore
+    handle = (
+        await manager._resolve_sandbox(client, user.id, app_id, env, record=StartRecord())
+    ).handle
+    assert client.restored == [handle.app_name]  # attach gone + snapshot -> restore
     assert client.provisioned == []
-    assert handle.app_name == app_name_for(app_id)
 
 
 async def test_start_raises_lock_unavailable_not_conflict_when_the_acquire_hits_redis(
@@ -280,7 +317,7 @@ async def test_start_reaps_through_a_dead_sessions_lingering_lock(
     )
     assert a_sandbox_name("someone-elses") in client.torn_down  # the ghost was executed first
     # ...and the allocation SUCCEEDED over it rather than 409ing on the phantom.
-    assert client.provisioned == [app_name_for(session.app_id)]
+    assert client.provisioned == [session.handle.app_name]
     assert manager.active_session_for(user.id) is session
 
 
@@ -328,7 +365,7 @@ async def test_start_compensates_a_provision_failure_no_leaked_lock(
     session = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=good, may_write=True
     )
-    assert good.provisioned == [app_name_for(session.app_id)]
+    assert good.provisioned == [session.handle.app_name]
 
 
 async def test_a_failed_starting_marker_write_leaks_no_lock(
@@ -386,7 +423,209 @@ async def test_reconcile_on_start_unblocks_a_crashed_user(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
     assert a_sandbox_name("stale") in client.torn_down  # the orphan was reaped on the way in
-    assert client.provisioned == [app_name_for(session.app_id)]
+    assert client.provisioned == [session.handle.app_name]
+
+
+class _ParkedBeforeItsDelete(AttachesWhatTheRecordNames):
+    """The shutdown routine waits on `gate` before it deletes a container, so a test can watch a
+    start finish while the delete it handed off has not begun."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+
+    async def teardown(self, handle: SandboxHandle) -> None:
+        await self.gate.wait()
+        await super().teardown(handle)
+
+
+async def test_a_dead_sessions_container_goes_behind_the_start_without_its_tree(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ A container still marked ending holds the slot for a session nothing is running. The
+    start owes its delete and goes on at once under a name of its own; the delete runs behind it,
+    reads nothing out of the container, and leaves the new container and its record alone.
+
+    Mutation check: owe the holder with a write-back and its tree is bundled; reap it inline and
+    nothing is left behind the start to wait for."""
+
+    @contextlib.asynccontextmanager
+    async def _session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    monkeypatch.setattr(db_base, "async_session_factory", lambda: _session())
+    saved = "b" * 40
+    user, project_id = await _mk(db_session, "m-dead-holder@rvaiglobal.com")
+    manager = SessionManager(session_factory=lambda: _session())
+    app_id = await resolve_app_for_project(db_session, user.id, project_id)
+    await db_session.commit()
+    await fake_storage.put(snapshot_key(app_id), a_git_bundle(saved), metadata={"head_sha": saved})
+    client = _ParkedBeforeItsDelete()
+    first = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+    await manager.finish_turn_sandbox(first)
+    held = first.handle.app_name
+    await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_STATE, REGISTRY_STATE_ENDING)
+    already_running = set(shutdown_module._IN_FLIGHT)
+
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+
+    behind = list(set(shutdown_module._IN_FLIGHT) - already_running)
+    assert len(behind) == 1 and not behind[0].done(), "nothing was left behind the start"
+    assert second.handle.app_name != held
+    owed = (
+        (
+            await db_session.execute(
+                sa.select(PendingTeardown).where(PendingTeardown.user_id == user.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [(row.app_name, row.write_back) for row in owed] == [(held, False)]
+
+    client.gate.set()
+    await asyncio.gather(*behind)
+
+    assert client.torn_down == [held]
+    assert client.bundled_from == [], "the dead tree was bundled"
+    meta = await fake_storage.head(snapshot_key(app_id))
+    assert meta is not None and (meta.metadata or {})["head_sha"] == saved
+    reg = await read_registry(fake_redis, user.id)
+    assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == second.handle.app_name
+    assert await lock_is_held(fake_redis, user.id) is True, "the new session lost its lock"
+    assert (
+        await db_session.execute(
+            sa.select(PendingTeardown).where(PendingTeardown.user_id == user.id)
+        )
+    ).all() == []
+    await _end_the_turn(manager, second)
+
+
+async def _a_holder_left_ending(
+    db: AsyncSession, redis: aioredis.Redis, manager: SessionManager, email: str
+) -> tuple[User, uuid.UUID, FakeSandboxClient, str]:
+    """A dead session's container still holding the slot: its turn ended, something marked it
+    ending, and nothing finished the job."""
+    user, project_id = await _mk(db, email)
+    client = FakeSandboxClient()
+    first = await manager.ensure_sandbox(
+        db, user, project_id, sandbox_client=client, may_write=True
+    )
+    await manager.finish_turn_sandbox(first)
+    await redis.hset(registry_key(user.id), REGISTRY_FIELD_STATE, REGISTRY_STATE_ENDING)
+    return user, project_id, client, first.handle.app_name
+
+
+async def test_a_dead_sessions_lock_and_lease_go_with_the_container_it_hands_over(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    spawned: list[tuple[OwedTeardown, ShutdownReason]],
+) -> None:
+    """★ A dead session leaves more than its container in the slot. Its lock would refuse the
+    start, and its liveness lease would go on sparing whatever this citizen registers next, so
+    both go with the container it hands over.
+
+    Mutation check: drop the lock reap from the hand-over and the start is refused; drop the lease
+    release and the lease outlives the start."""
+    manager = a_manager_whose_ledger_is(db_session)
+    user, project_id, client, held = await _a_holder_left_ending(
+        db_session, fake_redis, manager, "m-dead-residue@rvaiglobal.com"
+    )
+    await fake_redis.set(lock_key(user.id), "a-dead-sessions-token", ex=900)
+    assert await renew_liveness_lease(fake_redis, user.id)
+
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+
+    assert _handed_over(spawned) == [(held, False, ShutdownReason.REPLACED)]
+    assert await fake_redis.get(lock_key(user.id)) == second.lock_token
+    assert await liveness_lease_is_held(fake_redis, user.id) is False
+    await _end_the_turn(manager, second)
+
+
+async def test_a_lock_left_with_no_record_beside_it_does_not_refuse_the_start(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """A process that died between taking the lock and recording a container leaves the lock
+    alone in the slot, and the start takes the slot through it.
+
+    Mutation check: return from the empty slot's reclaim without reaping the lock and the start
+    is refused."""
+    user, project_id = await _mk(db_session, "m-lone-lock@rvaiglobal.com")
+    await fake_redis.set(lock_key(user.id), "a-dead-sessions-token", ex=900)
+    manager = SessionManager()
+
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=FakeSandboxClient(), may_write=True
+    )
+
+    assert await fake_redis.get(lock_key(user.id)) == session.lock_token
+    await _end_the_turn(manager, session)
+
+
+async def test_a_holder_handed_over_without_ever_serving_raises_the_absent_proof_alarm(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    spawned: list[tuple[OwedTeardown, ShutdownReason]],
+) -> None:
+    """★ The absent-proof alarm is the number to watch for a template that does not boot, and a
+    holder a start replaces ends its life in the hand-over rather than in a reap. It is counted
+    there, once, as replaced.
+
+    Mutation check: drop the alarm from the hand-over and nothing is counted."""
+    manager = a_manager_whose_ledger_is(db_session)
+    user, project_id, client, held = await _a_holder_left_ending(
+        db_session, fake_redis, manager, "m-dead-unproven@rvaiglobal.com"
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        second = await manager.ensure_sandbox(
+            db_session, user, project_id, sandbox_client=client, may_write=True
+        )
+
+    fired = [e for e in logs if e["event"] == SERVING_PROOF_ABSENT_AT_TEARDOWN]
+    assert [(e["app_name"], e["reason"]) for e in fired] == [(held, "replaced")]
+    await _end_the_turn(manager, second)
+
+
+async def test_a_restarted_containers_quiet_hand_over_does_not_silence_another_holders_alarm(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    spawned: list[tuple[OwedTeardown, ShutdownReason]],
+) -> None:
+    """The alarm stays quiet for the one restarted container that had served. A holder the same
+    start replaces that never served is still counted.
+
+    Mutation check: test only that some container was remembered, not which one, and this alarm
+    goes silent."""
+    manager = a_manager_whose_ledger_is(db_session)
+    user, project_id, client, held = await _a_holder_left_ending(
+        db_session, fake_redis, manager, "m-dead-other@rvaiglobal.com"
+    )
+    remembered = manager_module._restarted_after_serving.set("sbx-a-restarted-one-that-served")
+
+    try:
+        with structlog.testing.capture_logs() as logs:
+            second = await manager.ensure_sandbox(
+                db_session, user, project_id, sandbox_client=client, may_write=True
+            )
+    finally:
+        manager_module._restarted_after_serving.reset(remembered)
+
+    fired = [e for e in logs if e["event"] == SERVING_PROOF_ABSENT_AT_TEARDOWN]
+    assert [(e["app_name"], e["reason"]) for e in fired] == [(held, "replaced")]
+    await _end_the_turn(manager, second)
 
 
 async def test_concurrent_same_user_starts_never_double_allocate(
@@ -419,23 +658,26 @@ async def test_concurrent_same_user_starts_never_double_allocate(
 
 
 async def test_clean_end_then_start_restores_from_snapshot_not_fresh(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    spawned: list[tuple[OwedTeardown, ShutdownReason]],
 ) -> None:
     # A turn's end PARDONS the container: registry kept under the lease. The next allocation
     # must RESTORE the saved bundle — provisioning fresh would wipe the user's work onto a
     # blank template.
     #
     # It must ALSO not destroy the pardoned container on the way. The allocator used to pass no
-    # `spare_app`, so `_the_live_sandbox_is_already_the_one_we_want` answered False
+    # `spare`, so `_the_live_sandbox_is_already_the_one_we_want` answered False
     # unconditionally and reconcile-on-start reaped every incumbent — including, as here, one
     # already serving this very app. That is the same destroy-and-rebuild bug removed from
-    # the two turn paths and never removed from this one. Here the reap is invisible because
-    # `attach_handle` is unset, so the attach arm raises `SandboxGoneError` and the restore
-    # happens either way; on a REACHABLE container it cost the user everything since their
-    # last Save (see the sibling below).
+    # the two turn paths and never removed from this one. Here only the claim line's `reclaimed`
+    # tells the two apart, because `attach_handle` is unset and the restore happens either way;
+    # on a REACHABLE container it cost the user everything since their last Save (see the
+    # sibling below).
     #
     user, project_id = await _mk(db_session, "m15@rvaiglobal.com")
-    manager = SessionManager()
+    manager = a_manager_whose_ledger_is(db_session)
     client = FakeSandboxClient()
     first = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=client, may_write=True
@@ -449,13 +691,18 @@ async def test_clean_end_then_start_restores_from_snapshot_not_fresh(
     client.attach_handle = None
     assert await fake_redis.hgetall(registry_key(user.id)) != {}  # pardoned: registry stays
 
-    second = await manager.ensure_sandbox(
-        db_session, user, project_id, sandbox_client=client, may_write=True
-    )
+    with structlog.testing.capture_logs() as logs:
+        second = await manager.ensure_sandbox(
+            db_session, user, project_id, sandbox_client=client, may_write=True
+        )
     assert second.app_id == first.app_id  # same project -> same app
-    assert client.torn_down == []  # the pardoned container was SPARED, not reaped
-    assert client.restored == [app_name_for(second.app_id)]  # RESTORED, not re-provisioned
-    assert client.provisioned == [app_name_for(first.app_id)]  # only the very first allocation
+    # Spared at the lock; handed over at the birth, once its attach had found it gone.
+    claimed = [e["reclaimed"] for e in logs if e["event"] == BUILD_WORKSPACE_CLAIMED_EVENT]
+    assert claimed == [False]
+    assert _handed_over(spawned) == [(first.handle.app_name, False, ShutdownReason.REPLACED)]
+    assert client.torn_down == []
+    assert client.restored == [second.handle.app_name]  # RESTORED, not re-provisioned
+    assert client.provisioned == [first.handle.app_name]  # only the very first allocation
 
 
 async def test_restore_falls_back_to_fresh_when_snapshot_vanishes_mid_restore(
@@ -486,9 +733,10 @@ async def test_restore_falls_back_to_fresh_when_snapshot_vanishes_mid_restore(
     await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # head-check sees it...
 
     env = build_app_env(app_id)
-    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
-    assert client.provisioned == [app_name_for(app_id)]  # ...the pull 404s -> fresh
-    assert handle.app_name == app_name_for(app_id)
+    handle = (
+        await manager._resolve_sandbox(client, user.id, app_id, env, record=StartRecord())
+    ).handle
+    assert client.provisioned == [handle.app_name]  # ...the pull 404s -> fresh
 
 
 # --- never provision a blank template over the user's work --------------------------
@@ -559,13 +807,14 @@ async def test_head_check_retries_a_transient_blip_then_restores(
         client = FakeSandboxClient()
         app_id, env = await _seed_app_with_bundle(db_session, user, project_id, store)
 
-        handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
+        handle = (
+            await manager._resolve_sandbox(client, user.id, app_id, env, record=StartRecord())
+        ).handle
 
         assert store.head_calls == _HEAD_ATTEMPTS  # blipped, blipped, answered
         assert len(no_sleep) == _HEAD_ATTEMPTS - 1  # backed off between attempts
-        assert client.restored == [app_name_for(app_id)]
+        assert client.restored == [handle.app_name]
         assert client.provisioned == []  # never guessed "absent"
-        assert handle.app_name == app_name_for(app_id)
     finally:
         storage_accessor._backend_singleton = None
 
@@ -638,12 +887,13 @@ async def test_restore_retries_a_transient_sandbox_error_then_succeeds(
     client = FlakyRestore()
     app_id, env = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
 
-    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
+    handle = (
+        await manager._resolve_sandbox(client, user.id, app_id, env, record=StartRecord())
+    ).handle
 
     assert client.attempts == 2
-    assert client.restored == [app_name_for(app_id)]
+    assert client.restored == [handle.app_name]
     assert client.provisioned == []  # the fallback is gone for good
-    assert handle.app_name == app_name_for(app_id)
 
 
 async def test_persistent_restore_failure_fails_closed_and_never_provisions_fresh(
@@ -760,7 +1010,7 @@ async def test_start_with_object_storage_unconfigured_provisions_fresh_instead_o
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
 
-    assert client.provisioned == [app_name_for(session.app_id)]  # started, and started fresh
+    assert client.provisioned == [session.handle.app_name]  # started, and started fresh
     assert no_sleep == []  # never retried what is a permanent config fact, not a blip
     # ...and the turn still ends cleanly with no store: the recovery copy is a no-op here.
     await _end_the_turn(manager, session)
@@ -916,7 +1166,127 @@ async def test_a_turn_that_is_still_running_is_refused_at_once_and_never_waited_
         )
 
     assert manager.active_session_for(user.id) is first  # the running turn keeps the slot
-    assert client.provisioned == [app_name_for(first.app_id)]  # and no second container
+    assert client.provisioned == [first.handle.app_name]  # and no second container
+
+
+async def test_a_retry_after_a_container_was_left_behind_starts_another_under_a_new_name(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    no_sleep: list[float],
+    spawned: list[tuple[OwedTeardown, ShutdownReason]],
+) -> None:
+    """★ Each attempt at a restore is a container of its own. One that failed after its container
+    was created and recorded is let go before the next, and the next never reuses its name, so a
+    late delete of the first can never reach the second.
+
+    Mutation check: mint one name per start rather than per attempt and both attempts share it."""
+    user, project_id = await _mk(db_session, "m-retry-name@rvaiglobal.com")
+    manager = a_manager_whose_ledger_is(db_session)
+
+    class LeavesItsFirstContainerBehind(FakeSandboxClient):
+        async def restore_from_snapshot(
+            self,
+            user_id,
+            app_name,
+            *,
+            app_env,
+            source_key=None,
+            kind="build_sandbox",
+            shared_project_id=None,
+            shared_owner_id=None,
+        ):
+            handle = await super().restore_from_snapshot(user_id, app_name, app_env=app_env)
+            if len(self.restored) == 1:
+                raise SandboxError("the restore failed and its container would not go")
+            return handle
+
+    client = LeavesItsFirstContainerBehind()
+    app_id, env = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    handle = (
+        await manager._resolve_sandbox(client, user.id, app_id, env, record=StartRecord())
+    ).handle
+
+    left_behind, replacement = client.restored
+    assert left_behind != replacement
+    assert handle.app_name == replacement
+    assert _handed_over(spawned) == [(left_behind, False, ShutdownReason.REPLACED)]
+    assert client.torn_down == []
+    reg = await read_registry(fake_redis, user.id)
+    assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == replacement
+
+
+async def test_a_holder_the_ledger_cannot_take_keeps_its_record_when_its_delete_is_refused(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    no_sleep: list[float],
+) -> None:
+    """★ A record the ledger cannot take, here one that cannot say which app it ran, is deleted
+    inline, and until then it is the only thing naming its container. ARM refusing that delete
+    fails the start rather than dropping the record over a container that is still running.
+
+    Mutation check: drop the record whatever the delete said and the start goes on over an
+    orphan."""
+    user, project_id = await _mk(db_session, "m-refused-inline@rvaiglobal.com")
+    manager = a_manager_whose_ledger_is(db_session)
+    app_id, env = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+    holder = a_sandbox_name("refused-inline")
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: holder,
+            REGISTRY_FIELD_FQDN: "refused.example",
+            REGISTRY_FIELD_TOKEN_REF: "ref",
+            REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+        },
+    )
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ARM refused the delete")
+
+    with pytest.raises(SnapshotUnavailableError):
+        await manager._resolve_sandbox(client, user.id, app_id, env, record=StartRecord())
+
+    reg = await read_registry(fake_redis, user.id)
+    assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == holder
+    assert client.restored == []
+    owed = await db_session.execute(
+        sa.select(PendingTeardown).where(PendingTeardown.user_id == user.id)
+    )
+    assert owed.all() == []
+
+
+async def test_a_second_start_of_an_unsaved_project_hands_the_first_over_under_a_new_name(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    spawned: list[tuple[OwedTeardown, ShutdownReason]],
+) -> None:
+    """★ With nothing saved each birth is a fresh provision, and it is no less a container of its
+    own: the one its attach found gone goes behind the start, and the new one never shares its
+    name, so the late delete cannot reach it.
+
+    Mutation check: name the fresh provision after its app and both starts share one name; delete
+    the holder inline and nothing goes behind the start."""
+    user, project_id = await _mk(db_session, "m-fresh-twice@rvaiglobal.com")
+    manager = a_manager_whose_ledger_is(db_session)
+    client = FakeSandboxClient()
+    first = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+    await manager.finish_turn_sandbox(first)
+
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+
+    assert client.provisioned == [first.handle.app_name, second.handle.app_name]
+    assert first.handle.app_name != second.handle.app_name
+    assert _handed_over(spawned) == [(first.handle.app_name, False, ShutdownReason.REPLACED)]
+    assert client.torn_down == []
+    await _end_the_turn(manager, second)
 
 
 # --- per-app Blob env injection on the birth arms only ------------------------------
@@ -983,10 +1353,11 @@ async def test_restore_injects_both_blob_vars(
     await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # no registry + snapshot -> restore
 
     handle = (
-        await manager._resolve_sandbox(client, user.id, app_id, build_app_env(app_id))
+        await manager._resolve_sandbox(
+            client, user.id, app_id, build_app_env(app_id), record=StartRecord()
+        )
     ).handle
-    assert client.restored == [app_name_for(app_id)]
-    assert handle.app_name == app_name_for(app_id)
+    assert client.restored == [handle.app_name]
     assert calls == [app_id]
     assert client.restore_env is not None
     assert client.restore_env["BIAL_BLOB_SAS"] == _BLOB_VARS["BIAL_BLOB_SAS"]
@@ -1028,7 +1399,9 @@ async def test_attach_does_no_storage_work_and_forwards_no_env(
     )
 
     handle = (
-        await manager._resolve_sandbox(client, user.id, app_id, build_app_env(app_id))
+        await manager._resolve_sandbox(
+            client, user.id, app_id, build_app_env(app_id), record=StartRecord()
+        )
     ).handle
     assert client.provisioned == [] and client.restored == []  # attached
     assert handle.app_name == app_name_for(app_id)
@@ -1132,7 +1505,7 @@ async def _relaunched(
     client: FakeSandboxClient,
 ) -> uuid.UUID:
     """One press, with everything it detached waited out."""
-    app_id = await manager.relaunch_preview(db, user, project_id, client)
+    app_id = (await manager.relaunch_preview(db, user, project_id, client)).app_id
     await detached_work_done(manager)
     return app_id
 
@@ -1154,9 +1527,8 @@ async def test_relaunch_restores_starts_the_dev_server_and_releases_the_lock(
 
     assert await _relaunched(manager, db_session, user, project_id, client) == app_id
 
-    name = app_name_for(app_id)
-    assert client.restored == [name]
-    assert client.dev_started == [name]  # NOT just restored — the dev server was started
+    assert len(client.restored) == 1
+    assert client.dev_started == client.restored  # NOT just restored — the dev server was started
     assert await _proven(fake_redis, user.id)  # ...and something watched it show a page
     assert client.provisioned == []  # never a blank template
     assert await lock_is_held(fake_redis, user.id) is False  # lock released — slot not held
@@ -1180,13 +1552,14 @@ async def test_relaunch_answers_before_the_container_is_up(
         manager.relaunch_preview(db_session, user, project_id, client), timeout=5
     )
 
-    assert answered == app_id
+    assert answered.app_id == app_id
     await asyncio.wait_for(client.restoring.wait(), timeout=5)
     assert await read_starting_marker(fake_redis, user.id) == project_id  # the poll says starting
     assert await lock_is_held(fake_redis, user.id) is True  # the start still holds the slot
     client.gate.set()
     await detached_work_done(manager)
-    assert client.dev_started == [app_name_for(app_id)]
+    assert len(client.restored) == 1
+    assert client.dev_started == client.restored
     assert await lock_is_held(fake_redis, user.id) is False
 
 
@@ -1208,11 +1581,11 @@ async def test_a_second_press_while_the_first_is_still_coming_up_joins_it(
         manager.relaunch_preview(db_session, user, project_id, client), timeout=5
     )
 
-    assert again == app_id
+    assert again.app_id == app_id
     client.gate.set()
     await detached_work_done(manager)
-    assert client.restored == [app_name_for(app_id)]  # one start, not two
-    assert client.dev_started == [app_name_for(app_id)]
+    assert len(client.restored) == 1  # one start, not two
+    assert client.dev_started == client.restored
 
 
 async def test_relaunch_does_not_occupy_the_build_slot(
@@ -1311,7 +1684,7 @@ async def test_relaunch_keeps_a_restored_container_whose_app_shows_no_page(
 
     await _relaunched(manager, db_session, user, project_id, client)
 
-    assert client.restored == [app_name_for(app_id)]  # a container WAS created...
+    assert len(client.restored) == 1  # a container WAS created...
     assert client.torn_down == []  # ...and it survives the app being slow
     assert not await _proven(fake_redis, user.id), "nothing watched it show a page"
     registry = await read_registry(fake_redis, user.id)
@@ -1353,7 +1726,7 @@ async def test_relaunch_spares_the_container_when_the_stay_settle_hits_a_redis_e
     finally:
         monkeypatch_eval.undo()
 
-    assert client.restored == [app_name_for(app_id)]  # a container WAS created...
+    assert len(client.restored) == 1  # a container WAS created...
     assert client.torn_down == []  # ...and SURVIVES
     assert manager._active_by_user == {}
 
@@ -1385,7 +1758,7 @@ async def test_a_store_blip_once_the_app_is_up_still_watches_for_its_first_page(
     with structlog.testing.capture_logs() as logs:
         await _relaunched(manager, db_session, user, project_id, client)
 
-    assert client.restored == [app_name_for(app_id)]
+    assert len(client.restored) == 1
     assert client.torn_down == []
     assert await _proven(fake_redis, user.id), "the app was up and nothing watched it"
     assert await fake_redis.get(start_failure_key(user.id)) is None
@@ -1432,10 +1805,9 @@ async def test_a_press_during_a_failed_starts_teardown_starts_afresh_instead_of_
         await asyncio.sleep(0)
     client.gate.set()
 
-    assert await asyncio.wait_for(again, timeout=5) == app_id
+    assert (await asyncio.wait_for(again, timeout=5)).app_id == app_id
     await detached_work_done(manager)
-    name = app_name_for(app_id)
-    assert client.restored == [name, name], "the second press joined the lost start"
+    assert len(set(client.restored)) == 2, "the second press joined the lost start"
     assert await _proven(fake_redis, user.id)
 
 
@@ -1507,7 +1879,7 @@ async def test_a_relaunch_while_a_turn_is_still_letting_go_waits_like_a_message_
 
     gate.set()
     await finishing
-    assert await relaunching == app_id  # and then the start is admitted
+    assert (await relaunching).app_id == app_id  # and then the start is admitted
     await detached_work_done(manager)
 
 
@@ -1572,9 +1944,8 @@ async def test_a_start_cancelled_mid_flight_still_tears_down_and_releases_the_lo
         task.cancel()
     await detached_work_done(manager)
 
-    name = app_name_for(app_id)
-    assert client.restored == [name]  # a container WAS created before the cancel...
-    assert client.torn_down == [name]  # ...and compensation tore it down anyway
+    assert len(client.restored) == 1  # a container WAS created before the cancel...
+    assert client.torn_down == client.restored  # ...and compensation tore it down anyway
     assert await lock_is_held(fake_redis, user.id) is False  # lock released — no wedged slot
     assert manager._active_by_user == {}
 
@@ -1652,7 +2023,7 @@ async def test_a_sweep_during_the_relaunch_provision_window_does_not_reap_it(
     assert client.reaped_mid_provision == 0  # ...and spared it anyway
     assert client.torn_down == []  # the half-built container survived
     reg = await read_registry(fake_redis, user.id)
-    assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == app_name_for(app_id)
+    assert reg is not None and client.restored == [reg[REGISTRY_FIELD_APP_NAME]]
     # The preview is live AND leased at the end — not merely un-reaped by luck.
     assert await stay_of_execution_is_current(fake_redis, user.id) is True
 
@@ -1677,10 +2048,10 @@ async def test_the_next_real_start_reaps_a_relaunched_preview_through_its_stay(
 
     await _relaunched(manager, db_session, user, project_a, client)
 
-    preview_app_name = app_name_for(preview_app_id)
     reg = await read_registry(fake_redis, user.id)
     assert reg is not None
-    assert reg[REGISTRY_FIELD_APP_NAME] == preview_app_name
+    preview_app_name = reg[REGISTRY_FIELD_APP_NAME]
+    assert reg[REGISTRY_FIELD_APP_ID] == str(preview_app_id)
     # A genuinely CURRENT lease — the sweep would spare this container right now.
     assert datetime.fromisoformat(reg[REGISTRY_FIELD_PREVIEW_STAY_UNTIL]) > datetime.now(UTC)
     assert await stay_of_execution_is_current(fake_redis, user.id) is True
@@ -1694,7 +2065,7 @@ async def test_the_next_real_start_reaps_a_relaunched_preview_through_its_stay(
     assert preview_app_name in client.torn_down
     # (b) ...and the registry now names the NEW SESSION's app. Project B is a different app,
     #     so this is a real assertion and not a tautology about a shared app_name.
-    build_app_name = app_name_for(session.app_id)
+    build_app_name = session.handle.app_name
     assert build_app_name != preview_app_name
     reg_after = await read_registry(fake_redis, user.id)
     assert reg_after is not None
@@ -1790,7 +2161,7 @@ async def test_relaunch_never_attaches_to_a_container_that_is_already_ending(
 
     name = app_name_for(app_id)
     assert client.torn_down == [name]  # the dying container was reaped...
-    assert client.restored == [name]  # ...and a fresh one restored
+    assert len(client.restored) == 1 and client.restored != [name]  # ...and a fresh one restored
 
 
 async def test_a_post_attach_failure_spares_the_attached_container(
@@ -1868,8 +2239,8 @@ async def test_dev_start_failing_on_the_restore_arm_still_fails_the_relaunch(
 
     await _relaunched(manager, db_session, user, project_id, client)
 
-    assert client.restored == [app_name_for(app_id)]
-    assert client.torn_down == [app_name_for(app_id)]  # ours to create, ours to clean up
+    assert len(client.restored) == 1
+    assert client.torn_down == client.restored  # ours to create, ours to clean up
     assert await lock_is_held(fake_redis, user.id) is False
 
 
@@ -2304,6 +2675,33 @@ async def test_a_project_that_never_switched_it_on_is_born_with_nothing_extra(
     assert client.provision_env is not None
     assert url_name not in client.provision_env
     assert client_id_name not in client.provision_env
+
+
+async def test_a_colleagues_view_of_a_switched_on_project_is_born_with_nothing_extra(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    _lake_configured: None,
+) -> None:
+    """The connector is its owner's: a colleague's view of the project gets none of it.
+
+    Mutation check: build the view's settings with the owner's connector and the colleague's
+    container is born with the owner's coordinates."""
+    from src.db.models.project import Project
+
+    owner, project_id = await _switched_on_connector_project(db_session, "cx4@rvaiglobal.com")
+    await _seed_app_with_bundle(db_session, owner, project_id, fake_storage)
+    colleague = await UserFactory.create(db_session, email="cx4-colleague@rvaiglobal.com")
+    project = await db_session.get(Project, project_id)
+    assert project is not None
+    client = FakeSandboxClient()
+
+    await SessionManager().launch_shared_preview(db_session, colleague, project, client)
+
+    url_name, client_id_name = _connector_names()
+    assert client.restore_env is not None, "the view was never restored"
+    assert url_name not in client.restore_env
+    assert client_id_name not in client.restore_env
 
 
 # --- the copy fires on a BIRTH, and only on a birth ----------------------------------------------

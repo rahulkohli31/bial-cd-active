@@ -38,6 +38,7 @@ from src.services.redis.keys import (
     ns,
     registry_key,
     registry_scan_patterns,
+    user_id_from_key,
 )
 from src.services.sandbox.base import new_alias
 
@@ -226,6 +227,22 @@ def test_the_scan_patterns_are_literals_and_never_wildcard_the_environment() -> 
         assert "*" not in head, f"{pattern} wildcards a segment above the user id"
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        f"bial:{_ENV}:sandbox:registry:{_U1}",
+        f"bial:sandbox:registry:{_U1}",
+    ],
+)
+def test_a_scanned_key_gives_back_the_user_it_was_built_for(key: str) -> None:
+    assert user_id_from_key(key) == _U1
+
+
+@pytest.mark.parametrize("key", ["bial:sandbox:registry:not-a-uuid", "bial:sandbox:registry:"])
+def test_a_key_this_platform_did_not_write_names_nobody(key: str) -> None:
+    assert user_id_from_key(key) is None
+
+
 # --- the type IS the boundary --------------------------------------------------------------
 
 
@@ -271,6 +288,8 @@ def test_registry_fields_are_the_frozen_set() -> None:
             "token_ref",
             "created_at",
             "state",
+            # The app the container runs; every lookup compares it rather than a name.
+            "app_id",
             "alias",
             # THE ONLY FIELD ON THIS HASH THAT MEANS THE APP ANSWERED A REQUEST. `state` is a
             # reaper-lifecycle label — its two values say whether the container is being torn

@@ -9,6 +9,7 @@ the tests here are as much about what is NOT written as about what is.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -17,25 +18,37 @@ from httpx import AsyncClient
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.v1.build_sessions import router as build_sessions_router
 from src.api.v1.build_sessions.schemas import (
     HIDDEN_SURFACE_PRESENT_STAY_SECONDS,
     SURFACE_PRESENT_STAY_SECONDS,
 )
 from src.services.build_sessions.appdata import resolve_app_for_project
-from src.services.build_sessions.manager import app_name_for
+from src.services.build_sessions.locks import (
+    Occupant,
+    SharedViewStamp,
+    record_holds,
+    shared_view_stamp,
+)
 from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_SERVING_SINCE,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_STAY_WRITER,
     REGISTRY_FIELD_TOKEN_REF,
+    legacy_registry_key,
 )
+from src.services.sandbox.base import app_name_for
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory
+from tests.fakes import a_name_unrelated_to_its_app
 
 
 async def _user_project_app(db_session: AsyncSession, email: str):
@@ -105,6 +118,41 @@ async def test_a_present_surface_pushes_the_stay_forward(
     assert writer == "surface_present"
     assert timedelta(seconds=SURFACE_PRESENT_STAY_SECONDS - 5) <= stay - before
     assert stay - before <= timedelta(seconds=SURFACE_PRESENT_STAY_SECONDS + 5)
+
+
+async def test_a_container_named_unrelated_to_its_app_has_its_stay_renewed(
+    client: AsyncClient, db_session: AsyncSession, fake_redis
+) -> None:
+    """The record names the app; the name is whatever the container was given.
+
+    Mutation check: compare, or hand the script, the name derived from the app and the screen
+    framing this container stops holding it open."""
+    user, project, app_id = await _user_project_app(db_session, "unrelated@bial.test")
+    await _register(fake_redis, user.id, a_name_unrelated_to_its_app())
+    await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_APP_ID, str(app_id))
+
+    body = await _renew(client, user, project)
+
+    assert body["outcome"] == "renewed"
+    stay, writer = await _stay(fake_redis, user.id)
+    assert stay is not None
+    assert writer == "surface_present"
+
+
+async def test_a_record_left_under_the_old_key_has_its_stay_renewed(
+    client: AsyncClient, db_session: AsyncSession, fake_redis
+) -> None:
+    """Mutation check: read only the current key and the screen framing this container stops
+    holding it open."""
+    user, project, app_id = await _user_project_app(db_session, "old-key@bial.test")
+    await _register(fake_redis, user.id, app_name_for(app_id))
+    await fake_redis.rename(registry_key(user.id), legacy_registry_key(user.id))
+
+    body = await _renew(client, user, project)
+
+    assert body["outcome"] == "renewed"
+    stay, _ = await _stay(fake_redis, user.id)
+    assert stay is not None
 
 
 async def test_a_hidden_surface_asks_for_the_longer_budget(
@@ -224,6 +272,31 @@ async def test_a_renewal_aimed_at_another_project_writes_nothing(
     assert stay is None, "the other project's container was given a reprieve it did not earn"
 
 
+async def test_a_view_of_the_app_is_not_its_build_sandbox(
+    client: AsyncClient, db_session: AsyncSession, fake_redis
+) -> None:
+    """A record naming this app but stamped as a shared view is not the container this project's
+    screen frames.
+
+    Mutation check: leave the stamp out of what the renewal reads and the view is held open."""
+    user, project, app_id = await _user_project_app(db_session, "a-view@bial.test")
+    await _register(fake_redis, user.id, a_name_unrelated_to_its_app())
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_ID: str(app_id),
+            REGISTRY_FIELD_SHARED_OWNER_ID: str(uuid.uuid4()),
+            REGISTRY_FIELD_SHARED_PROJECT_ID: str(project.id),
+        },
+    )
+
+    body = await _renew(client, user, project)
+
+    assert body["outcome"] == "not_this_container"
+    stay, _ = await _stay(fake_redis, user.id)
+    assert stay is None
+
+
 async def test_no_registry_hash_is_conjured_for_a_project_with_nothing_running(
     client: AsyncClient, db_session: AsyncSession, fake_redis
 ) -> None:
@@ -301,8 +374,8 @@ async def test_an_unreadable_coordination_store_answers_503(
     re-arms on the difference, and reading an outage as "your container is gone" is exactly the
     mistake `preview-state` was reshaped to stop making.
 
-    PATCHED ON `eval`, WHICH IS THE ONE CALL THIS ROUTE MAKES. Refusing a method the route never
-    invokes would leave this green whatever the route did with an outage."""
+    PATCHED ON `eval`, THE ROUTE'S WRITE. Refusing a method the route never invokes would leave
+    this green whatever the route did with an outage."""
     user, project, app_id = await _user_project_app(db_session, "outage@bial.test")
     await _register(fake_redis, user.id, app_name_for(app_id))
 
@@ -339,3 +412,49 @@ async def test_the_body_may_be_omitted_and_reads_as_a_visible_surface(
     stay, _ = await _stay(fake_redis, user.id)
     assert stay is not None
     assert stay - before <= timedelta(seconds=SURFACE_PRESENT_STAY_SECONDS + 5)
+
+
+class _AskedFor(Mapping[str, str]):
+    """A registry record that remembers every field it was asked for."""
+
+    def __init__(self, fields: dict[str, str]) -> None:
+        self._fields = fields
+        self.asked: set[str] = set()
+
+    def __getitem__(self, field: str) -> str:
+        self.asked.add(field)
+        return self._fields[field]
+
+    def __iter__(self) -> Iterator[str]:
+        self.asked.update(self._fields)
+        return iter(self._fields)
+
+    def __len__(self) -> int:
+        return len(self._fields)
+
+
+def test_a_renewal_fetches_every_field_its_ownership_check_reads() -> None:
+    """The renewal fetches named fields rather than the whole record, so a field the check comes to
+    read that the list lacks would read as absent and refuse every renewal of that container.
+
+    Mutation check: drop the owner's field from the renewal's list and this goes red."""
+    app_id, user_id = uuid.uuid4(), uuid.uuid4()
+    view = SharedViewStamp(owner_id=uuid.uuid4(), project_id=uuid.uuid4())
+    recorded = _AskedFor(
+        {
+            REGISTRY_FIELD_APP_ID: str(app_id),
+            REGISTRY_FIELD_APP_NAME: a_name_unrelated_to_its_app(),
+            REGISTRY_FIELD_SHARED_PROJECT_ID: str(view.project_id),
+            REGISTRY_FIELD_SHARED_OWNER_ID: str(view.owner_id),
+        }
+    )
+    named_for_its_app = _AskedFor({REGISTRY_FIELD_APP_NAME: app_name_for(app_id)})
+
+    for reg in (recorded, named_for_its_app):
+        for occupant in (Occupant(app_id), Occupant(app_id, view)):
+            record_holds(reg, occupant, user_id)
+        shared_view_stamp(reg)
+
+    assert recorded.asked | named_for_its_app.asked == set(
+        build_sessions_router._WHAT_A_RENEWAL_READS
+    )

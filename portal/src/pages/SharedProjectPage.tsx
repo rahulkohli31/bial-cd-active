@@ -15,7 +15,7 @@
  * whatever the owner currently has saved, and reports when that snapshot was taken — the two
  * `buildSessionApi` calls this wires to directly (see their own docstrings for the distinction).
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft, RefreshCw } from 'lucide-react'
 import { BusyGlyph } from '../components/ui/Waiting'
@@ -34,6 +34,8 @@ import {
 import type { SharedPreviewResponse } from '../utils/buildSessionTypes'
 import { ApiError } from '../utils/apiError'
 import { relativeTimeVerbose } from '../utils/relativeTime'
+import { markStartAbandoned, markStartClicked, markStartVisible } from '../utils/observe'
+import { MOUNTED_TYPE, isTrustedFrameReport } from '../utils/frameReport'
 import { PROJECT_GONE_NOTICE } from './ProjectsPage'
 
 export default function SharedProjectPage(): React.JSX.Element {
@@ -47,14 +49,13 @@ export default function SharedProjectPage(): React.JSX.Element {
   const [launching, setLaunching] = useState(false)
   const [launchError, setLaunchError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
-  // FORCES THE IFRAME TO ACTUALLY RELOAD. `preview.previewUrl` is a hash of (app, recipient)
-  // — `shr_name_for` — so it is byte-identical across a teardown-and-restore: a successful
-  // Refresh writes the SAME `src` to the SAME node, React sees no prop change, and the
-  // browser never reloads. The recipient keeps looking at a document whose container
-  // underneath it has already been destroyed and rebuilt. Bumped on every successful
-  // launch/refresh and folded into the iframe's `key`, which — unlike `src` — React always
-  // treats a change to as "this is a new element", forcing a real remount.
+  // FORCES THE IFRAME TO ACTUALLY RELOAD. A Launch that finds the view already running answers
+  // with the `previewUrl` the frame already holds, so React writes the SAME `src` to the SAME
+  // node and the browser never reloads. Bumped on every successful launch/refresh and folded
+  // into the iframe's `key`, which — unlike `src` — React always treats a change to as "this is
+  // a new element", forcing a real remount.
   const [frameNonce, setFrameNonce] = useState(0)
+  const frameRef = useRef<HTMLIFrameElement | null>(null)
 
   // THE HAND-OVER PROMPT. `launchSharedPreview`/`refreshSharedPreview` take the caller's own
   // one-per-user slot, so either can 409 `sandbox_reclaim_blocked` while one of the caller's own
@@ -110,10 +111,12 @@ export default function SharedProjectPage(): React.JSX.Element {
 
   const launch = useCallback((): void => {
     if (!projectId) return
+    const began = markStartClicked(projectId)
     setLaunching(true)
     setLaunchError(null)
     launchSharedPreview(projectId)
       .then(async (res) => {
+        began(res.startId)
         await renewSessionForPreview()
         setPreview(res)
         setFrameNonce((n) => n + 1)
@@ -148,10 +151,12 @@ export default function SharedProjectPage(): React.JSX.Element {
 
   const onRefresh = useCallback((): void => {
     if (!projectId) return
+    const began = markStartClicked(projectId)
     setRefreshing(true)
     setLaunchError(null)
     refreshSharedPreview(projectId)
       .then(async (res) => {
+        began(res.startId)
         await renewSessionForPreview()
         setPreview(res)
         setFrameNonce((n) => n + 1)
@@ -167,6 +172,24 @@ export default function SharedProjectPage(): React.JSX.Element {
       })
       .finally(() => setRefreshing(false))
   }, [projectId])
+
+  // THE STOP FOR A START BEGUN HERE, the builder pane's own: the framed document's
+  // `bial:app-mounted`, trusted only from this page's frame, at its origin and its path. Never a
+  // `load`, which a 502 fires too. There is no cover to wait for: the frame is drawn only once the
+  // server says the view is serving.
+  const framedUrl = preview !== null && preview.ready ? preview.previewUrl : null
+  useEffect(() => {
+    if (!projectId || framedUrl === null) return
+    const onMessage = (e: MessageEvent) => {
+      if (isTrustedFrameReport(e, framedUrl, frameRef.current?.contentWindow, MOUNTED_TYPE)) {
+        markStartVisible(projectId)
+      }
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [projectId, framedUrl])
+  // Leaving the page, or this share for another, ends the wait unreported.
+  useEffect(() => () => markStartAbandoned(), [projectId])
 
   // Fresh sequencing every time the dialog opens — a hand-over that failed and was retried
   // must not carry the PREVIOUS attempt's step forward.
@@ -282,6 +305,7 @@ export default function SharedProjectPage(): React.JSX.Element {
           </div>
         ) : preview !== null && preview.ready ? (
           <iframe
+            ref={frameRef}
             key={`${preview.previewUrl}#${frameNonce}`}
             title={project?.name || 'Shared application'}
             src={preview.previewUrl}

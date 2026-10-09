@@ -68,12 +68,14 @@ from src.services.build_sessions import (
     SharedProjectHasNoAppError,
     SnapshotUnavailableError,
     StopOutcome,
-    app_name_for,
     sweep_all,
 )
 from src.services.build_sessions.inventory import owning_app_ids
 from src.services.build_sessions.locks import (
+    Occupant,
     StartFailure,
+    read_registry,
+    record_holds,
     renew_presence_stay,
 )
 from src.services.orchestrator.client_errors import (
@@ -89,6 +91,13 @@ from src.services.redis import (
     build_coordination_or_503,
     coordination_is_gone,
     get_redis,
+    registry_key,
+)
+from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
 )
 from src.services.sandbox import SandboxError
 from src.services.sandbox.base import CompileState
@@ -111,6 +120,14 @@ _START_FAILURE_SENTENCES: Final[Mapping[StartFailure, str]] = {
     StartFailure.SANDBOX_UNAVAILABLE: _SANDBOX_UNAVAILABLE_MSG,
     StartFailure.COORDINATION_UNAVAILABLE: BUILD_COORDINATION_UNAVAILABLE_MSG,
 }
+
+# Every field `record_holds` compares, and the name a renewal is aimed at.
+_WHAT_A_RENEWAL_READS: Final = (
+    REGISTRY_FIELD_APP_ID,
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+)
 
 
 class ReapResponse(CamelModel):
@@ -281,7 +298,7 @@ async def relaunch_preview(
     # outage of the coordination store is a 503 here, never a claim that a build is running.
     with build_coordination_or_503():
         try:
-            app_id = await manager.relaunch_preview(db, user, body.project_id, sandbox)
+            admitted = await manager.relaunch_preview(db, user, body.project_id, sandbox)
         except BuildSessionConflictError:
             # This project's own work is running — relaunch never pre-empts it (409). A
             # DIFFERENT project of theirs never reaches here: that is a switch, and it starts.
@@ -307,7 +324,7 @@ async def relaunch_preview(
             raise AppApiError(
                 status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG
             ) from exc
-        return RelaunchPreviewResponse(app_id=app_id)
+        return RelaunchPreviewResponse(app_id=admitted.app_id, start_id=admitted.start_id)
     raise _coordination_is_gone()
 
 
@@ -780,6 +797,7 @@ async def _shared_preview_or_refuse(
             preview_url=preview.preview_url,
             ready=preview.ready,
             snapshot_taken_at=preview.snapshot_taken_at,
+            start_id=preview.start_id,
         )
     raise _coordination_is_gone()
 
@@ -979,10 +997,10 @@ async def renew_presence(
     writes a deadline onto coordination state, and a deadline a third-party page could push
     forward from a citizen's browser is a deadline an attacker can use to run up a bill.
 
-    THE CONTAINER IS NEVER NAMED ON THE WIRE. The server resolves which container this project
-    owns from its own app row — `app_name_for` is the same forward mapping the sandbox is named
-    by — and the write is refused inside Redis when the record names anything else. A caller that
-    could supply a name could hold somebody else's container open.
+    THE CONTAINER IS NEVER NAMED ON THE WIRE. The server resolves this project's app from its own
+    app row and asks the registry record whether it holds that app's container; the write is
+    refused inside Redis when the record names anything else by then. A caller that could supply
+    a name could hold somebody else's container open.
 
     200 ON ALL THREE OUTCOMES. `not_this_container` is the ordinary reading a moment after
     somebody opens a second project, and `nothing_running` is what a screen polling through a
@@ -1006,10 +1024,21 @@ async def renew_presence(
         return RenewPresenceResponse(outcome=RenewalOutcome.NOTHING_RUNNING)
     with build_coordination_or_503():
         redis = get_redis()
+        read = await redis.hmget(registry_key(user.id), _WHAT_A_RENEWAL_READS)
+        # Nothing read takes the whole read, which adopts a record left under the old key.
+        reg = {
+            field: str(value)
+            for field, value in zip(_WHAT_A_RENEWAL_READS, read, strict=True)
+            if value is not None
+        } or await read_registry(redis, user.id)
+        if reg is None:
+            return RenewPresenceResponse(outcome=RenewalOutcome.NOTHING_RUNNING)
+        if not record_holds(reg, Occupant(app_id), user.id):
+            return RenewPresenceResponse(outcome=RenewalOutcome.NOT_THIS_CONTAINER)
         outcome, stay_until = await renew_presence_stay(
             redis,
             user.id,
-            app_name=app_name_for(app_id),
+            app_name=reg[REGISTRY_FIELD_APP_NAME],
             presence=body.presence,
         )
         return RenewPresenceResponse(outcome=outcome, stay_until=stay_until)
@@ -1146,11 +1175,7 @@ async def report_client_error(
     ).scalar_one_or_none()
     if app_id is None:
         raise AppApiError(status.HTTP_404_NOT_FOUND, "Project not found.")
-    # `app_name_for` is the same forward mapping the sandbox is NAMED by, so the key written here
-    # is exactly the `SandboxHandle.app_name` the verify reads back. It is deliberately not
-    # reversed anywhere — the mapping is lossy (28 of 32 hex chars) and only ever computed
-    # forwards, which is the property `inventory.py` relies on for the same reason.
-    recorded = park_client_error(
-        app_name_for(app_id), source=body.source, title=body.title, stack=body.stack
-    )
+    # Parked against the APP, which is what the next verify drains by: whichever container serves
+    # it then, the crash describes this app's tree.
+    recorded = park_client_error(app_id, source=body.source, title=body.title, stack=body.stack)
     return ClientErrorReportResponse(recorded=recorded)

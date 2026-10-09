@@ -89,7 +89,11 @@ _LAKE: dict[str, str] = {
 # whether it does that refuses to boot rather than have an answer picked for it.
 _RETENTION: dict[str, str] = {"CONVERSATION_RETENTION_ENABLED": "false"}
 
-_WORKER_ENV = {**_CORE, **_STORE, **_REDIS, **_SANDBOX, **_RETENTION}
+# Required of the worker with no default: every ready sandbox it makes for the pool takes the
+# portal origin from it.
+_PORTAL: dict[str, str] = {"FRONTEND_URL": "http://localhost:5173"}
+
+_WORKER_ENV = {**_CORE, **_STORE, **_REDIS, **_SANDBOX, **_RETENTION, **_PORTAL}
 _API_ENV = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_EDGE}
 
 
@@ -204,8 +208,8 @@ def test_a_retention_window_that_condemns_every_conversation_is_refused(window: 
 
 
 def test_the_worker_boots_on_its_own_block_alone() -> None:
-    """No auth, no superadmin allowlist, no frontend URL — the worker has no RBAC surface and
-    serves no browser, so requiring them would be the union-of-everything problem again."""
+    """No auth and no superadmin allowlist — the worker has no RBAC surface and serves no
+    browser, so requiring them would be the union-of-everything problem again."""
     settings = _boot(WorkerSettings, _WORKER_ENV)
     assert isinstance(settings, WorkerSettings)
     assert settings.object_store is not None
@@ -213,10 +217,36 @@ def test_the_worker_boots_on_its_own_block_alone() -> None:
     assert settings.sandbox is not None
 
 
+def test_the_worker_refuses_to_boot_without_the_portal_address() -> None:
+    """A worker that guessed the portal's address would fill the pool with sandboxes the portal
+    is not allowed to frame. Mutation-check: give the worker's `FRONTEND_URL` a default and this
+    goes red."""
+    env = {k: v for k, v in _WORKER_ENV.items() if k != "FRONTEND_URL"}
+    with pytest.raises(ValidationError) as excinfo:
+        _boot(WorkerSettings, env)
+    assert "FRONTEND_URL" in str(excinfo.value)
+
+
+def test_the_worker_refuses_a_portal_address_that_is_not_https_in_production() -> None:
+    """The API's own gate: the address becomes every pool sandbox's frame-ancestors origin."""
+    env = {
+        **_WORKER_ENV,
+        "ENVIRONMENT": "production",
+        "REDIS__URL": "rediss://localhost:6380/0",
+        "FRONTEND_URL": "http://portal.example",
+    }
+    with pytest.raises(ValidationError) as excinfo:
+        _boot(WorkerSettings, env)
+    assert "FRONTEND_URL must be set to the portal's real https:// origin" in str(excinfo.value)
+
+    settings = _boot(WorkerSettings, {**env, "FRONTEND_URL": "https://portal.example"})
+    assert settings.FRONTEND_URL == "https://portal.example"
+
+
 def test_the_worker_profile_does_not_declare_api_only_fields() -> None:
     """Structural, not behavioural: if `auth` or `superadmin_emails` ever appear on the worker,
     the union-of-everything problem is back and the next operator dodges a gate again."""
-    api_only = {"auth", "superadmin_emails", "FRONTEND_URL", "spa_dist_dir"}
+    api_only = {"auth", "superadmin_emails", "spa_dist_dir"}
     leaked = api_only & set(WorkerSettings.model_fields)
     assert leaked == set(), f"API-only fields leaked onto the worker profile: {sorted(leaked)}"
 

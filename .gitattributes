@@ -63,6 +63,12 @@ backend/src/services/deploy/assets/**   text eol=lf
 # checkout from the generator entirely.
 backend/src/services/agent/connector_catalogue/**   text eol=lf
 
+# --- the analysis reader's copy --------------------------------------------------------------
+# A byte-for-byte copy of `sandbox/scripts/read_attachment.py` that ships in the backend image and
+# is uploaded to every analysis session. `sandbox/**` is LF above; this copy must be too, or the
+# build host's checkout ships a reader that no longer matches the one its identity test compares.
+backend/src/services/analysis/assets/**   text eol=lf
+
 # --- the published API reference -------------------------------------------------------------
 # `documentation/reference/openapi.json` is a GENERATED artefact: `backend/scripts/openapi.py`
 # renders it and `--check` compares it BYTE FOR BYTE. A Windows checkout with core.autocrlf=true

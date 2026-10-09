@@ -19,6 +19,7 @@ import RailResizeHandle from './RailResizeHandle'
 import WorkspaceToolbar from './WorkspaceToolbar'
 import { RAIL_DEFAULT, clampRailWidth, readRailWidth, writeRailWidth } from './railWidth'
 import { projectsListHref } from '../../utils/projectsListMemory'
+import { markStartAbandoned } from '../../utils/observe'
 import { isChatHistoryPath } from '../../utils/chatHistoryAddress'
 import type { DeviceName } from './devices'
 import { WORKSPACE_RAIL_ID } from './railId'
@@ -118,6 +119,14 @@ function ShellFrame() {
   const [device, setDevice] = useState<DeviceName>('Desktop')
   const [reloadNonce, setReloadNonce] = useState(0)
   const heading = useWorkspaceHeading()
+
+  // A START IS TIMED ONLY WHILE ITS PROJECT IS ON SCREEN. The shell outlives every move between a
+  // project and its chats, so it is the one place that sees the person move to another project or
+  // leave the workspace; either way the start they were waiting on reports nothing.
+  useEffect(() => {
+    if (heading.projectId !== null) markStartAbandoned(heading.projectId)
+  }, [heading.projectId])
+  useEffect(() => () => markStartAbandoned(), [])
 
   /**
    * THE BOUNDARY THE CITIZEN CAN MOVE. Read once on the first render and not watched afterwards:

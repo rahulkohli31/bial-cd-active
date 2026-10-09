@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import InstructionPart
@@ -35,6 +36,10 @@ from src.services.agent.mode_prompts import (
 from src.services.agent.read_tools import ReadOnlyWorkspace
 from src.services.orchestrator.deps import SandboxSession
 
+if TYPE_CHECKING:
+    # Placement reaches this package through the attachments module, so a runtime import cycles.
+    from src.services.analysis.placement import AnalysisSession
+
 
 @dataclass
 class ChatDeps:
@@ -44,7 +49,8 @@ class ChatDeps:
     is OPTIONAL (no tool reads it) since holding a pooled connection across a minutes-long
     Write turn would pin it idle-in-transaction, what short-lived harness sessions avoid.
     `workspace` and BUILD-only `sandbox` are `None` off their paths; both accessors fail-first
-    rather than degrade.
+    rather than degrade. `analysis` is BIAL Chat's handle on its file session, set only on a reply
+    that registers the analysis tools.
     """
 
     user_id: uuid.UUID
@@ -53,6 +59,7 @@ class ChatDeps:
     db: AsyncSession | None = None
     workspace: ReadOnlyWorkspace | None = None
     sandbox: SandboxSession | None = None
+    analysis: AnalysisSession | None = None
 
 
 chat_agent = Agent(deps_type=ChatDeps, retries=2)

@@ -9,21 +9,30 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.project_share import ProjectShare
 from src.services.build_sessions.appdata import resolve_app_for_project
-from src.services.build_sessions.inventory import _app_names_to_owners, backfill_sandbox_tags
-from src.services.build_sessions.manager import app_name_for, shr_name_for
+from src.services.build_sessions.inventory import (
+    OwnedApp,
+    _app_names_to_owners,
+    backfill_sandbox_tags,
+    owning_app_ids,
+)
 from src.services.sandbox.base import (
     KIND_BUILD_SANDBOX,
     KIND_SHARED_SANDBOX,
     TAG_KIND,
     TAG_USER_ID,
     FleetMember,
+    a_fresh_sandbox_name,
+    app_name_for,
+    pool_member_tags,
+    shr_name_for,
 )
 from tests.factories import ProjectFactory, UserFactory
-from tests.fakes import a_fleet_member
+from tests.fakes import a_fleet_member, a_ready_pool_row
 
 
 class _Tagger:
@@ -31,11 +40,11 @@ class _Tagger:
     half `test_inventory.py`'s own `_Fleet` (read-only) does not need."""
 
     def __init__(self, names: list[str]) -> None:
-        self.names = names
+        self.fleet = [a_fleet_member(n) for n in names]
         self.stamped: dict[str, dict[str, str]] = {}
 
     async def list_sandbox_fleet(self) -> list[FleetMember]:
-        return [a_fleet_member(n) for n in self.names]
+        return self.fleet
 
     async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
         self.stamped[name] = tags
@@ -74,6 +83,22 @@ async def test_a_names_to_owners_includes_both_the_build_and_the_shared_name(
     assert known[shared_name].kind == KIND_SHARED_SANDBOX
 
 
+async def test_the_sweeps_map_names_the_apps_owner_for_a_build_and_a_view_alike(
+    db_session: AsyncSession,
+) -> None:
+    """A sweep writes a tree back only to an app the slot's own user owns. Were a view's name to
+    carry its recipient as owner, a recipient's slot naming the owner's app would pass that check
+    and its tree would land on the owner's saved copy.
+
+    Mutation check: carry a view's recipient as its app's owner and this goes red."""
+    app_id, owner_id, recipient_id = await _owner_and_recipient_with_a_share(db_session)
+
+    owned = await owning_app_ids(db_session)
+
+    assert owned[app_name_for(app_id)] == OwnedApp(app_id, owner_id)
+    assert owned[shr_name_for(app_id, recipient_id)] == OwnedApp(app_id, owner_id)
+
+
 async def test_backfill_stamps_an_untagged_shared_view_as_shared_not_build(
     db_session: AsyncSession,
 ) -> None:
@@ -110,3 +135,23 @@ async def test_backfill_leaves_an_unmatched_name_ownerless_and_build_kind(
     stamped = tagger.stamped["sbx-" + "0" * 28]
     assert stamped[TAG_KIND] == KIND_BUILD_SANDBOX
     assert TAG_USER_ID not in stamped
+
+
+@pytest.mark.usefixtures("empty_sandbox_pool")
+async def test_backfill_does_not_count_a_ready_pool_container_as_unowned(
+    db_session: AsyncSession,
+) -> None:
+    """A pool container carries a kind and no owner until its claim, which is exactly the shape
+    the unowned count escalates; one the ledger holds is the pool's, not an orphan's."""
+    member, stranger = a_fresh_sandbox_name(), a_fresh_sandbox_name()
+    await a_ready_pool_row(member, fqdn=f"{member}.example", image_ref="acr/img:v1")
+    tagger = _Tagger([])
+    tagger.fleet = [
+        a_fleet_member(member, tags=pool_member_tags()),
+        a_fleet_member(stranger, tags={TAG_KIND: KIND_BUILD_SANDBOX}),
+    ]
+
+    report = await backfill_sandbox_tags(db_session, tagger)
+
+    assert (report.scanned, report.already_tagged, report.unowned) == (2, 2, 1)
+    assert tagger.stamped == {}

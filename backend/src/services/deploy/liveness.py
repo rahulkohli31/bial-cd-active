@@ -27,13 +27,14 @@ import uuid
 from typing import Any
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import distinct_on
 from sqlalchemy.orm import aliased
 
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
 
 
-def live_app_ids(*, owner_user_id: uuid.UUID | None = None) -> sa.Select[Any]:
+def live_app_ids(*, owner_user_id: uuid.UUID | None = None) -> sa.Select[*tuple[Any, ...]]:
     """A SELECT of the `app_id`s that are live right now — usable as an `IN (...)`, a LEFT
     JOIN, or a `COUNT(*)`, so every surface reads the same definition.
 
@@ -42,7 +43,7 @@ def live_app_ids(*, owner_user_id: uuid.UUID | None = None) -> sa.Select[Any]:
     at 25,245 apps / 112,045 deployments: 60-200ms on first sign-in for one citizen's page,
     growing forever)."""
 
-    def _owned(query: sa.Select[Any]) -> sa.Select[Any]:
+    def _owned[*Ts](query: sa.Select[*Ts]) -> sa.Select[*Ts]:
         if owner_user_id is None:
             return query
         return query.where(
@@ -69,14 +70,14 @@ def live_app_ids(*, owner_user_id: uuid.UUID | None = None) -> sa.Select[Any]:
             == sa.bindparam("live_succeeded", DeploymentStatus.SUCCEEDED, literal_execute=True),
             Deployment.url.is_not(None),
         )
-        .distinct(Deployment.app_id)
+        .ext(distinct_on(Deployment.app_id))
         .order_by(Deployment.app_id, Deployment.id.desc())
         .subquery()
     )
     last_unpublished = (
         _owned(sa.select(Deployment.app_id, Deployment.id))
         .where(Deployment.unpublished_at.is_not(None))
-        .distinct(Deployment.app_id)
+        .ext(distinct_on(Deployment.app_id))
         .order_by(Deployment.app_id, Deployment.id.desc())
         .subquery()
     )
@@ -129,7 +130,7 @@ def last_success_deployment() -> type[Deployment]:
             == sa.bindparam("succeeded", DeploymentStatus.SUCCEEDED, literal_execute=True),
             Deployment.url.is_not(None),
         )
-        .distinct(Deployment.app_id)
+        .ext(distinct_on(Deployment.app_id))
         .order_by(Deployment.app_id, Deployment.id.desc())
         .subquery()
     )

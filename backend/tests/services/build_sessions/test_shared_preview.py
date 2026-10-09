@@ -13,6 +13,8 @@ restore from, and how it tags the container it mints.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 import redis.asyncio as aioredis
@@ -22,26 +24,44 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.config import settings
 from src.db.models.project import Project
 from src.db.models.user import User
+from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.appdata import resolve_app_for_project
-from src.services.build_sessions.locks import lock_is_held, read_registry
+from src.services.build_sessions.locks import (
+    SharedViewStamp,
+    lock_is_held,
+    mark_serving,
+    read_registry,
+)
 from src.services.build_sessions.manager import (
     NoSnapshotToRelaunchError,
     SandboxReclaimBlockedError,
     SessionManager,
-    app_name_for,
-    shr_name_for,
 )
-from src.services.redis import registry_key
+from src.services.build_sessions.shutdown import OwedTeardown, ShutdownReason
+from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_CREATED_AT,
+    REGISTRY_FIELD_FQDN,
+    REGISTRY_FIELD_SERVING_SINCE,
     REGISTRY_FIELD_SHARED_OWNER_ID,
     REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_SHARED_SERVED_COUNT,
+    REGISTRY_FIELD_STATE,
 )
 from src.services.sandbox import SandboxHandle, SandboxNotReadyError
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from tests.factories import ProjectFactory, UserFactory
-from tests.fakes import FakeSandboxClient, FakeStorage, detached_work_done
+from tests.fakes import (
+    AttachesWhatTheRecordNames,
+    FakeSandboxClient,
+    FakeStorage,
+    a_manager_whose_ledger_is,
+    a_name_unrelated_to_its_app,
+    detached_work_done,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -66,6 +86,19 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture
+def handed_over(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, bool]]:
+    """Every container a start hands to the shutdown routine, recorded rather than run: what the
+    routine does with a shared view is `test_shutdown.py`'s subject."""
+    recorded: list[tuple[str, bool]] = []
+
+    def _record(owed: OwedTeardown, *, reason: ShutdownReason, **_aimed_at: object) -> None:
+        recorded.append((owed.app_name, owed.write_back))
+
+    monkeypatch.setattr(manager_module, "shut_it_down_in_the_background", _record)
+    return recorded
+
+
 async def _owner_with_saved_app(
     db: AsyncSession, store: FakeStorage, *, email: str
 ) -> tuple[User, Project, uuid.UUID]:
@@ -76,6 +109,10 @@ async def _owner_with_saved_app(
     await db.refresh(project)
     await store.put(snapshot_key(app_id), b"BUNDLE")
     return owner, project, app_id
+
+
+def _the_view(owner: User, project: Project) -> SharedViewStamp:
+    return SharedViewStamp(owner_id=owner.id, project_id=project.id)
 
 
 async def test_launch_cold_restores_and_returns_the_owners_app_id(
@@ -90,9 +127,8 @@ async def test_launch_cold_restores_and_returns_the_owners_app_id(
 
     preview = await manager.launch_shared_preview(db_session, recipient, project, client)
 
-    shared_name = shr_name_for(app_id, recipient.id)
     assert preview.app_id == app_id  # the OWNER's app id, never the recipient's
-    assert client.restored == [shared_name]
+    assert len(client.restored) == 1
     assert client.provisioned == []  # never a blank template
     assert preview.ready is True
     assert await lock_is_held(fake_redis, recipient.id) is False  # lock released, slot free
@@ -123,7 +159,7 @@ async def test_launch_keeps_a_restored_container_whose_dev_server_never_readies(
 
     assert preview.ready is False, "an app that never served must not be reported as ready"
     assert preview.preview_url, "…but the URL still ships — the pane owns the labelled wait"
-    assert client.restored == [shr_name_for(app_id, recipient.id)]  # it WAS created...
+    assert len(client.restored) == 1  # it WAS created...
     assert client.torn_down == []  # ...and it survives the owner's app being slow
     assert await lock_is_held(fake_redis, recipient.id) is False
 
@@ -168,7 +204,7 @@ async def test_launch_stamps_the_registry_with_the_shared_projects_identity(
 ) -> None:
     """The registry-hash half of requirement 24 (#198 slice 5): Launch must stamp WHICH
     project this slot is a shared view of, and WHOSE, so a later occupancy check can
-    recognize it without reverse-parsing `shr_name_for`'s hash. See
+    recognize it, which the container's name cannot say. See
     `test_a_live_shared_view_earns_the_hand_over_dialog_instead_of_silent_reclaim` for the
     behavior this stamp exists to enable."""
     owner, project, app_id = await _owner_with_saved_app(
@@ -222,7 +258,7 @@ async def test_launch_attaches_to_an_already_live_shared_view(
     first = await manager.launch_shared_preview(db_session, recipient, project, client)
 
     # Re-attach: point the fake at itself as an already-live container under the same name.
-    shared_name = shr_name_for(app_id, recipient.id)
+    shared_name = client.restored[0]
     client.attach_handle = SandboxHandle(
         fqdn=f"{shared_name}.example",
         token="tok",  # noqa: S106 - a fake, never a real bearer
@@ -251,8 +287,53 @@ async def test_refresh_always_restores_even_when_already_live(
 
     await manager.launch_shared_preview(db_session, recipient, project, client, force_refresh=True)
 
-    shared_name = shr_name_for(app_id, recipient.id)
-    assert client.restored == [shared_name, shared_name]  # restored TWICE, not attached once
+    # Restored TWICE, each into a container of its own, not attached once.
+    assert len(set(client.restored)) == 2
+
+
+async def test_a_restarted_view_is_given_up_and_the_owners_copy_restored_again(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    handed_over: list[tuple[str, bool]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ Azure restarting a claimed container brings it back with no settings and none of its
+    files. A launch treats it as gone: the owner's saved copy goes into a new container, the
+    restarted one is never started, and it is owed its delete with nothing written back. Its
+    serving proof goes first, or a poll would frame it meanwhile.
+
+    Mutation check: attach to it whatever it reports and no second restore happens.
+    Mutation check: give it up without retracting its proof and it still vouches at the rebirth."""
+    owner, project, app_id = await _owner_with_saved_app(
+        db_session, fake_storage, email="owner-restarted@example.com"
+    )
+    recipient = await UserFactory.create(db_session, email="recipient-restarted@example.com")
+    manager = a_manager_whose_ledger_is(db_session)
+    client = FakeSandboxClient()
+    await manager.launch_shared_preview(db_session, recipient, project, client)
+    [restarted] = client.restored
+    client.attach_handle = client.by_name[restarted]
+    client.unconfigured.add(restarted)
+    await mark_serving(fake_redis, recipient.id, app_name=restarted, when=datetime.now(UTC))
+    proof_at_the_rebirth: list[str | None] = []
+    clear_the_way = manager._clear_the_way_for_a_birth
+
+    async def looked_at(*args: Any) -> None:
+        reg = await read_registry(fake_redis, recipient.id)
+        proof_at_the_rebirth.append(None if reg is None else reg.get(REGISTRY_FIELD_SERVING_SINCE))
+        await clear_the_way(*args)
+
+    monkeypatch.setattr(manager, "_clear_the_way_for_a_birth", looked_at)
+
+    preview = await manager.launch_shared_preview(db_session, recipient, project, client)
+
+    assert proof_at_the_rebirth == [""]
+    assert preview.app_id == app_id
+    assert client.restored[0] == restarted
+    [reborn] = client.restored[1:]
+    assert client.started == [restarted, reborn]
+    assert handed_over == [(restarted, False)]
 
 
 async def test_launch_with_no_saved_snapshot_is_a_dead_end_404(
@@ -313,9 +394,11 @@ async def test_revoke_tears_down_a_live_shared_view(
     manager = SessionManager()
     client = FakeSandboxClient()
     await manager.launch_shared_preview(db_session, recipient, project, client)
-    shared_name = shr_name_for(app_id, recipient.id)
+    shared_name = client.restored[0]
 
-    revoked = await manager.revoke_shared_preview(recipient.id, app_id, sandbox_client=client)
+    revoked = await manager.revoke_shared_preview(
+        recipient.id, app_id, _the_view(owner, project), sandbox_client=client
+    )
 
     assert revoked is True
     assert shared_name in client.torn_down
@@ -332,18 +415,23 @@ async def test_revoke_is_a_noop_when_nothing_is_there(
     manager = SessionManager()
     client = FakeSandboxClient()
 
-    revoked = await manager.revoke_shared_preview(recipient.id, app_id, sandbox_client=client)
+    revoked = await manager.revoke_shared_preview(
+        recipient.id, app_id, _the_view(owner, project), sandbox_client=client
+    )
 
     assert revoked is False
     assert client.torn_down == []
 
 
 async def test_a_first_message_puts_a_live_shared_view_away_and_starts(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    handed_over: list[tuple[str, bool]],
 ) -> None:
     """★ A colleague's shared view in the recipient's slot never blocks their own project: it
-    holds no work of its own, so it is torn down and the recipient's workspace starts. Nothing
-    is written back, so the OWNER's saved copy is untouched."""
+    holds no work of its own, so it is handed over as a shared view, deleted with nothing written
+    back, and the recipient's workspace starts. The OWNER's saved copy is untouched."""
     owner, project, app_id = await _owner_with_saved_app(
         db_session, fake_storage, email="owner11@example.com"
     )
@@ -351,8 +439,9 @@ async def test_a_first_message_puts_a_live_shared_view_away_and_starts(
     recipient_project = await ProjectFactory.create(
         db_session, recipient.id, description="Recipient's own, different project"
     )
-    manager = SessionManager()
-    await manager.launch_shared_preview(db_session, recipient, project, FakeSandboxClient())
+    manager = a_manager_whose_ledger_is(db_session)
+    viewer = FakeSandboxClient()
+    await manager.launch_shared_preview(db_session, recipient, project, viewer)
 
     build_client = FakeSandboxClient()
     session = await manager.ensure_sandbox(
@@ -360,13 +449,17 @@ async def test_a_first_message_puts_a_live_shared_view_away_and_starts(
     )
 
     assert session.project_id == recipient_project.id
-    assert shr_name_for(app_id, recipient.id) in build_client.torn_down
+    assert handed_over == [(viewer.restored[0], False)]
+    assert build_client.torn_down == []
     assert build_client.provisioned, "the recipient's own workspace was started"
     assert await fake_storage.get(snapshot_key(app_id)) == b"BUNDLE"
 
 
 async def test_opening_their_own_app_puts_a_live_shared_view_away_and_starts(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    handed_over: list[tuple[str, bool]],
 ) -> None:
     """★ The same for the start control: relaunching a saved app of the recipient's own
     replaces the shared view in their slot instead of refusing."""
@@ -380,16 +473,18 @@ async def test_opening_their_own_app_puts_a_live_shared_view_away_and_starts(
     own_app_id = await resolve_app_for_project(db_session, recipient.id, recipient_project.id)
     await db_session.commit()
     await fake_storage.put(snapshot_key(own_app_id), b"OWN-BUNDLE")
-    manager = SessionManager()
-    await manager.launch_shared_preview(db_session, recipient, project, FakeSandboxClient())
+    manager = a_manager_whose_ledger_is(db_session)
+    viewer = FakeSandboxClient()
+    await manager.launch_shared_preview(db_session, recipient, project, viewer)
 
     client = FakeSandboxClient()
     started = await manager.relaunch_preview(db_session, recipient, recipient_project.id, client)
     await detached_work_done(manager)
 
-    assert started == own_app_id
-    assert shr_name_for(app_id, recipient.id) in client.torn_down
-    assert client.restored == [app_name_for(own_app_id)]
+    assert started.app_id == own_app_id
+    assert handed_over == [(viewer.restored[0], False)]
+    assert client.torn_down == []
+    assert len(client.restored) == 1
     assert await fake_storage.get(snapshot_key(app_id)) == b"BUNDLE"
 
 
@@ -411,7 +506,9 @@ async def test_an_ordinary_build_disowns_a_prior_occupants_shared_stamp(
     manager = SessionManager()
     shared_client = FakeSandboxClient()
     await manager.launch_shared_preview(db_session, recipient, project, shared_client)
-    await manager.revoke_shared_preview(recipient.id, app_id, sandbox_client=shared_client)
+    await manager.revoke_shared_preview(
+        recipient.id, app_id, _the_view(owner, project), sandbox_client=shared_client
+    )
 
     build_client = FakeSandboxClient()
     await manager.ensure_sandbox(
@@ -445,8 +542,138 @@ async def test_revoke_never_touches_the_recipients_own_build(
     await manager.finish_turn_sandbox(session)  # pardons it
 
     revoked = await manager.revoke_shared_preview(
-        recipient.id, app_id, sandbox_client=build_client
+        recipient.id, app_id, _the_view(owner, project), sandbox_client=build_client
     )
 
     assert revoked is False
     assert build_client.torn_down == []
+
+
+# --- a container whose name says nothing about its app -------------------------------------
+
+
+async def _renamed(redis: aioredis.Redis, user_id: uuid.UUID) -> str:
+    """Give the view in `user_id`'s slot a name unrelated to its app, as any container may carry
+    now that every lookup reads the app and the stamp from the record."""
+    name = a_name_unrelated_to_its_app()
+    await redis.hset(registry_key(user_id), REGISTRY_FIELD_APP_NAME, name)
+    return name
+
+
+async def test_a_second_launch_reattaches_a_view_named_like_a_build_sandbox(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """Mutation check: look the view up by the name derived from the app and recipient, and the
+    second launch restores over the view the colleague already has open."""
+    owner, project, app_id = await _owner_with_saved_app(
+        db_session, fake_storage, email="owner-r1@example.com"
+    )
+    recipient = await UserFactory.create(db_session, email="recipient-r1@example.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    await manager.launch_shared_preview(db_session, recipient, project, client)
+    name = await _renamed(fake_redis, recipient.id)
+    client.attach_handle = SandboxHandle(
+        fqdn=f"{name}.example", token="tok", app_name=name, preview_url="/a/x", ready=True
+    )
+
+    await manager.launch_shared_preview(db_session, recipient, project, client)
+
+    assert len(client.restored) == 1, "the standing view was attached, not restored again"
+    assert client.torn_down == []
+    reg = await read_registry(fake_redis, recipient.id)
+    assert reg is not None and reg[REGISTRY_FIELD_APP_ID] == str(app_id)
+
+
+async def test_revoking_a_share_tears_down_the_view_named_like_a_build_sandbox(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ A missed revoke leaves a removed colleague a running copy of the owner's app.
+
+    Mutation check: look the view up by the derived name and the revoke finds nothing."""
+    owner, project, app_id = await _owner_with_saved_app(
+        db_session, fake_storage, email="owner-r2@example.com"
+    )
+    recipient = await UserFactory.create(db_session, email="recipient-r2@example.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    await manager.launch_shared_preview(db_session, recipient, project, client)
+    name = await _renamed(fake_redis, recipient.id)
+
+    revoked = await manager.revoke_shared_preview(
+        recipient.id, app_id, _the_view(owner, project), sandbox_client=client
+    )
+
+    assert revoked is True
+    assert client.torn_down == [name]
+    assert await read_registry(fake_redis, recipient.id) is None
+
+
+async def test_a_viewer_releases_their_view_named_like_a_build_sandbox_and_nothing_is_saved(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ Releasing is the viewer's way back to their own workspace. The view is torn down and
+    written nowhere: not over the owner's copy, and not into the viewer's own app either. The
+    client attaches whatever the record names and answers the write-back, so a write-back that
+    ran would show up below.
+
+    Mutation check: decide "is this a view" from the name in the release and it refuses, leaving
+    the slot held by a colleague's app; decide it from the name in the reap and the view's tree
+    is bundled into the viewer's own app."""
+    owner, project, app_id = await _owner_with_saved_app(
+        db_session, fake_storage, email="owner-r3@example.com"
+    )
+    recipient = await UserFactory.create(db_session, email="recipient-r3@example.com")
+    own_project = await ProjectFactory.create(db_session, recipient.id, description="Their own")
+    own_app_id = await resolve_app_for_project(db_session, recipient.id, own_project.id)
+    await db_session.commit()
+    manager = SessionManager()
+    client = AttachesWhatTheRecordNames()
+    await manager.launch_shared_preview(db_session, recipient, project, client)
+    name = await _renamed(fake_redis, recipient.id)
+
+    released = await manager.release_project_sandbox(
+        db_session, recipient, own_project.id, sandbox_client=client
+    )
+
+    assert released is True
+    assert client.torn_down == [name]
+    assert client.bundled_from == []
+    assert await fake_storage.get(snapshot_key(app_id)) == b"BUNDLE"
+    assert await fake_storage.head(snapshot_key(own_app_id)) is None
+
+
+async def test_releasing_a_project_saves_and_ends_its_container_whatever_its_name(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The project's own build sandbox, under a name unrelated to its app: released, its tree
+    written to that app's saved copy first.
+
+    Mutation check: recognise the container by the name derived from its app and the release
+    finds nothing to give up."""
+    user = await UserFactory.create(db_session, email="releaser@example.com")
+    project = await ProjectFactory.create(db_session, user.id, description="Their own")
+    app_id = await resolve_app_for_project(db_session, user.id, project.id)
+    await db_session.commit()
+    name = a_name_unrelated_to_its_app()
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: name,
+            REGISTRY_FIELD_APP_ID: str(app_id),
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+            REGISTRY_FIELD_FQDN: f"{name}.example",
+            REGISTRY_FIELD_CREATED_AT: "2026-10-05T00:00:00+00:00",
+        },
+    )
+    client = AttachesWhatTheRecordNames()
+
+    released = await SessionManager().release_project_sandbox(
+        db_session, user, project.id, sandbox_client=client
+    )
+
+    assert released is True
+    assert client.bundled_from == [name]
+    assert client.torn_down == [name]
+    meta = await fake_storage.head(snapshot_key(app_id))
+    assert meta is not None and (meta.metadata or {})["head_sha"] == "c" * 40

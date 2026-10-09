@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from datetime import UTC, datetime, time
 from pathlib import Path
 
 import pytest
@@ -256,6 +257,108 @@ def test_the_ceiling_refuses_a_zero_or_negative_span() -> None:
     instant it was created, and a negative one reads as a ceiling already passed."""
     with pytest.raises(ValidationError):
         _settings(sandbox={**_SANDBOX, "drain_after_hours": 0})
+
+
+# --- the pool of ready sandboxes -----------------------------------------------------------
+
+
+def _sandbox_env(monkeypatch: pytest.MonkeyPatch, **pool: str) -> None:
+    """The `SANDBOX__*` block as an operator sets it, as environment variables."""
+    for key, value in {**_SANDBOX, **pool}.items():
+        monkeypatch.setenv(f"SANDBOX__{key.upper()}", str(value))
+
+
+def test_the_pool_ships_switched_off_with_a_working_day_of_india_time() -> None:
+    s = _settings(sandbox=_SANDBOX)
+    assert s.sandbox is not None
+    assert (s.sandbox.pool_day_size, s.sandbox.pool_night_size) == (0, 0)
+    assert (s.sandbox.pool_day_start, s.sandbox.pool_day_end) == (time(9, 0), time(19, 0))
+    assert s.sandbox.pool_day_days == frozenset({0, 1, 2, 3, 4})
+
+
+def test_a_pool_size_above_twenty_fails_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mistyped size fails the deploy rather than running dozens of ready containers."""
+    _sandbox_env(monkeypatch, pool_day_size="21")
+
+    with pytest.raises(ValidationError, match="pool_day_size"):
+        Settings.model_validate(_BASE_ENV)
+
+
+def test_twenty_is_the_largest_size_that_starts(monkeypatch: pytest.MonkeyPatch) -> None:
+    _sandbox_env(monkeypatch, pool_day_size="20", pool_night_size="20")
+
+    s = Settings.model_validate(_BASE_ENV)
+
+    assert s.sandbox is not None
+    assert (s.sandbox.pool_day_size, s.sandbox.pool_night_size) == (20, 20)
+
+
+@pytest.mark.parametrize("field", ["pool_day_size", "pool_night_size"])
+def test_a_negative_pool_size_fails_startup(field: str) -> None:
+    with pytest.raises(ValidationError):
+        _settings(sandbox={**_SANDBOX, field: -1})
+
+
+def test_the_days_and_hours_are_typed_as_an_operator_would(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _sandbox_env(
+        monkeypatch,
+        pool_day_days="Mon, tue,SAT",
+        pool_day_start="08:50",
+        pool_day_end="20:00",
+    )
+
+    s = Settings.model_validate(_BASE_ENV)
+
+    assert s.sandbox is not None
+    assert s.sandbox.pool_day_days == frozenset({0, 1, 5})
+    assert (s.sandbox.pool_day_start, s.sandbox.pool_day_end) == (time(8, 50), time(20, 0))
+
+
+@pytest.mark.parametrize("days", ["mon,funday", "", " , "])
+def test_a_day_that_is_not_a_weekday_fails_startup(
+    monkeypatch: pytest.MonkeyPatch, days: str
+) -> None:
+    _sandbox_env(monkeypatch, pool_day_days=days)
+
+    with pytest.raises(
+        ValidationError, match="takes names from mon, tue, wed, thu, fri, sat, sun"
+    ):
+        Settings.model_validate(_BASE_ENV)
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [("19:00", "09:00"), ("09:00", "09:00"), ("09:00+05:30", "19:00")],
+)
+def test_a_day_that_is_not_a_span_of_india_time_fails_startup(start: str, end: str) -> None:
+    with pytest.raises(ValidationError):
+        _settings(sandbox={**_SANDBOX, "pool_day_start": start, "pool_day_end": end})
+
+
+@pytest.mark.parametrize(
+    ("instant", "size"),
+    [
+        # 09:00 India time on a Monday: the day has begun.
+        (datetime(2026, 10, 5, 3, 30, tzinfo=UTC), 5),
+        # A minute before.
+        (datetime(2026, 10, 5, 3, 29, tzinfo=UTC), 1),
+        # 18:59 India time: still the day.
+        (datetime(2026, 10, 5, 13, 29, tzinfo=UTC), 5),
+        # 19:00 India time: the day has ended.
+        (datetime(2026, 10, 5, 13, 30, tzinfo=UTC), 1),
+        # Sunday 23:00 UTC is 04:30 on Monday in India: night.
+        (datetime(2026, 10, 4, 23, 0, tzinfo=UTC), 1),
+        # Noon on a Saturday in India: not a day of the working week.
+        (datetime(2026, 10, 10, 6, 30, tzinfo=UTC), 1),
+    ],
+)
+def test_the_pool_size_follows_the_working_day_in_india_time(instant: datetime, size: int) -> None:
+    s = _settings(sandbox={**_SANDBOX, "pool_day_size": 5, "pool_night_size": 1})
+    assert s.sandbox is not None
+
+    assert s.sandbox.pool_size_at(instant) == size
 
 
 def test_redis_rejects_unknown_nested_key() -> None:
@@ -690,3 +793,39 @@ def test_sample_env_redis_keys_all_map_to_a_declared_field(sample: str) -> None:
     assert referenced <= declared, (
         f"{sample} names REDIS__* keys with no RedisConfig field: {referenced - declared}"
     )
+
+
+_ANALYSIS = {
+    "pool_endpoint": "https://centralindia.dynamicsessions.io/subscriptions/s/resourceGroups/rg/"
+    "sessionPools/p"
+}
+
+
+def test_analysis_is_optional_in_production_too() -> None:
+    assert Settings.model_fields["analysis"].default is None
+    assert _prod_settings(analysis=None).analysis is None
+
+
+def test_an_analysis_block_validates_when_present() -> None:
+    analysis = _settings(analysis=_ANALYSIS).analysis
+    assert analysis is not None
+    assert analysis.pool_endpoint == _ANALYSIS["pool_endpoint"]
+
+
+def test_an_analysis_block_without_an_endpoint_fails_at_startup() -> None:
+    with pytest.raises(ValidationError):
+        _settings(analysis={})
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["http://centralindia.dynamicsessions.io/x", "https://centralindia.dynamicsessions.io", "p"],
+)
+def test_an_analysis_endpoint_that_is_not_a_pool_url_fails_at_startup(endpoint: str) -> None:
+    with pytest.raises(ValidationError):
+        _settings(analysis={"pool_endpoint": endpoint})
+
+
+def test_analysis_rejects_unknown_nested_key() -> None:
+    with pytest.raises(ValidationError):
+        _settings(analysis={**_ANALYSIS, "cooldown": "1200"})

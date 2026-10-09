@@ -17,6 +17,7 @@ from __future__ import annotations
 import abc
 import datetime as dt
 import enum
+import hashlib
 import secrets
 import uuid
 from collections.abc import Mapping
@@ -49,23 +50,52 @@ class SandboxGoneError(SandboxError):
 
 
 SANDBOX_NAME_PREFIX = "sbx-"
-"""The prefix every sandbox container app carries (`app_name_for`).
+"""The prefix every sandbox container app carries, build sandbox and shared view alike
+(`a_fresh_sandbox_name`).
 
-Defined here rather than inline at the mint site because two sides need to agree on it and
-they cannot import each other: `manager.app_name_for` WRITES it, and `AcaControlPlane.
-list_sandbox_app_names` READS it back to tell our containers from the deployed apps and
-unrelated workloads sharing the resource group. A drift between those two would make the
+`AcaControlPlane.list_sandbox_fleet` reads it back to tell our containers from the deployed apps
+and unrelated workloads sharing the resource group. A drift between the two would make the
 orphan reconciler quietly report nothing."""
 
 SHARED_SANDBOX_NAME_PREFIX = "shr-"
-"""The prefix every SHARED-RUNTIME container carries (`manager.shr_name_for`, #198) — a
-colleague's read-only, app-frame-only view of a project shared with them, restored from the
-builder's own saved snapshot. A THIRD lineage beside `sbx-` (the builder's own build sandbox)
-and `pub-` (a published app), never a variant of either: it is neither the builder's live
-workspace nor a citizen's shipped app, and every place that already tells those two apart by
-name (the portal edge's routing regex, the reaper, the fleet reclaimer) has to learn this
-third shape too, or a shared container becomes invisible to exactly the guards that keep the
-other two lineages from leaking money or access."""
+"""The prefix `shr_name_for` gives a colleague's shared view. Nothing creates a container under it
+— a new view takes `a_fresh_sandbox_name` — so it is only read, for views still running under it:
+by the portal edge's routing, the reaper's name guard, the fallback for a registry record without
+an app id, and the owed-teardown routine, which never writes such a view back."""
+
+#: Which kind of container a birth makes: a person's own build sandbox, or a colleague's view of a
+#: shared app, held in the viewer's slot.
+SandboxKind = Literal["build_sandbox", "shared_sandbox"]
+
+
+def app_name_for(app_id: uuid.UUID) -> str:
+    """`sbx-` + 28 hex chars of the app_id, stable per app. No container is created under it —
+    `a_fresh_sandbox_name` names every one — so it only recognises one still running under it:
+    for a registry record carrying no app id, and in the inventory's forward match."""
+    return f"{SANDBOX_NAME_PREFIX}{app_id.hex[:28]}"
+
+
+def shr_name_for(app_id: uuid.UUID, recipient_id: uuid.UUID) -> str:
+    """`shr-` + 28 hex chars of a SHA-256 digest of the app and recipient ids, stable per pair.
+    Like `app_name_for`, no container is created under it; it only recognises a view still
+    running under it.
+
+    FORWARD-MATCH-ONLY: nothing may ever reverse-parse an app id or a recipient id back out of
+    this name; both are carried losslessly on the container's own ARM tags
+    (`shared_sandbox_tags`)."""
+    digest = hashlib.sha256(f"{app_id}:{recipient_id}".encode()).hexdigest()
+    return f"{SHARED_SANDBOX_NAME_PREFIX}{digest[:28]}"
+
+
+def a_fresh_sandbox_name() -> str:
+    """`sbx-` plus 28 secure-random hex characters: a name for one container, never reused.
+
+    Every container this platform creates takes a new one, each further attempt a start makes
+    included, so a late delete aimed at an old container can never reach the one that replaced
+    it. A shared view takes the same shape; the registry's stamp, never the name, says which a
+    container is. 32 characters, ACA's ceiling, and the shape the portal edge, the supervisor and
+    the fleet listing accept."""
+    return f"{SANDBOX_NAME_PREFIX}{secrets.token_hex(14)}"
 
 
 def new_alias() -> str:
@@ -101,8 +131,8 @@ def base_path_for(key: str) -> str:
 # fleet sweep can no longer judge.
 
 TAG_KIND: Final = "bial-kind"
-"""What the resource IS. Today only the name prefix (`sbx-`/`pub-`/`shr-`) says this, which is a
-convention, rather than a record."""
+"""What the resource IS. A build sandbox and a shared view carry the same name shape, so the name
+cannot say."""
 
 TAG_USER_ID: Final = "bial-user-id"
 """The owning user's UUID, in plaintext. A container must be judgeable without the coordination
@@ -111,9 +141,8 @@ identifier, not a secret, and the resource group is internal-only. This is a del
 accepted trade-off — it does surface in cost exports."""
 
 TAG_APP_ID: Final = "bial-app-id"
-"""The app UUID this container serves. Note the name is NOT a substitute: `app_name_for` keeps only
-28 of the app_id's 32 hex characters, so a sandbox name is lossy and this tag is the only lossless
-back-reference the resource carries."""
+"""The app UUID this container serves. A container's name says nothing about its app, so this tag
+is the only back-reference the resource carries."""
 
 TAG_CONTROL_PLANE: Final = "bial-control-plane"
 """Which control plane created it — the environment segment. A dev control
@@ -127,6 +156,12 @@ either way — and a container that retained an original timestamp across a recr
 permanently overdue, i.e. instantly destroy-eligible while being seconds old. The precedent is
 `appdb/provision.py::_stamp_provisioned_at`: when the substrate's own timestamp is untrustworthy,
 author your own."""
+
+TAG_POOL: Final = "bial-pool"
+"""Present on a container made ahead of time for the pool of ready sandboxes: a marker for an
+operator reading Azure, which no code reads. Until its claim such a container carries this, its
+kind and its control plane and nothing else: owner, app and `TAG_CREATED_AT` are stamped after the
+claim, and the merge that stamps them leaves this one in place."""
 
 TAG_BACKFILLED_AT: Final = "bial-backfilled-at"
 """Present ONLY on a container whose identity was reconstructed after the fact. It marks the
@@ -293,6 +328,18 @@ def shared_sandbox_tags(*, recipient_id: uuid.UUID, app_id: uuid.UUID) -> dict[s
     )
 
 
+def pool_member_tags() -> dict[str, str]:
+    """The ARM identity of a container made for the pool, until its claim restamps it: its kind,
+    its control plane and the pool tag, and nothing naming an owner, an app or a birth."""
+    return checked_tags(
+        {
+            TAG_KIND: KIND_BUILD_SANDBOX,
+            TAG_CONTROL_PLANE: control_plane_segment(),
+            TAG_POOL: "1",
+        }
+    )
+
+
 def published_app_tags(*, app_id: uuid.UUID) -> dict[str, str]:
     """Identity for a PUBLISHED app — deliberately shorter than `sandbox_tags`. Two omissions:
     no `TAG_CREATED_AT` (every publish is a full `PUT`, so a timestamp here would be rewritten
@@ -313,10 +360,8 @@ def published_app_tags(*, app_id: uuid.UUID) -> dict[str, str]:
 
 @dataclass(frozen=True)
 class SandboxHandle:
-    """The handle returned by every provision/attach/restore call and passed back into every
-    operation.
-
-    `app_root_url` below is a DERIVED property, not a field of its own."""
+    """The frozen handle returned by every provision/attach/restore call and passed back into
+    every operation. `app_root_url` below is a derived property, not a field."""
 
     fqdn: str
     """The container's ACA ingress FQDN, host only, NO scheme (e.g. `app-xyz.westeurope.
@@ -345,6 +390,11 @@ class SandboxHandle:
     A stdout-marker-plus-child-alive check would get this wrong in both directions: the marker
     fires once `next dev` is LISTENING, before the first route has compiled, and a dev server
     the agent started itself would be invisible to a child-state check forever."""
+    configured: bool = True
+    """Whether the supervisor said, on the attach that made this handle, that it holds its
+    project's settings. False only for a pool container not configured since it booted, which
+    Azure restarting a claimed one also produces; it refuses to start the app until `configure`.
+    A supervisor that does not say was given its settings when it was created."""
     base_path: str = ""
     """The path the container serves under, `/a/<alias>` for a preview or shared view. Empty means
     the container's own name, which is all a handle built only to tear a container down knows."""
@@ -630,13 +680,15 @@ class SandboxClient(abc.ABC):
     async def provision_new(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
-        """Provision a BRAND-NEW container for `user_id`. `app_env` is the app's injected
-        environment, every name in it chosen to survive the supervisor's child-env scrub
-        allowlist; what belongs in it is `manager._resolve_sandbox`'s to decide.
+        """Provision a BRAND-NEW container for `user_id`, returning a handle with `ready=False`.
+        `app_env` is the app's injected environment, every name in it chosen to survive the
+        supervisor's child-env scrub allowlist. The caller MUST already hold the one-per-user
+        lock. Transient provisioning errors are retried with capped exponential backoff. The
+        handle's `app_name` is the container's own, which a claimed pool container keeps.
 
-        Returns a handle with `ready=False`. The caller MUST already hold the Redis
-        one-per-user lock. Transient provisioning errors retried with capped
-        exponential backoff."""
+        Refused while the user's registry still names a container: writing this one's record
+        over it would leave the old container with nothing that names it. The caller hands that
+        one over first."""
         ...
 
     @abc.abstractmethod
@@ -668,33 +720,18 @@ class SandboxClient(abc.ABC):
         *,
         app_env: dict[str, str],
         source_key: str | None = None,
-        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
+        kind: SandboxKind = "build_sandbox",
         shared_project_id: uuid.UUID | None = None,
         shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
-        """Provision a FRESH container and restore a git-bundle onto its local disk (git ops
-        over `/_sup/exec`), then RE-INJECT the app-data credential from `app_env`. Returns a
-        handle (`ready=False` until `wait_ready` / `dev_start`).
-
-        `source_key` names WHICH bundle to restore, defaulting to the app's saved snapshot.
-        It exists so a recovery can pull the crash-recovery copy instead — the only reason that
-        copy is written at all. Optional with a default rather than required, because every
-        existing caller means "the saved one" and should keep reading that way.
-
-        `kind` (#198) selects the ARM identity the fresh container is stamped with —
-        `sandbox_tags` (the default, `user_id` as OWNER) or `shared_sandbox_tags` (`user_id` as
-        RECIPIENT). ADDED, not widened from a callback: every existing caller means the default
-        and this keeps meaning it without touching a single call site. `is_a_shared_sandbox_name`
-        already matched this shape before any caller could produce it — a widening kept in step
-        with the guard it feeds, never announced ahead of one.
-
-        `shared_project_id`/`shared_owner_id` (#198) are the registry-hash counterpart of
-        `kind="shared_sandbox"`: written to `REGISTRY_FIELD_SHARED_PROJECT_ID`/
-        `REGISTRY_FIELD_SHARED_OWNER_ID` so a LATER occupancy check (`_occupying_project`'s
-        sibling in `manager.py`) can recognize "this slot holds a colleague's shared view"
-        without reverse-parsing `shr_name_for`'s hash — which, like every other name this
-        platform derives, is forward-match-only. `None` on the `build_sandbox` arm, always;
-        supplying one without the other is a caller error, never a partial stamp."""
+        """Provision a fresh container and restore a git bundle onto its disk, then re-inject the
+        app-data credential from `app_env`; the handle is `ready=False` until `wait_ready`. Its
+        `app_name` is the container's own, which a claimed pool container keeps. `source_key`
+        names the bundle: the app's saved snapshot by default, the crash-recovery copy for a
+        recovery. `kind` selects the ARM identity, with `user_id` the owner of a build sandbox
+        and the recipient of a shared view, whose `shared_project_id` and `shared_owner_id` are
+        stamped on the registry record together, as a container's name cannot say it is a view.
+        Refused, like `provision_new`, while the registry still names a container."""
         ...
 
     @abc.abstractmethod

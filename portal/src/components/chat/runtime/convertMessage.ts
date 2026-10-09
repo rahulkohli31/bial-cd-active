@@ -64,7 +64,8 @@ function activityState(state: 'ok' | 'failed' | 'pending'): ActivityState {
   if (state === 'ok') return 'ok'
   if (state === 'failed') return 'failed'
   // `pending` is a step that started and has not resolved. The group reports itself running when
-  // any contained part is running, and that is what drives the live count and the label.
+  // any contained part is running while its message is still being written, and that is what
+  // drives the live count and the label.
   return 'running'
 }
 

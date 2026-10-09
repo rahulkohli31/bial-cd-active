@@ -8,10 +8,13 @@ working upload right up until the answer is wrong.
 
 from __future__ import annotations
 
+import pytest
+
 from src.services.media import ALLOWED_MEDIA, CODE_LANE_MEDIA, is_code_lane
 from src.services.media.lanes import (
     CSV_MEDIA_TYPE,
     EXCEL_MEDIA_TYPE,
+    PASSWORD_PROTECTED_TEXT,
     PPTX_MEDIA_TYPE,
     TSV_MEDIA_TYPE,
     WORD_MEDIA_TYPE,
@@ -62,8 +65,12 @@ def test_an_office_file_must_carry_its_own_opc_part() -> None:
     assert code_lane_refusal(WORD_MEDIA_TYPE, "doc.docx", _ooxml(b"word/document.xml")) is None
     assert code_lane_refusal(PPTX_MEDIA_TYPE, "d.pptx", _ooxml(b"ppt/presentation.xml")) is None
 
-    # A workbook sent as a document, and a plain archive renamed: both refused.
-    assert code_lane_refusal(WORD_MEDIA_TYPE, "x.docx", _ooxml(b"xl/workbook.xml")) is not None
+    # A workbook sent as a document, and a plain archive renamed: both refused. The first is a real
+    # ZIP, so it must not be told it is not an Office file at all.
+    assert code_lane_refusal(WORD_MEDIA_TYPE, "x.docx", _ooxml(b"xl/workbook.xml")) == (
+        '"x.docx" does not match the file type it was sent as. '
+        "Re-save it in its own application and attach it again."
+    )
     assert code_lane_refusal(EXCEL_MEDIA_TYPE, "z.xlsx", _ZIP + b"just a zip") is not None
 
 
@@ -73,9 +80,9 @@ def test_a_password_protected_office_file_is_refused_at_the_door() -> None:
     workbook gets the same sentence a locked PDF gets, instead of being accepted, stored, charged,
     and failing inside the sandbox several turns later where nothing can explain it.
 
-    Mutation receipt: remove the `looks_password_protected` branch and the refusal becomes the
-    generic "could not be read" one, which a citizen holding a file they know is fine cannot act
-    on.
+    Mutation receipt: remove the `looks_password_protected` branch and the refusal becomes "is not
+    a spreadsheet, whatever its name says", which a citizen holding a file they know is fine
+    cannot act on.
     """
     locked = _OLE2 + bytes(64)
 
@@ -91,9 +98,42 @@ def test_the_password_check_runs_before_the_structure_check() -> None:
     about a file they know is fine, reads as the platform being broken."""
     refusal = code_lane_refusal(WORD_MEDIA_TYPE, "locked.docx", _OLE2 + bytes(64))
 
-    assert refusal is not None
-    assert "read" not in refusal.lower().split("password")[0]
-    assert "password" in refusal.lower()
+    assert refusal == PASSWORD_PROTECTED_TEXT
+
+
+@pytest.mark.parametrize(
+    ("media_type", "name", "expected"),
+    [
+        pytest.param(
+            WORD_MEDIA_TYPE,
+            "Office data.docx",
+            '"Office data.docx" is not a Word document, whatever its name says. '
+            "Open it in Word, re-save it as .docx, and attach it again.",
+            id="word",
+        ),
+        pytest.param(
+            EXCEL_MEDIA_TYPE,
+            "book.xlsx",
+            '"book.xlsx" is not a spreadsheet, whatever its name says. '
+            "Open it in Excel, re-save it as .xlsx, and attach it again.",
+            id="excel",
+        ),
+        pytest.param(
+            PPTX_MEDIA_TYPE,
+            "deck.pptx",
+            '"deck.pptx" is not a PowerPoint deck, whatever its name says. '
+            "Open it in PowerPoint, re-save it as .pptx, and attach it again.",
+            id="powerpoint",
+        ),
+    ],
+)
+def test_a_file_that_is_not_an_office_package_is_told_what_it_is_not(
+    media_type: str, name: str, expected: str
+) -> None:
+    """A file named `.docx` whose bytes are not a ZIP is not a damaged Word document: it was never
+    one. The refusal has to say that, and name the format, or "re-save it" gives a citizen
+    holding a dummy or mislabelled file nothing to act on."""
+    assert code_lane_refusal(media_type, name, bytes(4096)) == expected
 
 
 def test_delimited_files_are_admitted_on_their_extension() -> None:

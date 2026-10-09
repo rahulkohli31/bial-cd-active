@@ -25,6 +25,7 @@ from src.api.v1.build_sessions.deps import (
     session_manager_dependency,
 )
 from src.config import settings
+from src.db.models.app_registry import AppRegistry
 from src.db.models.audit import AuditLog
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.db.models.project import Project
@@ -32,17 +33,23 @@ from src.db.models.user import User
 from src.db.session import get_db
 from src.services.build_sessions import SessionManager
 from src.services.build_sessions.appdata import resolve_app_for_project
-from src.services.build_sessions.manager import shr_name_for
 from src.services.directory import client as directory_client
 from src.services.directory import is_directory_member
 from src.services.projects.shares import revoke_share
+from src.services.redis import registry_key
+from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import accessor as storage_accessor
 from src.services.storage import snapshot_key
 from tests.api.v1.projects.conftest import _VALID_DESCRIPTION, DELETE_BODY
 from tests.api.v1.projects.test_projects_crud import _auth
 from tests.factories import ProjectFactory, ProjectShareFactory, UserFactory
-from tests.fakes import FakeDirectory, FakeSandboxClient, FakeStorage
+from tests.fakes import (
+    FakeDirectory,
+    FakeSandboxClient,
+    FakeStorage,
+    a_name_unrelated_to_its_app,
+)
 
 
 @pytest.fixture
@@ -661,8 +668,7 @@ async def test_unshare_tears_down_the_colleagues_live_container(
     project = await db_session.get(Project, uuid.UUID(project_id))
     launched = await manager.launch_shared_preview(db_session, colleague, project, sbx)
     assert launched.app_id == app_id
-    shared_name = shr_name_for(app_id, colleague.id)
-    assert shared_name in sbx.restored
+    [shared_name] = sbx.restored
 
     resp = await client.post(
         f"/v1/projects/{project_id}:unshare",
@@ -673,6 +679,117 @@ async def test_unshare_tears_down_the_colleagues_live_container(
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
     assert shared_name in sbx.torn_down
+
+
+async def _a_colleagues_view_named_like_a_build_sandbox(
+    client, db_session, bind_store, manager, sbx, fake_redis
+) -> tuple[dict[str, str], str, User, str]:
+    """A shared, launched view whose container carries a name unrelated to its app."""
+    headers, owner = await _auth(db_session)
+    project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
+    colleague = await UserFactory.create(db_session, email="colleague@example.com")
+    await db_session.commit()
+    await client.post(
+        f"/v1/projects/{project_id}:share",
+        headers=headers,
+        json={"sharedWithUserId": str(colleague.id)},
+    )
+    project = await db_session.get(Project, uuid.UUID(project_id))
+    await manager.launch_shared_preview(db_session, colleague, project, sbx)
+    name = a_name_unrelated_to_its_app()
+    await fake_redis.hset(registry_key(colleague.id), REGISTRY_FIELD_APP_NAME, name)
+    return headers, project_id, colleague, name
+
+
+async def test_unshare_tears_down_a_colleagues_view_named_like_a_build_sandbox(
+    client, db_session, bind_store, wired_sandbox, _sandbox_configured, fake_redis
+) -> None:
+    """★ A missed revoke leaves a removed colleague a running copy of the owner's app.
+
+    Mutation check: hand the revoke any other project's stamp and the view keeps running."""
+    manager, sbx = wired_sandbox
+    headers, project_id, colleague, name = await _a_colleagues_view_named_like_a_build_sandbox(
+        client, db_session, bind_store, manager, sbx, fake_redis
+    )
+
+    resp = await client.post(
+        f"/v1/projects/{project_id}:unshare",
+        headers=headers,
+        json={"sharedWithUserId": str(colleague.id)},
+    )
+
+    assert resp.status_code == 200
+    assert sbx.torn_down == [name]
+
+
+async def test_deleting_a_project_tears_down_a_colleagues_view_named_like_a_build_sandbox(
+    client, db_session, bind_store, wired_sandbox, _sandbox_configured, fake_redis
+) -> None:
+    """Mutation check: look the view up by any other stamp and it outlives the project."""
+    manager, sbx = wired_sandbox
+    headers, project_id, colleague, name = await _a_colleagues_view_named_like_a_build_sandbox(
+        client, db_session, bind_store, manager, sbx, fake_redis
+    )
+
+    resp = await client.request(
+        "DELETE", f"/v1/projects/{project_id}", headers=headers, json=DELETE_BODY
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert sbx.torn_down == [name]
+    assert await fake_redis.exists(registry_key(colleague.id)) == 0
+
+
+async def test_a_colleagues_view_nobody_could_read_is_recorded_by_its_app_and_colleague(
+    client, db_session, bind_store, wired_sandbox, _sandbox_configured, fake_redis, monkeypatch
+) -> None:
+    """★ With no record to name it, the view is found in ARM by the app it runs AND the colleague
+    holding it: the app alone matches every colleague's view and the owner's own container.
+
+    Mutation check: record the bare app id and the survivor no longer says whose view it is."""
+    import importlib
+
+    import structlog.testing
+    from redis.exceptions import RedisError
+
+    from src.core.alarms import TEARDOWN_ARTEFACT_SURVIVED_EVENT
+
+    manager, sbx = wired_sandbox
+    headers, project_id, colleague, _name = await _a_colleagues_view_named_like_a_build_sandbox(
+        client, db_session, bind_store, manager, sbx, fake_redis
+    )
+    owner_app = await db_session.scalar(
+        select(AppRegistry.id).where(AppRegistry.project_id == uuid.UUID(project_id))
+    )
+
+    async def _unreadable(*args, **kwargs):
+        raise RedisError("the registry will not answer")
+
+    monkeypatch.setattr(
+        importlib.import_module("src.api.v1.projects.router"), "read_registry", _unreadable
+    )
+
+    with structlog.testing.capture_logs() as captured:
+        resp = await client.request(
+            "DELETE", f"/v1/projects/{project_id}", headers=headers, json=DELETE_BODY
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert [
+        entry["artefact_id"]
+        for entry in captured
+        if entry.get("event") == TEARDOWN_ARTEFACT_SURVIVED_EVENT
+        and entry.get("artefact") == "shared_sandbox_container"
+    ] == [f"{owner_app}/{colleague.id}"]
+    record = await db_session.scalar(
+        select(AuditLog).where(
+            AuditLog.action == "project:teardown-incomplete", AuditLog.resource_id == project_id
+        )
+    )
+    assert record is not None and record.detail is not None
+    assert {"artefact": "shared_sandbox_container", "id": f"{owner_app}/{colleague.id}"} in (
+        record.detail["survived"]
+    )
 
 
 # --- GET /{project_id}/shares ---------------------------------------------------

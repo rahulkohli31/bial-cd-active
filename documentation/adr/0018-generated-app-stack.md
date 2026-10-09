@@ -24,9 +24,9 @@ everywhere.
 **The package set is open.** The sandbox resolves dependencies against the public npm registry,
 and the building agent may install anything an application needs. The base sandbox image ships
 with a pre-installed set of dependencies as a speed base — so a session starts fast — not as a
-frozen or enforced set; a restored session reconciles its dependency lockfile against whatever the
-agent has since installed. What makes this acceptable is containment inside the sandbox, not a
-gatekept registry: generated code runs as an unprivileged process in a single-tenant container,
+frozen or enforced set; a restored session installs whatever the agent added on top of that
+base. What makes this acceptable is containment inside the sandbox, not a gatekept registry:
+generated code runs as an unprivileged process in a single-tenant container,
 behind a fail-closed environment allowlist, with no credential the application's own process can
 read (ADR-0014). The honest residual risk is that a malicious or typosquatted package is not
 physically unavailable to the agent; the mitigations that exist are sandbox-side, plus the human
@@ -44,6 +44,17 @@ a starting point the agent may edit or extend, not a ceiling: it may add depende
 and nothing in this decision freezes it in place. The authoritative pinned versions live in the
 generated-app template's own package manifest and lockfile in the repository, not in this record —
 restating a version number here would only go stale.
+
+**The template's own packages belong to the platform, and an app is brought up to the image's
+versions of them when it is restored.** A saved app carries the versions it was built with, and
+the image it is restored onto may pin newer ones. Left alone, every such app would reinstall its
+older copies over the image's on every open — a cost the pre-installed base exists to avoid — and
+would keep running releases a later image moved away from, often for a security fix. So a restore
+moves each of the template's packages up to the image's version, but never down and never onto
+another major release: an app the agent moved onto a newer release keeps it, and a new major can
+break the app's code. Packages the app added itself keep their saved versions. The move is a change
+in the workspace like any other, kept by the next save, whether the citizen makes it or the
+platform does before it shuts an idle sandbox down.
 
 **Data access is through Drizzle, against a PostgreSQL database dedicated to the app's own
 project.** Each generated app owns its schema, authored by the building agent directly in the

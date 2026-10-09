@@ -34,8 +34,8 @@ There is deliberately NO `:channel` family — single-replica means build progre
 WHY THIS EXISTS. Production shares one Redis instance with other BIAL apps, and a scheduled job
 reads this namespace as a spare-list and deletes Azure containers on the strength of it — a
 process pointed at the wrong instance must not act on another deployment's fleet. The registry
-hash is the ONE family with no TTL and the sole input to the fleet sweep and Azure inventory, so
-a moved or forgotten key permanently strands every container live at that instant. A fleet scan
+hash carries no TTL and is the sole input to the fleet sweep and Azure inventory, so a moved or
+forgotten key permanently strands every container live at that instant. A fleet scan
 issues current AND legacy as two literals, never one `bial:*:` glob, which would reach into
 another environment's fleet; a legacy match is dual-read too (`locks.read_registry`), and the
 legacy prefix stays read-only."""
@@ -312,6 +312,15 @@ def registry_scan_patterns() -> tuple[str, ...]:
     return (f"{key_prefix()}{FAMILY_REGISTRY}:*", f"{LEGACY_KEY_PREFIX}{FAMILY_REGISTRY}:*")
 
 
+def user_id_from_key(key: str) -> uuid.UUID | None:
+    """The user a scanned per-user key belongs to, or `None` for a key this platform did not
+    write: its last segment is the user id under every prefix."""
+    try:
+        return uuid.UUID(key.rsplit(":", 1)[-1])
+    except ValueError:
+        return None
+
+
 # --- Registry hash fields (frozen — SESSION-API writes/reads these, never a
 # hand-typed field string) --------------------------------------------------
 
@@ -322,6 +331,13 @@ REGISTRY_FIELD_FQDN: Final = "fqdn"
 REGISTRY_FIELD_TOKEN_REF: Final = "token_ref"
 REGISTRY_FIELD_CREATED_AT: Final = "created_at"
 REGISTRY_FIELD_STATE: Final = "state"
+
+# THE APP THIS CONTAINER RUNS, written at birth — for a shared view, the owner's app. Every lookup
+# that asks "is this app X's container?" compares this, never a name derived from X, so a
+# container may carry any name. Absent only on a record an earlier release wrote, when every name
+# was derived from its app. Three places read that absence, and go together:
+# `locks.record_holds`, `locks.is_a_shared_view` and `reaper._owning_app_id`.
+REGISTRY_FIELD_APP_ID: Final = "app_id"
 
 # THE CONTAINER'S PUBLIC ADDRESS KEY — what a browser's URL carries instead of `app_name`. Written
 # with the record at create and never changed for that container; the next container gets a new
@@ -389,14 +405,13 @@ REGISTRY_FIELD_STAY_WRITER: Final = "stay_writer"
 # process — than the adoption.
 REGISTRY_FIELD_ADOPTED_FROM_LEGACY: Final = "adopted_from_legacy"
 
-# --- shared-runtime identity (#198) — written ONLY when this slot holds a `shr-` container ---
+# --- shared-runtime identity — written ONLY when this slot holds a shared view ---
 #
 # The per-user slot this hash describes can hold EITHER the user's own build sandbox OR a
-# colleague's shared project, restored read-only into their slot. `app_name` alone cannot say
-# which: `shr_name_for` hashes the (app, recipient) pair, so nothing may reverse-parse an app id
-# or project id back out of it (same forward-match-only rule `app_name_for`/`published_app_name`
-# follow). Written once, at Launch, so the occupancy check a future slice adds (recognizing "you
-# already hold a shared view" before a new build silently reclaims it) never needs a backfill.
+# colleague's shared project, restored read-only into their slot. These two fields are what tells
+# the two apart, never the container's name: a shared view is never written back, so reading one
+# as a build sandbox would put a colleague's copy over its owner's saved work. Written together,
+# once, at Launch.
 
 REGISTRY_FIELD_SHARED_PROJECT_ID: Final = "shared_project_id"
 """The shared `projects.id` this slot is a read-only view of. Absent on every other registry
@@ -425,6 +440,7 @@ REGISTRY_FIELDS: Final = frozenset(
         REGISTRY_FIELD_TOKEN_REF,
         REGISTRY_FIELD_CREATED_AT,
         REGISTRY_FIELD_STATE,
+        REGISTRY_FIELD_APP_ID,
         REGISTRY_FIELD_ALIAS,
         REGISTRY_FIELD_SERVING_SINCE,
         REGISTRY_FIELD_WAITING_SINCE,

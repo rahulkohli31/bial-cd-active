@@ -19,6 +19,7 @@ from typing import Annotated, Self
 from pydantic import Field, PositiveInt, SecretStr, field_validator, model_validator
 from pydantic_settings import NoDecode
 
+from src.services.analysis.config import AnalysisConfig
 from src.services.appdb.config import AppDatabaseSettings
 from src.services.auth.config import AuthConfig
 from src.services.deploy.config import DeployConfig
@@ -26,7 +27,7 @@ from src.services.lake.config import LakeConfig
 from src.services.redis.config import RedisConfig
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage.config import StorageConfig
-from src.settings.core import CoreSettings
+from src.settings.core import CoreSettings, require_an_https_portal_in_production
 from src.settings.foundry import FoundryConfig
 
 
@@ -108,6 +109,10 @@ class ApiSettings(CoreSettings):
     # capability nobody has enabled. Add the gate in the same commit that makes the portal show a
     # Deploy control unconditionally.
     deploy: DeployConfig | None = None
+
+    # The session pool BIAL Chat runs file analysis in. Unset, BIAL Chat refuses Office and CSV
+    # files at its doors and answers everything else as before.
+    analysis: AnalysisConfig | None = None
 
     # Azure AI Foundry access. Genuinely optional: dev/test exercise the agent harness with
     # Pydantic AI's TestModel and make no live call, and None means "AI chat not configured".
@@ -267,12 +272,7 @@ class ApiSettings(CoreSettings):
         # FRONTEND_URL keeps its dev default, but it feeds security surfaces — the sandbox
         # frame-ancestors CSP via BIAL_PORTAL_ORIGIN and postMessage targetOrigin checks — so
         # production booting with the localhost default would silently mis-scope them.
-        if self.is_production and not self.FRONTEND_URL.startswith("https://"):
-            raise ValueError(
-                "FRONTEND_URL must be set to the portal's real https:// origin in "
-                "production: the localhost dev default (or any non-https URL) would "
-                "mis-scope the sandbox frame-ancestors CSP and postMessage origins."
-            )
+        require_an_https_portal_in_production(self.is_production, self.FRONTEND_URL)
         return self
 
     @model_validator(mode="after")

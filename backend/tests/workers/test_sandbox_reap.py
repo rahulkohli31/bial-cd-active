@@ -12,6 +12,7 @@ import pytest
 import redis.asyncio as aioredis
 
 from src.services.build_sessions.destroy import may_destroy_on_this_control_plane
+from src.services.build_sessions.inventory import OwnedApp
 
 
 def test_only_production_may_destroy() -> None:
@@ -65,31 +66,41 @@ def test_the_sweep_does_not_stop_because_a_sibling_pass_is_switched_off(
     assert sandbox_reap._off_duty_because() == "flag_off"
 
 
-async def test_the_scheduled_sweep_deletes_nothing_off_production(
+async def test_off_production_the_registry_pass_stays_off_and_the_owed_pass_runs(
     monkeypatch: pytest.MonkeyPatch, fake_redis: aioredis.Redis
 ) -> None:
     """THE SAME STANDING DIRECTIVE EVERY DESTRUCTIVE PASS IS UNDER: the dev subscription runs
-    containers people use to validate this feature, and an unattended timer must not delete from
-    it. Scoped to the SCHEDULED sweep only — `POST /v1/internal/reap` still sweeps anywhere
-    (superadmin, audited), and reconcile-on-start still collects a developer's own stale
-    sandbox on their next build.
+    containers people use to validate this feature, and an unattended pass must not decide to
+    delete from it. `POST /v1/internal/reap` still sweeps the registry anywhere (superadmin,
+    audited).
 
-    Mutation-check: drop the `may_destroy_on_this_control_plane` check from `_off_duty_because`
-    and this goes red."""
+    THE OWED PASS DECIDES NOTHING. It carries out deletions a start or a switch on this control
+    plane already decided, and a start clears the record before its delete is confirmed, so off
+    production nothing else would retry one. The kill switch still stops both.
+
+    Mutation check: drop the `may_destroy_on_this_control_plane` check and the registry spy
+    fires; gate the whole task on it again and the owed pass never runs."""
+    from src.services.build_sessions.shutdown import OwedSweepResult
     from src.workers import sandbox_reap
 
     swept: list[object] = []
+    owed_passes: list[object] = []
 
     async def _spy_sweep(*args: object, **kwargs: object) -> object:
         swept.append(kwargs)
-        raise AssertionError("the scheduled sweep must not run off production")
+        raise AssertionError("the scheduled registry pass must not run off production")
 
-    async def _owning() -> dict[str, uuid.UUID]:
+    async def _spy_owed(*args: object, **kwargs: object) -> OwedSweepResult:
+        owed_passes.append(args)
+        return OwedSweepResult(settled=0, still_owed=0, failed=0)
+
+    async def _owning() -> dict[str, OwnedApp]:
         return {}
 
     # Redis, the control plane and the owner map are all AVAILABLE on purpose: the sweep must
     # reach `sweep_all` and fail on the spy, not go green by tripping over an unconfigured dep.
     monkeypatch.setattr("src.services.build_sessions.reaper.sweep_all", _spy_sweep)
+    monkeypatch.setattr("src.services.build_sessions.shutdown.sweep_owed_teardowns", _spy_owed)
     monkeypatch.setattr(sandbox_reap, "_owning_app_ids", _owning)
     monkeypatch.setattr("src.services.sandbox.get_sandbox", lambda: _Fleet())
 
@@ -98,8 +109,12 @@ async def test_the_scheduled_sweep_deletes_nothing_off_production(
         await sandbox_reap.reap_abandoned_sandboxes()
 
     assert swept == []
-    monkeypatch.setattr(sandbox_reap, "settings", _Settings("production"))
-    assert sandbox_reap._off_duty_because() is None
+    assert len(owed_passes) == 2
+
+    monkeypatch.setattr(sandbox_reap, "settings", _Settings("development", sweep=False))
+    await sandbox_reap.reap_abandoned_sandboxes()
+
+    assert len(owed_passes) == 2, "the kill switch stops the owed pass too"
 
 
 async def test_the_scheduled_sweep_hands_the_owning_app_ids_to_the_gate(
@@ -122,8 +137,10 @@ async def test_the_scheduled_sweep_hands_the_owning_app_ids_to_the_gate(
         seen["map"] = app_ids_by_name
         return SweepResult(reaped=0, failed=0)
 
-    async def _owning() -> dict[str, uuid.UUID]:
-        return {"sbx-x": app_id}
+    owned = {"sbx-x": OwnedApp(app_id, uuid.uuid4())}
+
+    async def _owning() -> dict[str, OwnedApp]:
+        return owned
 
     monkeypatch.setattr("src.services.build_sessions.reaper.sweep_all", _spy_sweep)
     monkeypatch.setattr(sandbox_reap, "_owning_app_ids", _owning)
@@ -132,4 +149,4 @@ async def test_the_scheduled_sweep_hands_the_owning_app_ids_to_the_gate(
 
     await sandbox_reap.reap_abandoned_sandboxes()
 
-    assert seen["map"] == {"sbx-x": app_id}
+    assert seen["map"] == owned

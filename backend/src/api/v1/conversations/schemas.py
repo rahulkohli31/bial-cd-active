@@ -283,6 +283,9 @@ class WorkspaceFrame(CamelModel):
     # it — and it stays true after the phase that carried it has passed. Sharing one field made
     # every ordinary turn post its phase narration into the banner slot above the composer.
     notice: str | None = None
+    # On `ready`: the start this turn began, which the browser reports its own clock against.
+    # `None` when the turn attached to a workspace already running.
+    start_id: uuid.UUID | None = None
 
 
 class PreviewFrame(CamelModel):

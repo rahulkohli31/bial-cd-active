@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -29,14 +28,14 @@ from src.services.orchestrator.deps import SandboxSession
 class _Recorder:
     """Stands in for the reader, recording the path it was asked for.
 
-    CARRIES A SESSION because the tool body binds `app_id` on the named-failure log. A double
-    without one fails as an `AttributeError` that reads like a bug in the code under test.
+    CARRIES LOG FIELDS because the tool body binds them on the named-failure log. A double
+    without them fails as an `AttributeError` that reads like a bug in the code under test.
     """
 
     result: str = '{"ok": true, "file": "roster.xlsx", "rows": 5000}'
     raises: Exception | None = None
     seen: list[str] | None = None
-    session: Any = field(default_factory=lambda: SimpleNamespace(app_id=uuid.uuid4()))
+    log_fields: dict[str, str] = field(default_factory=lambda: {"app_id": str(uuid.uuid4())})
 
     async def read(self, path: str) -> str:
         if self.seen is None:

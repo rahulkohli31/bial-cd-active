@@ -102,7 +102,7 @@ class ClaimOutcome:
     review: ReviewRecord
 
 
-def _record(row: Row[Any]) -> ReviewRecord:
+def _record(row: Row[*tuple[Any, ...]]) -> ReviewRecord:
     """One committed row → the frozen record. Positional against `_RECORD_COLUMNS`."""
     return ReviewRecord(*row)
 

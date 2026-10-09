@@ -8,16 +8,35 @@ outlives its test blows up in the next one.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
+import asyncpg
+import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from src.config import settings
 from src.db.models.project_database import ProjectDatabase
 from src.services.appdb.provision import control_plane_dsn
+
+
+@contextmanager
+def refused_by_postgres(
+    expected: type[asyncpg.PostgresError],
+) -> Iterator[pytest.ExceptionInfo[DBAPIError]]:
+    """Expect Postgres to refuse the connection with `expected`, the driver's own error class.
+
+    SQLAlchemy wraps a refusal at connect time like any other driver error, so the class that
+    says WHY Postgres refused sits under the wrapper rather than on it."""
+    with pytest.raises(DBAPIError) as refused:
+        yield refused
+    orig = refused.value.orig
+    assert isinstance(orig.__cause__ if orig is not None else None, expected), repr(orig)
 
 
 async def scalar_on(dsn: str, sql: str, **params: Any) -> Any:

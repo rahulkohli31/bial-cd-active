@@ -236,7 +236,7 @@ async def reconcile_orphaned_app_databases(
     read as "no orphans" would be the worst possible output of this function.
     """
     moment = now or datetime.datetime.now(datetime.UTC)
-    claims: Sequence[sa.Row[tuple[str, str]]] = (
+    claims: Sequence[sa.Row[str, str]] = (
         await db.execute(sa.select(ProjectDatabase.db_name, ProjectDatabase.role_name))
     ).all()
     registered_databases = frozenset(str(row[0]) for row in claims)

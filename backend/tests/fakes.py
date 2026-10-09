@@ -6,6 +6,8 @@ conversation delete-sweeps, and the snapshot round-trip run without Azurite.
 `FakeSandboxClient` is a canned `SandboxClient` (the mock helper) that lets SESSION-API's
 reaper + SessionManager + router tests run without a live container or real ACA.
 
+`FakeAnalysisRuntime` stands in for BIAL Chat's Azure session pool.
+
 `ToolDeps` and `write_legacy_build_started` at the foot of the file are re-hosted from `src/`:
 both were harness-only in production and were deleted with it, and both were the driver for
 tests of code that is still live. See the section comment there.
@@ -15,10 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import enum
+import secrets
 import uuid
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Final, Literal
 
@@ -32,6 +36,14 @@ from src.core.connectors import CONNECTORS, ConnectedSystem, ResolvedWindow
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.project_connector import ConnectorWindowKind
+from src.services.analysis import (
+    AnalysisTimedOutError,
+    AnalysisUnavailableError,
+    Execution,
+    SessionFile,
+)
+from src.services.analysis.placement import LINK_CODE
+from src.services.build_sessions.locks import read_registry
 from src.services.build_sessions.manager import SessionManager
 from src.services.build_sessions.outcome import (
     FORCE_ENDED,
@@ -49,9 +61,11 @@ from src.services.redis import (
 )
 from src.services.redis.keys import (
     REGISTRY_FIELD_ALIAS,
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
+    REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_SERVING_SINCE,
     REGISTRY_FIELD_SHARED_OWNER_ID,
     REGISTRY_FIELD_SHARED_PROJECT_ID,
@@ -70,6 +84,7 @@ from src.services.sandbox.base import (
     FileResult,
     FleetMember,
     SandboxClient,
+    SandboxError,
     SandboxGoneError,
     SandboxHandle,
     SandboxNotReadyError,
@@ -110,7 +125,7 @@ def a_git_bundle(sha: str = "a" * 40) -> bytes:
 
 
 def a_sandbox_name(marker: str = "x") -> str:
-    """A container name the platform could actually have MINTED: `manager.app_name_for` emits
+    """A container name the platform could actually have MINTED: `app_name_for` emits
     `sbx-` + exactly 28 lowercase hex characters. Fixtures used to say `"sbx-x"` — a shape no
     code path produces — which let a missing name guard on the ARM delete path go unnoticed
     (`reap_user` handed the registry's value straight to a delete, `""` included). Hex-encoded
@@ -118,8 +133,14 @@ def a_sandbox_name(marker: str = "x") -> str:
     return "sbx-" + (marker.encode().hex() + "0" * 28)[:28]
 
 
+def a_name_unrelated_to_its_app() -> str:
+    """A container name that says nothing about the app it runs: the sandbox shape, random hex.
+    A lookup that still derives a name from the app cannot find a container called this."""
+    return "sbx-" + secrets.token_hex(14)
+
+
 def a_shared_sandbox_name(marker: str = "x") -> str:
-    """The `shr-` sibling of `a_sandbox_name` (#198) — a shape `manager.shr_name_for` could
+    """The `shr-` sibling of `a_sandbox_name` (#198) — a shape `shr_name_for` could
     actually have minted, for the same reason: a fixture no code path produces would let a
     missing shape guard on the ARM delete path go unnoticed."""
     return "shr-" + (marker.encode().hex() + "0" * 28)[:28]
@@ -262,6 +283,97 @@ class FakeDirectory:
         return httpx.Response(404, request=request)
 
 
+@dataclass
+class FakeAnalysisRuntime:
+    """An in-memory `AnalysisRuntime`: one dict of files per session identifier.
+
+    A call on an unknown identifier opens an empty session, as the service does. `remove` is
+    Azure deleting an idle session. `unavailable` fails every call; `run_times_out` fails every
+    run with the deadline; `hold_runs` parks each run until it is cleared. `handle_run` decides
+    what a run prints, and its streams are cut at the run's `output_limit` as the service cuts
+    them. `calls` records `(operation, session_id)` in order, `uploads` and `deletions` the
+    `(session_id, name)` of each file call, and `runs` the code. Placement's own link run lands in
+    `links` instead and always succeeds: the knobs above are for model code."""
+
+    files: dict[str, dict[str, bytes]] = field(default_factory=dict)
+    stamps: dict[str, dict[str, str]] = field(default_factory=dict)
+    calls: list[tuple[str, str]] = field(default_factory=list)
+    uploads: list[tuple[str, str]] = field(default_factory=list)
+    deletions: list[tuple[str, str]] = field(default_factory=list)
+    runs: list[tuple[str, str]] = field(default_factory=list)
+    links: list[str] = field(default_factory=list)
+    unavailable: bool = False
+    run_times_out: bool = False
+    hold_runs: asyncio.Event | None = None
+    handle_run: Callable[[str, str], Execution] = field(
+        default=lambda _session_id, _code: Execution(succeeded=True, stdout="", stderr="")
+    )
+    _uploads: int = 0
+
+    def _enter(self, operation: str, session_id: str) -> dict[str, bytes]:
+        self.calls.append((operation, session_id))
+        if self.unavailable:
+            raise AnalysisUnavailableError(f"{operation} refused")
+        self.stamps.setdefault(session_id, {})
+        return self.files.setdefault(session_id, {})
+
+    def operations(self, operation: str) -> list[str]:
+        """The session ids `operation` was called with, in order."""
+        return [session for name, session in self.calls if name == operation]
+
+    def remove(self, session_id: str) -> None:
+        """Azure deleting the session after its cool-down: the next call opens an empty one."""
+        self.files.pop(session_id, None)
+        self.stamps.pop(session_id, None)
+
+    async def list_files(self, session_id: str) -> list[SessionFile]:
+        held = self._enter("list_files", session_id)
+        stamps = self.stamps[session_id]
+        return [
+            SessionFile(name=name, size=len(data), modified=stamps[name])
+            for name, data in held.items()
+        ]
+
+    async def upload_file(self, session_id: str, name: str, data: bytes) -> None:
+        self._enter("upload_file", session_id)[name] = data
+        self.uploads.append((session_id, name))
+        self._uploads += 1
+        self.stamps[session_id][name] = f"stamp-{self._uploads}"
+
+    async def delete_file(self, session_id: str, name: str) -> None:
+        self._enter("delete_file", session_id).pop(name, None)
+        self.deletions.append((session_id, name))
+        self.stamps[session_id].pop(name, None)
+
+    async def run(
+        self, session_id: str, code: str, *, timeout_s: float, output_limit: int
+    ) -> Execution:
+        self._enter("run", session_id)
+        if code == LINK_CODE:
+            self.links.append(session_id)
+            return Execution(succeeded=True, stdout="", stderr="")
+        self.runs.append((session_id, code))
+        if self.hold_runs is not None:
+            await self.hold_runs.wait()
+        if self.run_times_out:
+            raise AnalysisTimedOutError(f"run outlived {timeout_s}s")
+        execution = self.handle_run(session_id, code)
+        return replace(
+            execution,
+            stdout=execution.stdout[: output_limit - 1],
+            stderr=execution.stderr[: output_limit - 1],
+        )
+
+    async def delete_session(self, session_id: str) -> None:
+        self.calls.append(("delete_session", session_id))
+        if self.unavailable:
+            raise AnalysisUnavailableError("delete_session refused")
+        self.remove(session_id)
+
+    async def aclose(self) -> None:
+        return None
+
+
 def _fake_handle(app_name: str) -> SandboxHandle:
     fqdn = f"{app_name}.westeurope.azurecontainerapps.io"
     return SandboxHandle(
@@ -277,6 +389,7 @@ async def _hydrate_registry(
     user_id: str,
     handle: SandboxHandle,
     *,
+    app_env: dict[str, str],
     shared_project_id: uuid.UUID | None = None,
     shared_owner_id: uuid.UUID | None = None,
 ) -> None:
@@ -294,13 +407,18 @@ async def _hydrate_registry(
     Green, and blind to the whole change.
 
     `shared_project_id`/`shared_owner_id` (#198) mirror the real client's `_write_registry`:
-    stamped only when given, `None` on the ordinary `provision_new` arm."""
+    stamped only when given, `None` on the ordinary `provision_new` arm. The app id is read off
+    `app_env` as the real client reads it, so an env without one fails here as it would there."""
     key = registry_key(uuid.UUID(user_id))
     born = datetime.now(UTC).isoformat()
-    await get_redis().hset(
+    # One transaction, as the real writer: the stamp is the only classifier, so no reader may
+    # see this container under the previous occupant's kind.
+    pipe = get_redis().pipeline(transaction=True)
+    pipe.hset(
         key,
         mapping={
             REGISTRY_FIELD_APP_NAME: handle.app_name,
+            REGISTRY_FIELD_APP_ID: app_env["BIAL_APP_ID"],
             REGISTRY_FIELD_ALIAS: new_alias(),
             REGISTRY_FIELD_FQDN: handle.fqdn,
             # A reference, never the raw token — mirrors the real client's contract.
@@ -314,21 +432,19 @@ async def _hydrate_registry(
         },
     )
     if shared_project_id is not None:
-        await get_redis().hset(
+        pipe.hset(
             key,
             mapping={
                 REGISTRY_FIELD_SHARED_PROJECT_ID: str(shared_project_id),
                 REGISTRY_FIELD_SHARED_OWNER_ID: str(shared_owner_id),
             },
         )
-    # `shared_served_count` disowned UNCONDITIONALLY — mirrors the real client's own fix: a
-    # high-water mark left behind by a PRIOR occupant of this slot (build sandbox or a
-    # replaced shared view) must never be compared against a fresh container's first reading.
-    await get_redis().hdel(key, REGISTRY_FIELD_SHARED_SERVED_COUNT)
+    # A stay and a served-count high-water mark left by a PRIOR occupant of this slot are
+    # disowned on every fresh container, exactly as the real client disowns them.
+    pipe.hdel(key, REGISTRY_FIELD_PREVIEW_STAY_UNTIL, REGISTRY_FIELD_SHARED_SERVED_COUNT)
     if shared_project_id is None:
-        await get_redis().hdel(
-            key, REGISTRY_FIELD_SHARED_PROJECT_ID, REGISTRY_FIELD_SHARED_OWNER_ID
-        )
+        pipe.hdel(key, REGISTRY_FIELD_SHARED_PROJECT_ID, REGISTRY_FIELD_SHARED_OWNER_ID)
+    await pipe.execute()
 
 
 class FakeSandboxClient(SandboxClient):
@@ -403,14 +519,26 @@ class FakeSandboxClient(SandboxClient):
         # (`ServedCount`'s own docstring). `False` by default: most tests script a small count
         # that is meant to compare as a real total.
         self.served_count_truncated: bool = False
+        # Containers that report no settings, as a claimed pool container Azure restarted does:
+        # they refuse `dev_start` as the supervisor does. Every start a container accepted is
+        # recorded with the container it went to.
+        self.unconfigured: set[str] = set()
+        self.started: list[str] = []
+
+    async def _refuse_to_orphan(self, user_id: str) -> None:
+        """The real client's refusal to record a container over a record naming another: a
+        caller that forgot to hand the old one over fails here as it would in production."""
+        if await get_redis().hget(registry_key(uuid.UUID(user_id)), REGISTRY_FIELD_APP_NAME):
+            raise SandboxError("the registry still names a container nobody has taken over")
 
     async def provision_new(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
+        await self._refuse_to_orphan(user_id)
         self.provisioned.append(app_name)
         self.provision_env = dict(app_env)
         handle = _fake_handle(app_name)
-        await _hydrate_registry(user_id, handle)
+        await _hydrate_registry(user_id, handle, app_env=app_env)
         self.by_name[app_name] = handle
         return handle
 
@@ -438,7 +566,10 @@ class FakeSandboxClient(SandboxClient):
             raise SandboxGoneError("sandbox is ending")
         if self.attach_handle is None:
             raise SandboxGoneError("no live sandbox for user")
-        return self.attach_handle
+        # The real client reads this off the supervisor's answer to the attach's own probe.
+        return replace(
+            self.attach_handle, configured=self.attach_handle.app_name not in self.unconfigured
+        )
 
     async def attach_by_name(self, *, app_name: str) -> SandboxHandle:
         """Mirrors the real client's absent-vs-unreachable split, keyed on `by_name` /
@@ -460,6 +591,7 @@ class FakeSandboxClient(SandboxClient):
         shared_project_id: uuid.UUID | None = None,
         shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
+        await self._refuse_to_orphan(user_id)
         self.restored.append(app_name)
         # Which bundle a restore PULLED is the whole question for the recovery flow, so record
         # it — `restored` only says a restore happened, never from what.
@@ -473,7 +605,11 @@ class FakeSandboxClient(SandboxClient):
         self.restore_env = dict(app_env)
         handle = _fake_handle(app_name)
         await _hydrate_registry(
-            user_id, handle, shared_project_id=shared_project_id, shared_owner_id=shared_owner_id
+            user_id,
+            handle,
+            app_env=app_env,
+            shared_project_id=shared_project_id,
+            shared_owner_id=shared_owner_id,
         )
         self.by_name[app_name] = handle
         return handle
@@ -516,6 +652,9 @@ class FakeSandboxClient(SandboxClient):
     async def dev_start(
         self, handle: SandboxHandle, *, cmd: list[str] | None = None, cwd: str | None = None
     ) -> int:
+        if handle.app_name in self.unconfigured:
+            raise SandboxError("dev/start failed with status 412")
+        self.started.append(handle.app_name)
         return 4321
 
     async def dev_status(self, handle: SandboxHandle) -> DevStatus:
@@ -576,6 +715,47 @@ class FakeSandboxClient(SandboxClient):
         self.unreachable_by_name.discard(handle.app_name)
 
 
+class AttachesWhatTheRecordNames(FakeSandboxClient):
+    """Attaches whichever container the user's record names, as the real client does, answers
+    the whole write-back ladder, and says which containers it bundled a tree out of — so a test
+    that asserts nothing was written back is asserting it of a write-back that COULD have run."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bundled_from: list[str] = []
+        bundle = base64.b64encode(a_git_bundle("c" * 40)).decode()
+
+        def handler(cmd: list[str]) -> ExecResult:
+            if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
+                return ExecResult(stdout=f"{'a' * 40}@@ M page.tsx@@4@@", stderr="", exit=0)
+            if cmd[0] == "base64":
+                return ExecResult(stdout=bundle, stderr="", exit=0)
+            return ExecResult(stdout="", stderr="", exit=0)
+
+        self.exec_handler = handler
+
+    async def attach_existing(self, user_id: str) -> SandboxHandle:
+        reg = await read_registry(get_redis(), uuid.UUID(user_id))
+        if reg is None or reg.get(REGISTRY_FIELD_STATE) == REGISTRY_STATE_ENDING:
+            raise SandboxGoneError("nothing to attach")
+        name = reg[REGISTRY_FIELD_APP_NAME]
+        return SandboxHandle(
+            fqdn=f"{name}.example", token="tok", app_name=name, preview_url="", ready=True
+        )
+
+    async def exec(
+        self,
+        handle: SandboxHandle,
+        cmd: list[str],
+        *,
+        cwd: str | None = None,
+        timeout_s: int = 900,
+    ) -> ExecResult:
+        if cmd[0] == "base64":
+            self.bundled_from.append(handle.app_name)
+        return await super().exec(handle, cmd, cwd=cwd, timeout_s=timeout_s)
+
+
 class DevServerDownUntilStarted(FakeSandboxClient):
     """A container whose dev server is down until something starts it.
 
@@ -622,11 +802,45 @@ class DevServerDownUntilStarted(FakeSandboxClient):
         return DevStatus(running=up, ready=up, port=3000, root_status=200 if up else None)
 
 
+async def a_ready_pool_row(
+    name: str, *, fqdn: str, image_ref: str, since: datetime | None = None
+) -> None:
+    """A ready row in the pool's ledger, committed the way the ledger commits its own; a test
+    that writes one takes `empty_sandbox_pool`."""
+    from src.db.base import async_session_factory
+    from src.db.models.sandbox_pool import SandboxPoolMember, SandboxPoolState
+
+    async with async_session_factory() as db:
+        db.add(
+            SandboxPoolMember(
+                name=name,
+                fqdn=fqdn,
+                image_ref=image_ref,
+                state=SandboxPoolState.READY,
+                state_changed_at=since or datetime.now(UTC),
+            )
+        )
+        await db.commit()
+
+
 async def detached_work_done(manager: SessionManager) -> None:
     """Wait out everything the manager has detached — a start's slow half, its watch for a first
     page, a compensation — including whatever those spawn while being waited on."""
     while manager._tasks:
         await asyncio.gather(*list(manager._tasks), return_exceptions=True)
+
+
+def a_manager_whose_ledger_is(db: AsyncSession) -> SessionManager:
+    """A manager whose own sessions are the test's, so a debt it owes is one the test can read.
+
+    A default manager's sessions cannot see the test's uncommitted rows, so its ledger declines
+    every hand-over and the inline delete runs in its place: a test of a hand-over binds this."""
+
+    @contextlib.asynccontextmanager
+    async def _session() -> AsyncIterator[AsyncSession]:
+        yield db
+
+    return SessionManager(session_factory=lambda: _session())
 
 
 # ── Writers re-hosted from `src/`, where nothing calls them any more ──────────
