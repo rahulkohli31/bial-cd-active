@@ -1323,6 +1323,7 @@ class AcaSandboxClient(SandboxClient):
         *,
         app_id: uuid.UUID,
         kind: SandboxKind,
+        needs_identity: bool,
         shared_project_id: uuid.UUID | None,
         shared_owner_id: uuid.UUID | None,
     ) -> SandboxHandle | None:
@@ -1339,6 +1340,11 @@ class AcaSandboxClient(SandboxClient):
         stopwatch = running_stopwatch()
         if self._config.pool_size_at(datetime.now(UTC)) == 0:
             stopwatch.missed("size_zero", ready_count=0)
+            return None
+        if needs_identity:
+            # A ready container was made with no data identity, and Azure attaches one only when
+            # a container is created.
+            stopwatch.missed("connector", ready_count=None)
             return None
         try:
             ready = await pool.ready_count()
@@ -1674,11 +1680,27 @@ class AcaSandboxClient(SandboxClient):
         # builder upstream is broken, which is worth failing loudly on rather than provisioning an
         # anonymous container to paper over.
         app_id = uuid.UUID(app_env["BIAL_APP_ID"])
+        # WHETHER THIS CONTAINER MAY READ A CONNECTOR'S DATA, read back out of the environment
+        # the caller built rather than decided again here. The access question — a lake
+        # configured, the connector switched on for this project — was answered once by
+        # `build_connector_env`, and the presence of its coordinates IS that
+        # answer; deriving it again would be a second place the platform decides who may read
+        # BIAL's flight data. `None` means no identity block at all, so a container that was not
+        # granted anything gets a spec byte-identical to the one this platform sent before
+        # connectors existed.
+        #
+        # Imported lazily for the same reason the three `src.config` imports in this module are:
+        # this file is reached from `src/services/sandbox/__init__.py`, which `src/settings/api.py`
+        # imports, and the connector registry reaches `src/db/models/`.
+        from src.services.lake.env import identity_resource_id_for_env
+
+        identity_resource_id = identity_resource_id_for_env(app_env)
         claimed = await self._claim_a_ready_one(
             user_uuid,
             app_env,
             app_id=app_id,
             kind=kind,
+            needs_identity=identity_resource_id is not None,
             shared_project_id=shared_project_id,
             shared_owner_id=shared_owner_id,
         )
@@ -1697,21 +1719,6 @@ class AcaSandboxClient(SandboxClient):
         env = {**app_env, **_creation_env(base_path, token)}
         # Identity resolved BEFORE the create, so a container never exists untagged.
         tags = _identity_tags(kind, user_uuid, app_id)
-        # WHETHER THIS CONTAINER MAY READ A CONNECTOR'S DATA, read back out of the environment
-        # the caller built rather than decided again here. The access question — a lake
-        # configured, the connector switched on for this project — was answered once by
-        # `build_connector_env`, and the presence of its coordinates IS that
-        # answer; deriving it again would be a second place the platform decides who may read
-        # BIAL's flight data. `None` means no identity block at all, so a container that was not
-        # granted anything gets a spec byte-identical to the one this platform sent before
-        # connectors existed.
-        #
-        # Imported lazily for the same reason the three `src.config` imports in this module are:
-        # this file is reached from `src/services/sandbox/__init__.py`, which `src/settings/api.py`
-        # imports, and the connector registry reaches `src/db/models/`.
-        from src.services.lake.env import identity_resource_id_for_env
-
-        identity_resource_id = identity_resource_id_for_env(app_env)
         held = await self._hold_the_create(app_name)
         try:
             fqdn = await self._create_with_retry(

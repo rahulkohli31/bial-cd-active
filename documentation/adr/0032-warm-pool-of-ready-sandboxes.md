@@ -34,9 +34,10 @@ project's files, packages or processes into the next.
 
 **Every kind of start claims from it, at the one place every start already creates a container.**
 Reopening, a new project, a chat message, a switch and a shared view all pass through the same
-create step, so one claim there covers all of them, and no start kind or project type is treated
-differently. If nothing ready can be claimed, the same step creates a container the way it always
-has, so a failure in the pool can never fail a start that would have succeeded without it.
+create step, so one claim there covers all of them, and no start kind is treated differently. A
+connector project's start is the one exception, below. If nothing ready can be claimed, the same
+step creates a container the way it always has, so a failure in the pool can never fail a start that
+would have succeeded without it.
 
 **Settings reach a claimed container through the supervisor, once, after the claim.** The supervisor
 accepts one new authenticated call that takes the project's settings. It is limited to the
@@ -141,13 +142,14 @@ are swapped. The platform learns that an image was deployed only from the image 
 changing, so each sandbox deploy sets it to the new immutable tag in both the backend and the
 worker; a moving tag would hide the deploy.
 
-**The pool ships switched off.** Every size is zero when this lands. A connector project's app
-reads tenant data through an identity that Azure attaches when the container is created, and a
-ready container has no project yet, so it cannot carry it. Until a follow-up gives a connector
-project's claim that identity — by attaching it after the claim, or by a second small pool created
-with it — a ready container that a connector project could claim without it must not exist, and no
-condition by project type is added to make an exception. The sizes are raised once that has
-shipped.
+**A connector project's start never claims.** Its app reads tenant data through an identity that
+Azure attaches when the container is created, and a ready container has no project yet, so it cannot
+carry it. Whether a start needs the identity is the fact the create already reads from the start's
+environment; it is read once, before the claim, and a start that needs it creates its own container
+with it and, while the pool is on, is recorded as a miss for that reason. A connector project
+therefore opens no faster with the pool on, until a follow-up gives its claim the identity — by
+attaching it after the claim, or by a second small pool created with it. The pool ships switched
+off, every size zero, and the sizes can be raised without waiting for that follow-up.
 
 ## Consequences
 
@@ -157,8 +159,9 @@ shipped.
   is recorded once with whether it claimed and, if not, why; the records are read only as
   superadmin aggregates.
 - A start the pool cannot serve is today's start, unannounced and recorded with its reason: none
-  ready (more starts than ready containers, or Azure refusing creates), a size of zero, a claimed
-  container that failed its health check, or a later step of a claim that failed.
+  ready (more starts than ready containers, or Azure refusing creates), a size of zero, a
+  connector project, a claimed container that failed its health check, or a later step of a claim
+  that failed.
 - Ready containers cost money. They are billed as running containers, and whether a lower idle
   rate applies in this tenant is not established. The size settings are the lever, the night size
   keeps the idle cost down, and an image swap briefly doubles the pool inside the environment's

@@ -24,7 +24,7 @@ Split = Literal["admitted", "settings", "created", "dev_started", "first_page"]
 Lap = Literal["files", "restore_exec", "registry_write", "dev_start", "bearer_read", "configure"]
 
 #: Why a start created a container rather than claiming a ready one.
-Miss = Literal["no_ready", "unhealthy", "claim_failed", "size_zero"]
+Miss = Literal["no_ready", "unhealthy", "claim_failed", "size_zero", "connector"]
 
 
 def _ms(seconds: float) -> int:

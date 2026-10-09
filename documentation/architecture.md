@@ -144,7 +144,8 @@ project's files and processes into the next.
 
 **Every start goes through the one place that creates a container.** A claim there covers every
 kind of start, and when nothing ready can be claimed that same place creates a container the old
-way. The pool can make a start faster; it cannot make one fail.
+way. A data-connector project's start never claims: its data identity can only be given when a
+container is created. The pool can make a start faster; it cannot make one fail.
 
 **A container's name is not its app's name.** A container made ahead has no app to be named
 after, so every lookup reads a record of which app a container serves instead of working the name
