@@ -14,14 +14,45 @@ the platform already runs. On the test account the same four builds cost 36% les
 correcting for one run that found the cache already warm) and finished in about two-thirds of the
 time.
 
+A flight-data app can open from a pool of ready workspaces of its own, made with the identity that
+reads BIAL's flight data, so it opens as quickly as any other app. The pool ships switched off. It
+fills only once its sizes are set and the worker may attach that identity; until then a flight-data
+app opens in a workspace made for it, as it does today. The pool saves the wait for Azure to make
+the workspace; installing a larger app's libraries still takes as long as on the plain pool. On the
+test account a small flight-data app opened from the pool in 8 seconds and read its data.
+
 > **Before deploying:** roll out the new sandbox image before the new backend, and set
 > `SANDBOX__IMAGE_REF` to its tag in the backend and the worker, as on every sandbox deploy. The
 > backend tells a flight-data build to run an install command that only the new image carries. On
 > an old image, including a workspace started before the image changed, the build reads the older
 > reference file and writes the data module by hand, so it keeps none of the flight-data saving.
+>
+> Run the migrations before the new backend and worker start: this release adds one, and the
+> worker reads it every minute. Leave the `SANDBOX__POOL_CONNECTOR_*` sizes unset until both run
+> this release, since an older release refuses to start while they are set.
+
+### Added
+
+- **A second pool of ready workspaces, for flight-data projects.** It has day and night sizes of
+  its own, `SANDBOX__POOL_CONNECTOR_DAY_SIZE` and `SANDBOX__POOL_CONNECTOR_NIGHT_SIZE`, which are 0
+  by default and are set to the same values on the backend and the worker. Each workspace in it is
+  made with the data identity and nothing of any project's, and only a flight-data project's start
+  takes one. A shared view of a flight-data app still opens from the plain pool, without the data.
+- **A workspace from either pool is checked against Azure before a project gets it.** It must carry
+  exactly the identity its pool requires: none for the plain pool, the data identity for the other.
+  One that does not is deleted before the project's settings reach it, the alarm
+  `sandbox_pool_claim_wrong_identity` is raised, and the project gets a workspace of its own.
+- **To fill the flight-data pool, the worker needs the right to attach the data identity and the
+  same `CONNECTOR_LAKE__*` settings as the backend.** Without either, only that pool stays empty and
+  raises its own below-size alarm; the plain pool and every app's start are unaffected.
 
 ### Changed
 
+- **The start report says which pool a start could have used.** A flight-data start whose pool is
+  switched off is recorded as `connector`, and one whose pool had nothing ready as `no_ready`.
+  Before this release a flight-data start never took a ready workspace and was recorded as
+  `connector`, or as `size_zero` while the pool was off, so a report that spans this release mixes
+  the two meanings.
 - **Build chats think at medium effort, as Plan chats already do.** BIAL Chat stays at low.
 - **The assistant is asked to send steps that do not depend on each other in one reply,** in Plan,
   Build and BIAL Chat. In Build, steps that change files or run commands now run one at a time, in

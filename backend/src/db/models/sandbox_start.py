@@ -37,7 +37,8 @@ class SandboxStartKind(enum.StrEnum):
 
 class SandboxProjectType(enum.StrEnum):
     PLAIN = "plain"
-    #: The start's environment carries the connector coordinates and so its data identity.
+    #: A start whose environment carries a connector's coordinates, or a pool container made with
+    #: the lake's identity, which receives the coordinates when a start claims it.
     CONNECTOR = "connector"
 
 
@@ -47,7 +48,9 @@ class SandboxStartMiss(enum.StrEnum):
     NO_READY = "no_ready"
     UNHEALTHY = "unhealthy"
     CLAIM_FAILED = "claim_failed"
+    #: A plain start found the plain pool switched off.
     SIZE_ZERO = "size_zero"
+    #: A connector start found the connector pool switched off.
     CONNECTOR = "connector"
 
 

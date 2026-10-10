@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.db.models.project import Project
+from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
 from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.appdata import resolve_app_for_project
@@ -38,6 +39,7 @@ from src.services.build_sessions.manager import (
     SessionManager,
 )
 from src.services.build_sessions.shutdown import OwedTeardown, ShutdownReason
+from src.services.lake.env import connector_env_names, identity_resource_id_for_env
 from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_ID,
@@ -53,6 +55,7 @@ from src.services.redis.keys import (
 from src.services.sandbox import SandboxHandle, SandboxNotReadyError
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
+from tests.api.v1.connectors.conftest import KEY
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import (
     AttachesWhatTheRecordNames,
@@ -197,6 +200,39 @@ async def test_the_restored_container_is_tagged_as_a_shared_sandbox(
     await manager.launch_shared_preview(db_session, recipient, project, client)
 
     assert client.restored_as_kind == ["shared_sandbox"]
+
+
+async def test_a_shared_view_of_a_connector_project_is_never_handed_its_data(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    lake_configured: None,
+) -> None:
+    """★ The owner's grant is not the colleague's: the view is born without the coordinates, so
+    it gets no identity and never claims from the connector pool.
+
+    Mutation check: build the view's settings as its owner's and the coordinates reach it."""
+    _, project, _ = await _owner_with_saved_app(
+        db_session, fake_storage, email="owner-lake@example.com"
+    )
+    db_session.add(
+        ProjectConnector(
+            project_id=project.id,
+            connector_key=KEY,
+            enabled=True,
+            window_kind=ConnectorWindowKind.RELATIVE,
+            window_days=7,
+        )
+    )
+    await db_session.commit()
+    recipient = await UserFactory.create(db_session, email="recipient-lake@example.com")
+    client = FakeSandboxClient()
+
+    await SessionManager().launch_shared_preview(db_session, recipient, project, client)
+
+    assert client.restore_env is not None
+    assert set(connector_env_names(KEY)).isdisjoint(client.restore_env)
+    assert identity_resource_id_for_env(client.restore_env) is None
 
 
 async def test_launch_stamps_the_registry_with_the_shared_projects_identity(

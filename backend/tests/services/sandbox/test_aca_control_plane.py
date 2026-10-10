@@ -847,3 +847,36 @@ async def test_get_app_fqdn_maps_terminal(monkeypatch: pytest.MonkeyPatch) -> No
     with pytest.raises(AcaError) as ei:
         await cp.get_app_fqdn(name="sbx-x")
     assert not isinstance(ei.value, AcaTransientError)
+
+
+@pytest.mark.parametrize("absent", [ResourceNotFoundError("gone"), _http_error(404)])
+async def test_read_app_absent_returns_none(
+    monkeypatch: pytest.MonkeyPatch, absent: BaseException
+) -> None:
+    cp = _control_plane(monkeypatch, _raises("get", absent))
+    assert await cp.read_app(name="sbx-x", keys=("SUPERVISOR_TOKEN",)) is None
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ServiceRequestError("request blip"),
+        ServiceResponseError("response blip"),
+        _http_error(429),
+        _http_error(500),
+    ],
+)
+async def test_read_app_maps_transient(
+    monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> None:
+    # A claim asks a transient failure again, and keeps the container if it repeats.
+    cp = _control_plane(monkeypatch, _raises("get", exc))
+    with pytest.raises(AcaTransientError):
+        await cp.read_app(name="sbx-x", keys=("SUPERVISOR_TOKEN",))
+
+
+async def test_read_app_maps_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    cp = _control_plane(monkeypatch, _raises("get", _http_error(403)))
+    with pytest.raises(AcaError) as ei:
+        await cp.read_app(name="sbx-x", keys=("SUPERVISOR_TOKEN",))
+    assert not isinstance(ei.value, AcaTransientError)

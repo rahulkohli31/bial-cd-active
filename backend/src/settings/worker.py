@@ -19,6 +19,7 @@ from typing import Self
 from pydantic import PositiveInt, model_validator
 
 from src.services.deploy.config import DeployConfig
+from src.services.lake.config import LakeConfig
 from src.services.redis.config import RedisConfig
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage.config import StorageConfig
@@ -82,6 +83,12 @@ class WorkerSettings(CoreSettings):
     # block. Shape must match `ApiSettings.deploy` — pinned by a test, since the two are now
     # declared separately and could otherwise drift.
     deploy: DeployConfig | None = None
+
+    # The lake and the identity that reads it, the API's exact values, for the connector pool's
+    # containers. Without it each of those fills is refused with a warning, and a connector
+    # project's start creates its own container. Shape pinned to `ApiSettings.connector_lake` by
+    # the same test.
+    connector_lake: LakeConfig | None = None
 
     # ============================================================ KNOBS
     # Defaults that are correct answers rather than placeholders — each says what it means.

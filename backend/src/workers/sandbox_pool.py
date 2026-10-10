@@ -1,9 +1,10 @@
-"""The pool of ready sandboxes, held at its size every minute (`build_sessions/pool_pass.py`).
+"""The two pools of ready sandboxes, plain and connector, each held at its size every minute
+(`build_sessions/pool_pass.py`).
 
 Unlike the sweep it runs in every environment: it deletes only containers the pool's own ledger
-holds, never one a registry names. Each tick logs one line, at a size of zero too, so a silent
-minute means the pass is not running. Each pass takes an advisory lock, so the two schedulers of
-a deploy run one pass between them.
+holds, never one a registry names. Each tick logs one line per pool, at a size of zero too, so a
+silent minute means the pass is not running. Each pass takes an advisory lock, so the two
+schedulers of a deploy run one pass between them.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ SANDBOX_POOL_CRON: Final = "* * * * *"
     schedule=[{"cron": SANDBOX_POOL_CRON, "schedule_id": SANDBOX_POOL_SCHEDULE_ID}],
 )
 async def keep_the_pool_at_its_size() -> None:
-    """One pass over the pool, or one line saying why there was none."""
+    """One pass over both pools, or one line saying why there was none."""
     from src.services.build_sessions.pool_pass import run_pool_pass
 
     await run_pool_pass()

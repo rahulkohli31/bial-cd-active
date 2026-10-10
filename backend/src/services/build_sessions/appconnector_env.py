@@ -6,8 +6,8 @@ raising only when a *configured* substrate genuinely fails: the shape `appstorag
 
 THIS IS THE SECURITY BOUNDARY OF THE WHOLE DATA-PLANE PASS. Two conditions, both required: a
 lake is configured, and the connector is switched on for THIS project, which the project's owner
-owns. The answer decides both the coordinates and the managed identity — see
-`services/lake/env.py::identity_resource_id_for_env` for why those cannot be separated.
+owns. The answer decides both the coordinates and the managed identity a start's container gets —
+see `services/lake/env.py::identity_resource_id_for_env` for why a start cannot separate them.
 
 WHETHER A CONNECTOR READS IS READ OFF `resolve_window`, NEVER DECIDED AGAIN HERE. It is the same
 value the settings row shows the citizen, and a second place that decides it is a second place

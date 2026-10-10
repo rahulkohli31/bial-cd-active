@@ -36,6 +36,7 @@ from src.core.connectors import CONNECTORS, ConnectedSystem, ResolvedWindow
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.project_connector import ConnectorWindowKind
+from src.db.models.sandbox_start import SandboxProjectType
 from src.services.analysis import (
     AnalysisTimedOutError,
     AnalysisUnavailableError,
@@ -802,8 +803,20 @@ class DevServerDownUntilStarted(FakeSandboxClient):
         return DevStatus(running=up, ready=up, port=3000, root_status=200 if up else None)
 
 
+#: The identity of the lake the `lake_configured` fixture configures.
+LAKE_IDENTITY: Final = (
+    "/subscriptions/s/resourceGroups/rg/providers/Microsoft.ManagedIdentity"
+    "/userAssignedIdentities/the-lake-identity"
+)
+
+
 async def a_ready_pool_row(
-    name: str, *, fqdn: str, image_ref: str, since: datetime | None = None
+    name: str,
+    *,
+    fqdn: str,
+    image_ref: str,
+    project_type: SandboxProjectType = SandboxProjectType.PLAIN,
+    since: datetime | None = None,
 ) -> None:
     """A ready row in the pool's ledger, committed the way the ledger commits its own; a test
     that writes one takes `empty_sandbox_pool`."""
@@ -816,6 +829,7 @@ async def a_ready_pool_row(
                 name=name,
                 fqdn=fqdn,
                 image_ref=image_ref,
+                project_type=project_type,
                 state=SandboxPoolState.READY,
                 state_changed_at=since or datetime.now(UTC),
             )

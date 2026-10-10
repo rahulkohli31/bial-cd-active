@@ -29,6 +29,7 @@ import httpx
 import structlog
 from redis.exceptions import RedisError
 
+from src.core.alarms import SANDBOX_POOL_WRONG_IDENTITY_EVENT
 from src.core.redaction import scrub_untrusted
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
@@ -93,6 +94,7 @@ from src.services.sandbox.stopwatch import Miss, running_stopwatch
 from src.services.storage import get_storage, snapshot_key
 
 if TYPE_CHECKING:
+    from src.db.models.sandbox_start import SandboxProjectType
     from src.services.sandbox.pool import ClaimedMember
 
 _log = structlog.get_logger()
@@ -530,6 +532,13 @@ def _per_project_env_names() -> frozenset[str]:
     from src.services.lake.env import connector_env_names
 
     return _PER_PROJECT_ENV_NAMES.union(*(connector_env_names(key) for key in CONNECTORS))
+
+
+def _carries_exactly(identities: frozenset[str], expected: str | None) -> bool:
+    """Whether a claimed container carries `expected` and no other identity, or none at all when
+    `expected` is `None`. ARM need not hand a resource id back in the case it was sent in."""
+    wanted = frozenset() if expected is None else frozenset({expected.casefold()})
+    return frozenset(identity.casefold() for identity in identities) == wanted
 
 
 def _identity_tags(kind: SandboxKind, user_uuid: uuid.UUID, app_id: uuid.UUID) -> dict[str, str]:
@@ -1323,31 +1332,36 @@ class AcaSandboxClient(SandboxClient):
         *,
         app_id: uuid.UUID,
         kind: SandboxKind,
-        needs_identity: bool,
+        identity_resource_id: str | None,
         shared_project_id: uuid.UUID | None,
         shared_owner_id: uuid.UUID | None,
     ) -> SandboxHandle | None:
-        """Make a ready container from the pool this start's own, or answer `None` for the start
-        to create one; the start's stopwatch records which, and why not. A claimed container that
-        fails a step before its registry write is let go, or put back when the step learnt
-        nothing of it, and another tried, twice at most. Only the registry write fails the start,
-        as it would fail a create: a slot another start took meanwhile, or a registry that did
-        not answer."""
+        """Make a ready container from this start's pool its own, or answer `None` for the start
+        to create one; the start's stopwatch records which, and why not. The start's identity
+        picks the pool: the connector pool, whose containers carry it, or the plain one when
+        `None`. A claimed container that fails a step before its registry write is let go, or put
+        back when the step learnt nothing of it, and another tried, twice at most. Only the
+        registry write fails the start, as it would fail a create: a slot another start took
+        meanwhile, or a registry that did not answer."""
         # Deferred: the ledger reaches `src.db`, which reaches `src.config`.
         from src.db.base import DB_UNREACHABLE
+        from src.db.models.sandbox_start import SandboxProjectType
         from src.services.sandbox import pool
 
+        project_type = (
+            SandboxProjectType.PLAIN
+            if identity_resource_id is None
+            else SandboxProjectType.CONNECTOR
+        )
         stopwatch = running_stopwatch()
-        if self._config.pool_size_at(datetime.now(UTC)) == 0:
-            stopwatch.missed("size_zero", ready_count=0)
-            return None
-        if needs_identity:
-            # A ready container was made with no data identity, and Azure attaches one only when
-            # a container is created.
-            stopwatch.missed("connector", ready_count=None)
+        if self._config.pool_size_at(datetime.now(UTC), project_type=project_type) == 0:
+            if project_type is SandboxProjectType.CONNECTOR:
+                stopwatch.missed("connector", ready_count=None)
+            else:
+                stopwatch.missed("size_zero", ready_count=0)
             return None
         try:
-            ready = await pool.ready_count()
+            ready = await pool.ready_count(project_type=project_type)
         except DB_UNREACHABLE:
             _log.warning("sandbox_pool_ledger_unreachable", exc_info=True)
             stopwatch.missed("claim_failed", ready_count=None)
@@ -1358,7 +1372,7 @@ class AcaSandboxClient(SandboxClient):
         try:
             for _ in range(_CLAIMS_PER_START):
                 try:
-                    member = await pool.claim(self._config.image_ref)
+                    member = await pool.claim(self._config.image_ref, project_type=project_type)
                 except DB_UNREACHABLE:
                     _log.warning("sandbox_pool_ledger_unreachable", exc_info=True)
                     miss = "claim_failed"
@@ -1371,6 +1385,7 @@ class AcaSandboxClient(SandboxClient):
                         user_uuid,
                         app_env,
                         app_id=app_id,
+                        identity_resource_id=identity_resource_id,
                         shared_project_id=shared_project_id,
                         shared_owner_id=shared_owner_id,
                     )
@@ -1403,7 +1418,7 @@ class AcaSandboxClient(SandboxClient):
                 _log.info("sandbox_pool_member_claimed", app_name=member.name, ready_count=ready)
                 # Side by side: the replacement's row is what tells a pass meanwhile that the
                 # pool is being made whole, and the restamp spends seconds on ARM.
-                self._detach(self._refill())
+                self._detach(self._refill(project_type))
                 self._detach(self._restamp(member.name, _identity_tags(kind, user_uuid, app_id)))
                 return handle
         finally:
@@ -1419,16 +1434,26 @@ class AcaSandboxClient(SandboxClient):
         app_env: dict[str, str],
         *,
         app_id: uuid.UUID,
+        identity_resource_id: str | None,
         shared_project_id: uuid.UUID | None,
         shared_owner_id: uuid.UUID | None,
     ) -> SandboxHandle:
-        """Take over a container just claimed: read its bearer, check it answers, hand it its
-        project's settings, then write the registry record that makes it this person's
-        workspace. A step before the write raises `_ClaimFellThroughError` naming the miss; the
-        container is the caller's to let go."""
+        """Take over a container just claimed: read its bearer, check that Azure attached exactly
+        `identity_resource_id` to it and that it answers, hand it its project's settings, then
+        write the registry record that makes it this person's workspace. A step before the write
+        raises `_ClaimFellThroughError` naming the miss; the container is the caller's to let
+        go."""
         stopwatch = running_stopwatch()
         with stopwatch.lap("bearer_read"):
-            token, alias = await self._read_a_claimed_env(member.name)
+            token, alias, identities = await self._read_a_claimed_env(member.name)
+        if not _carries_exactly(identities, identity_resource_id):
+            _log.error(
+                SANDBOX_POOL_WRONG_IDENTITY_EVENT,
+                app_name=member.name,
+                expected=identity_resource_id,
+                carried=sorted(identities),
+            )
+            raise _ClaimFellThroughError("claim_failed")
         base_path = base_path_for(alias)
         handle = SandboxHandle(
             fqdn=member.fqdn,
@@ -1467,27 +1492,33 @@ class AcaSandboxClient(SandboxClient):
             raise
         return handle
 
-    async def _read_a_claimed_env(self, name: str) -> tuple[str, str]:
-        """A claimed container's supervisor bearer and alias, off its Azure environment. A
-        transient ARM error is asked again once, and a second keeps the container: nothing was
-        learnt of it. A container Azure does not have, one with no bearer, or one made before
-        aliases, which serves at its own name, falls through to be let go."""
+    async def _read_a_claimed_env(self, name: str) -> tuple[str, str, frozenset[str]]:
+        """A claimed container's supervisor bearer, its alias and the identities Azure attached
+        to it, in one read of its Azure app. A transient ARM error is asked again once, and a
+        second keeps the container: nothing was learnt of it. A container Azure does not have, one
+        with no bearer, or one made before aliases, which serves at its own name, falls through to
+        be let go."""
         transient: AcaTransientError | None = None
         for attempt in range(_BEARER_READS):
             if attempt:
                 await _asleep(_ACA_RETRY_START_SECONDS)
             try:
-                token = await self._aca.get_app_env_value(name=name, key=_SUPERVISOR_TOKEN_ENV)
-                base_path = await self._aca.get_app_env_value(name=name, key=_BASE_PATH_ENV)
+                facts = await self._aca.read_app(
+                    name=name, keys=(_SUPERVISOR_TOKEN_ENV, _BASE_PATH_ENV)
+                )
             except AcaTransientError as exc:
                 transient = exc
                 continue
             except AcaError as exc:
                 raise _ClaimFellThroughError("claim_failed") from exc
+            if facts is None:
+                raise _ClaimFellThroughError("claim_failed")
+            token = facts.env.get(_SUPERVISOR_TOKEN_ENV)
+            base_path = facts.env.get(_BASE_PATH_ENV)
             alias = (base_path or "").removeprefix("/a/")
             if token is None or base_path != base_path_for(alias) or not IS_ALIAS.fullmatch(alias):
                 raise _ClaimFellThroughError("claim_failed")
-            return token, alias
+            return token, alias, facts.identities
         raise _ClaimFellThroughError("claim_failed", keep=True) from transient
 
     async def _put_it_back(self, member: ClaimedMember) -> None:
@@ -1520,13 +1551,16 @@ class AcaSandboxClient(SandboxClient):
         except DB_UNREACHABLE:
             _log.warning("sandbox_pool_row_outlived_its_container", app_name=member.name)
 
-    async def _refill(self) -> None:
-        """Replace a claimed container, behind its start, while the pool is below its size. A
-        lost fill is made up by the worker's next pass."""
+    async def _refill(self, project_type: SandboxProjectType) -> None:
+        """Replace a claimed container of `project_type`, behind its start, while that pool is
+        below its size. A lost fill is made up by the worker's next pass."""
         from src.db.base import DB_UNREACHABLE
 
         try:
-            await self.fill_one(self._config.pool_size_at(datetime.now(UTC)))
+            await self.fill_one(
+                self._config.pool_size_at(datetime.now(UTC), project_type=project_type),
+                project_type=project_type,
+            )
         except DB_UNREACHABLE:
             _log.warning("sandbox_pool_refill_failed", exc_info=True)
 
@@ -1539,19 +1573,30 @@ class AcaSandboxClient(SandboxClient):
         except SandboxError:
             _log.warning("sandbox_pool_claim_restamp_failed", app_name=name, exc_info=True)
 
-    async def fill_one(self, target: int) -> FillOutcome:
-        """Make one ready container for the pool unless the filling and ready rows of the
-        configured image already number `target`. Its row is written before it waits for the
-        pool's bound, so every count of the pool sees it queued; its deadline restarts once the
-        bound is held, and a fill whose row a pass let go meanwhile makes nothing. The row is
-        marked ready at the address Azure answers with once its supervisor answers too. A create
-        Azure refuses, a container that never answers, or a fill cut short leaves no row, or a
-        retiring one while the container may still stand. A ledger failure raises."""
+    async def fill_one(self, target: int, *, project_type: SandboxProjectType) -> FillOutcome:
+        """Make one ready container for the `project_type` pool unless that pool's filling and
+        ready rows of the configured image already number `target`; a connector one carries the
+        lake's identity, and is refused unwritten while no lake is configured. Its row is written
+        before it waits for the pool's bound, so every count sees it queued; its deadline restarts
+        once the bound is held, and a fill whose row a pass let go meanwhile makes nothing. The row
+        is marked ready once Azure and then the supervisor answer. A refused create, a silent
+        container or a fill cut short leaves no row, or a retiring one while the container may
+        still stand. A ledger failure raises."""
         from src.db.models.sandbox_pool import SandboxPoolState
+        from src.db.models.sandbox_start import SandboxProjectType
+        from src.services.lake.env import lake_identity_resource_id
         from src.services.sandbox import pool
 
+        identity_resource_id: str | None = None
+        if project_type is SandboxProjectType.CONNECTOR:
+            identity_resource_id = lake_identity_resource_id()
+            if identity_resource_id is None:
+                _log.warning("sandbox_pool_connector_fill_without_a_lake")
+                return "refused"
         name = a_fresh_sandbox_name()
-        member_id = await pool.add_filling(name, self._config.image_ref, up_to=target)
+        member_id = await pool.add_filling(
+            name, self._config.image_ref, project_type=project_type, up_to=target
+        )
         if member_id is None:
             return "at_target"
         token = secrets.token_urlsafe(_SUPERVISOR_TOKEN_BYTES)
@@ -1566,9 +1611,10 @@ class AcaSandboxClient(SandboxClient):
                 if not await pool.restart_the_clock(member_id):
                     _log.warning("sandbox_pool_fill_outlived_its_row", app_name=name)
                     return "refused"
-                # No data identity: nothing project-specific reaches a container before its claim.
+                # No coordinates, with or without the identity: nothing project-specific reaches a
+                # container before its claim.
                 fqdn = await self._create_with_retry(
-                    name, env, pool_member_tags(), None, arm="pool_fill"
+                    name, env, pool_member_tags(), identity_resource_id, arm="pool_fill"
                 )
             answered = await self._first_answer(
                 SandboxHandle(fqdn=fqdn, token=token, app_name=name, preview_url="", ready=False)
@@ -1592,7 +1638,12 @@ class AcaSandboxClient(SandboxClient):
             # Never claimable, or a pass let its row go as overdue: nothing will take it.
             await self._let_the_fill_go(member_id, name)
             return "refused"
-        _log.info("sandbox_pool_member_filled", app_name=name, image_ref=self._config.image_ref)
+        _log.info(
+            "sandbox_pool_member_filled",
+            app_name=name,
+            image_ref=self._config.image_ref,
+            project_type=project_type,
+        )
         return "filled"
 
     async def _let_the_fill_go(self, member_id: uuid.UUID, name: str) -> None:
@@ -1687,7 +1738,7 @@ class AcaSandboxClient(SandboxClient):
         # answer; deriving it again would be a second place the platform decides who may read
         # BIAL's flight data. `None` means no identity block at all, so a container that was not
         # granted anything gets a spec byte-identical to the one this platform sent before
-        # connectors existed.
+        # connectors existed. The same answer picks the pool a claim may take from.
         #
         # Imported lazily for the same reason the three `src.config` imports in this module are:
         # this file is reached from `src/services/sandbox/__init__.py`, which `src/settings/api.py`
@@ -1700,7 +1751,7 @@ class AcaSandboxClient(SandboxClient):
             app_env,
             app_id=app_id,
             kind=kind,
-            needs_identity=identity_resource_id is not None,
+            identity_resource_id=identity_resource_id,
             shared_project_id=shared_project_id,
             shared_owner_id=shared_owner_id,
         )

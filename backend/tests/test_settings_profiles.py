@@ -340,17 +340,29 @@ def test_the_frontend_url_gate_rejects_the_dev_default_in_production() -> None:
     assert "FRONTEND_URL must be set to the portal's real https:// origin" in str(excinfo.value)
 
 
-def test_both_roles_agree_on_the_shape_of_deploy() -> None:
-    """`deploy` is the ONE field both manifests declare, so it is the one that can drift.
-
-    The mixin layer guaranteed this structurally by construction; with a manifest per role it is
-    two separate declarations, and a divergence (one gaining a default, a gate, or a different
-    type) would be silent. Everything else in the worker's manifest is worker-only and has no twin.
-    """
-    api_field = ApiSettings.model_fields["deploy"]
-    worker_field = WorkerSettings.model_fields["deploy"]
+@pytest.mark.parametrize("field", ["deploy", "connector_lake"])
+def test_both_roles_agree_on_the_shape_of_each_block_they_share(field: str) -> None:
+    """Each manifest declares these blocks separately, so a divergence (one gaining a default, a
+    gate, or a different type) would be silent."""
+    api_field = ApiSettings.model_fields[field]
+    worker_field = WorkerSettings.model_fields[field]
     assert api_field.annotation == worker_field.annotation
     assert api_field.is_required() == worker_field.is_required() is False
+
+
+def test_a_worker_with_a_connector_pool_size_and_no_lake_still_boots() -> None:
+    """The flight-data pool fails soft: its fills are refused, and every other job runs on."""
+    settings = _boot(WorkerSettings, {**_WORKER_ENV, "SANDBOX__POOL_CONNECTOR_DAY_SIZE": "2"})
+
+    assert settings.connector_lake is None
+    assert settings.sandbox.pool_connector_day_size == 2
+
+
+def test_a_worker_reads_the_lake_with_the_apis_variables() -> None:
+    settings = _boot(WorkerSettings, {**_WORKER_ENV, **_LAKE})
+
+    assert settings.connector_lake is not None
+    assert settings.connector_lake.identity_resource_id.endswith("/lake-reader")
 
 
 def test_the_api_still_requires_its_own_superadmin_allowlist() -> None:
