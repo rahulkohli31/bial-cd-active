@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.5] - 2026-10-10
+
+Building an app spends about a third fewer tokens for the same work, so a day's allowance goes
+further and builds finish sooner. Nothing is taken out of a chat's history. Most of the saving
+comes from the assistant thinking at a lower effort level while it builds. It is also asked to
+send steps that do not depend on each other in one reply, and to leave to the platform the checks
+the platform already runs. On the test account the same four builds cost 36% less (39% before
+correcting for one run that found the cache already warm) and finished in about two-thirds of the
+time.
+
+> **Before deploying:** roll out the new sandbox image before the new backend, and set
+> `SANDBOX__IMAGE_REF` to its tag in the backend and the worker, as on every sandbox deploy. The
+> backend tells a flight-data build to run an install command that only the new image carries. On
+> an old image, including a workspace started before the image changed, the build reads the older
+> reference file and writes the data module by hand, so it keeps none of the flight-data saving.
+
+### Changed
+
+- **Build chats think at medium effort, as Plan chats already do.** BIAL Chat stays at low.
+- **The assistant is asked to send steps that do not depend on each other in one reply,** in Plan,
+  Build and BIAL Chat. In Build, steps that change files or run commands now run one at a time, in
+  the order sent, so two edits to one file both land. Reads of attached files run one at a time in
+  every chat.
+- **A build leaves its checks to the platform.** The platform type-checks the app, reads its logs
+  and opens its home page after every turn that changes it. The build instructions now say so, and
+  tell the assistant not to fetch the app's own pages.
+- **Attaching or removing a file mid-chat no longer re-sends the whole chat at full price.** The
+  file tools and their rules are part of every chat from its first message, and the files attached
+  now are named in a hidden note. In the test, the message carrying the file cost 44% less in a
+  Plan chat and 63% less in BIAL Chat. In return, every BIAL Chat's first message costs a little
+  more, also where file analysis is switched off; later messages read the rules at the cached
+  price. A BIAL Chat with no file attached starts no analysis session.
+- **A flight-data build gets its data module from one command.** It installs the four packages at
+  tested versions and writes `lib/flight-data.ts`, which reads only the columns it needs, one block
+  of rows at a time. The assistant is given the module's functions and told not to open the file,
+  except to read one of them. If an app's packages need an npm flag, the
+  assistant installs the four itself and runs the command again.
+
+### Fixed
+
+- **A BIAL Chat holding a file gives a formula or a macro when asked.** Its rule against showing
+  code now covers only the Python it ran on a file.
+
 ## [1.9.4] - 2026-10-09
 
 A flight-data app opens with its data again while the pool of ready workspaces is on. A ready
