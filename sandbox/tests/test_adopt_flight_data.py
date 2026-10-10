@@ -206,10 +206,11 @@ def test_the_image_puts_it_where_the_backend_and_the_reference_say() -> None:
     assert f"node {destination}" in REFERENCE.read_text(encoding="utf-8")
 
 
-def test_every_name_the_schema_answer_gives_the_module_is_one_it_exports() -> None:
+def test_the_schema_answer_names_every_function_and_constant_the_module_exports() -> None:
     """The schema answer summarises the module instead of the agent opening it, so a rename in
-    the seed would leave the agent importing a name that is gone. Column names count as the
-    values of the exported column constants."""
+    the seed would leave the agent importing a name that is gone, and a new export would stay
+    unknown to an agent told the list is whole. Column names count as the values of the exported
+    column constants."""
     answer = CONNECTOR_TOOLS.read_text(encoding="utf-8")
     section = answer[
         answer.index("What the current version of the module exports") : answer.index(
@@ -220,17 +221,19 @@ def test_every_name_the_schema_answer_gives_the_module_is_one_it_exports() -> No
     module = (SEED / "flight-data.ts").read_text(encoding="utf-8")
     exported = set(re.findall(r"^export (?:async )?(?:function|const|type) (\w+)", module, re.M))
     column_values = set(re.findall(r"^export const \w+ = '(\w+)'", module, re.M))
+    values = set(re.findall(r"^export (?:async )?(?:function|const) (\w+)", module, re.M))
 
     assert len(claimed & exported) >= 15, claimed
     assert claimed <= exported | column_values, claimed - exported - column_values
+    assert values <= claimed, values - claimed
 
 
 def test_npm_is_stopped_before_the_platform_ends_the_command() -> None:
     """The platform's cut kills `node` alone, so an npm still running then would carry on with no
     parent; the script's own limit has to fall first."""
-    script_ms = int(re.search(r"timeout: ([\d_]+)", SCRIPT.read_text(encoding="utf-8"))[1])
-    match = re.search(
+    script = re.search(r"timeout: ([\d_]+)", SCRIPT.read_text(encoding="utf-8"))
+    platform = re.search(
         r"^RUN_COMMAND_SLOW_TIMEOUT_S = (\d+)", CONSTANTS.read_text(encoding="utf-8"), re.M
     )
-    assert match is not None
-    assert script_ms < int(match[1]) * 1000
+    assert script is not None and platform is not None
+    assert int(script[1]) < int(platform[1]) * 1000
