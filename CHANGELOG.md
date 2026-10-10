@@ -17,8 +17,9 @@ time.
 A flight-data app can open from a pool of ready workspaces of its own, made with the identity that
 reads BIAL's flight data, so it opens as quickly as any other app. The pool ships switched off. It
 fills only once its sizes are set and the worker may attach that identity; until then a flight-data
-app opens in a workspace made for it, as it does today. On the test account a flight-data app
-opened from the pool in 8 seconds and read its data.
+app opens in a workspace made for it, as it does today. The pool saves the wait for Azure to make
+the workspace; installing a larger app's libraries still takes as long as on the plain pool. On the
+test account a small flight-data app opened from the pool in 8 seconds and read its data.
 
 > **Before deploying:** roll out the new sandbox image before the new backend, and set
 > `SANDBOX__IMAGE_REF` to its tag in the backend and the worker, as on every sandbox deploy. The
