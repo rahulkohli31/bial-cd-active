@@ -230,8 +230,8 @@ the data identity (see "What has to exist before a production deployment"), and 
 the same
 `CONNECTOR_LAKE__*` settings as the control plane. Without either, nothing breaks for a person: each
 connector fill is refused with a warning, the worker raises that pool's below-size alarm, and a
-data-connector project's start creates its own sandbox as it always did. A grant takes effect at
-the next pass with no restart; the settings reach the worker when it next starts.
+data-connector project's start creates its own sandbox as it always did. A grant takes effect
+within minutes with no restart; the settings reach the worker when it next starts.
 
 **Switching the connector pool on**, once both processes run the release that brought it:
 

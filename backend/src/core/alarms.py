@@ -96,8 +96,8 @@ means the environment is full. When it cannot be fixed soon, set that pool's siz
 
 SANDBOX_POOL_WRONG_IDENTITY_EVENT: Final = "sandbox_pool_claim_wrong_identity"
 """A start claimed a ready sandbox that did not carry exactly the identity its pool requires: a
-plain one carrying any identity, or a connector one carrying none or another. The container was
-let go before the project's settings reached it, and the start created its own.
+plain one carrying any identity, or a connector one carrying none, another, or one more. The
+container was let go before the project's settings reached it, and the start created its own.
 
 A START NEVER FAILS BECAUSE OF THIS, but it is a security signal: a plain container carrying an
 identity could have handed a project data it was never granted.
@@ -105,7 +105,8 @@ identity could have handed a project data it was never granted.
 Fields: `app_name` (the container), `expected` (the resource id of the identity its pool requires,
 `None` for a plain one) and `carried` (the resource ids of the identities Azure had attached).
 
-WHAT TO DO: a connector container carrying another identity means the lake identity changed
-without the connector pool being drained, or the worker and the backend hold different lake
-settings. Make them equal, then drain that pool. A plain container carrying any identity was
-changed outside the platform: find out how before anything else."""
+WHAT TO DO: a connector container carrying none or another in place of `expected` means the lake
+identity changed without the connector pool being drained, or the worker and the backend hold
+different lake settings. Make them equal, then drain that pool. A container carrying an identity
+beside `expected`, or a plain one carrying any, was changed outside the platform: drain its pool
+and find out how before anything else."""

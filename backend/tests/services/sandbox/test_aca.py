@@ -830,6 +830,13 @@ async def test_one_read_answers_the_values_asked_for_and_the_identities_attached
     )
 
 
+def test_what_one_read_answers_never_prints_the_bearer() -> None:
+    facts = ContainerFacts(env={"SUPERVISOR_TOKEN": "a-bearer"}, identities=frozenset())
+
+    assert "a-bearer" not in repr(facts)
+    assert "a-bearer" not in str(facts)
+
+
 async def test_one_read_of_a_container_azure_does_not_have_answers_none() -> None:
     cp = _bare_control_plane()
 

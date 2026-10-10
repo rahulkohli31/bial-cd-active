@@ -182,11 +182,12 @@ The sandbox was deleted before the project's settings reached it, and the start 
 nobody lost anything. The event (`backend/src/core/alarms.py`) names the identity expected and the
 ones Azure had attached.
 
-- **A connector sandbox carrying another identity, or none.** The data identity changed without a
-  drain, or the worker and the backend hold different `CONNECTOR_LAKE__*` settings. Make them equal,
-  then follow "Changing the data identity" above.
-- **A plain sandbox carrying any identity.** Something outside the platform changed it. Drain the
-  plain pool and find out how before anything else.
+- **A connector sandbox carrying another identity in place of the data identity, or none.** The
+  data identity changed without a drain, or the worker and the backend hold different
+  `CONNECTOR_LAKE__*` settings. Make them equal, then follow "Changing the data identity" above.
+- **A connector sandbox carrying the data identity and one more, or a plain sandbox carrying any
+  identity.** Something outside the platform changed it. Drain that pool and find out how before
+  anything else.
 
 ### Deploying the release that introduced the pool
 

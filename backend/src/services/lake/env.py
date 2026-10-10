@@ -121,8 +121,8 @@ def identity_resource_id_for_env(app_env: dict[str, str]) -> str | None:
 
 def lake_identity_resource_id() -> str | None:
     """The ARM resource id of the configured lake's identity, or `None` with no lake: what a
-    container made ahead of time for the connector pool is created with. It is the only container
-    holding the identity without the coordinates, and only a connector project's start may claim
-    it."""
+    container made ahead of time for the connector pool is created with. A connector pool container
+    is the only kind that holds the identity without the coordinates, and only a connector
+    project's start may claim one."""
     lake = _configured_lake()
     return None if lake is None else lake.identity_resource_id
