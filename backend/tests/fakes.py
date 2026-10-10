@@ -803,7 +803,7 @@ class DevServerDownUntilStarted(FakeSandboxClient):
         return DevStatus(running=up, ready=up, port=3000, root_status=200 if up else None)
 
 
-#: The identity of the lake the `lake` fixture configures.
+#: The identity of the lake the `lake_configured` fixture configures.
 LAKE_IDENTITY: Final = (
     "/subscriptions/s/resourceGroups/rg/providers/Microsoft.ManagedIdentity"
     "/userAssignedIdentities/the-lake-identity"
@@ -815,7 +815,7 @@ async def a_ready_pool_row(
     *,
     fqdn: str,
     image_ref: str,
-    project_type: SandboxProjectType,
+    project_type: SandboxProjectType = SandboxProjectType.PLAIN,
     since: datetime | None = None,
 ) -> None:
     """A ready row in the pool's ledger, committed the way the ledger commits its own; a test

@@ -158,15 +158,13 @@ class SandboxConfig(BaseModel):
     def pool_size_at(self, instant: datetime, *, project_type: SandboxProjectType) -> int:
         """How many ready sandboxes the `project_type` pool should hold at `instant`, an aware
         datetime."""
-        # Here, not at module scope: the ORM reaches `src.config`, which imports this module. So
-        # nothing may call this while settings are being built.
-        from src.db.models.sandbox_start import SandboxProjectType
-
         local = instant.astimezone(INDIA)
         daytime = (
             local.weekday() in self.pool_day_days
             and self.pool_day_start <= local.time() < self.pool_day_end
         )
-        if project_type is SandboxProjectType.CONNECTOR:
+        # The enum's value, not its member: importing the ORM here would reach `src.config`, which
+        # imports this module.
+        if project_type == "connector":
             return self.pool_connector_day_size if daytime else self.pool_connector_night_size
         return self.pool_day_size if daytime else self.pool_night_size

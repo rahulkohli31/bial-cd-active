@@ -110,7 +110,7 @@ async def _keep_one_pool(
     this pass, and its alarm fires if it is left below its size."""
     config = client.config
     target = config.pool_size_at(at, project_type=project_type)
-    members = [m for m in await pool.the_ledger() if m.project_type is project_type]
+    members = await pool.the_ledger(project_type=project_type)
     overdue = [
         member
         for member in members

@@ -44,12 +44,17 @@ from src.workers.sandbox_pool import (
 )
 from tests.factories import UserFactory
 from tests.fakes import LAKE_IDENTITY, FakeSandboxClient
-from tests.services.sandbox.test_pool import IMAGE, OLD_IMAGE, PoolAca, Supervisors
+from tests.services.sandbox.test_pool import (
+    CONNECTOR,
+    IMAGE,
+    OLD_IMAGE,
+    PLAIN,
+    PoolAca,
+    Supervisors,
+)
 
 pytestmark = pytest.mark.usefixtures("empty_sandbox_pool")
 
-PLAIN = SandboxProjectType.PLAIN
-CONNECTOR = SandboxProjectType.CONNECTOR
 READY = SandboxPoolState.READY
 FILLING = SandboxPoolState.FILLING
 CLAIMED = SandboxPoolState.CLAIMED
@@ -403,13 +408,12 @@ async def test_a_claim_landing_between_the_passes_look_and_its_retire_keeps_its_
     since = datetime.now(UTC) - timedelta(hours=1)
     rows = [await _row(keeper, READY, since=since + timedelta(minutes=i)) for i in range(6)]
     real_reading = pool.the_ledger
-    readings = 0
 
-    async def a_start_claims_right_after_the_reading() -> list[SandboxPoolMember]:
-        nonlocal readings
-        reading = await real_reading()
-        readings += 1
-        if readings == 1:
+    async def a_start_claims_right_after_the_reading(
+        *, project_type: SandboxProjectType
+    ) -> list[SandboxPoolMember]:
+        reading = await real_reading(project_type=project_type)
+        if project_type is PLAIN:
             claimed = await pool.claim(IMAGE, project_type=PLAIN)
             assert claimed is not None and claimed.name == rows[0]
         return reading
@@ -464,7 +468,7 @@ async def test_the_alarm_never_fires_while_the_size_is_zero(keeper) -> None:
 # --- the two pools -----------------------------------------------------------------------------
 
 
-async def test_one_pass_fills_each_pool_to_its_own_size(keeper, lake) -> None:
+async def test_one_pass_fills_each_pool_to_its_own_size(keeper, lake_configured) -> None:
     """Only the flight-data pool's create carries the lake's identity, and each pool says what it
     did on its own line."""
     with capture_logs() as logged:
@@ -496,7 +500,7 @@ async def test_a_flight_data_pool_set_to_zero_retires_only_its_own_containers(ke
 @pytest.mark.parametrize("fails", [PLAIN, CONNECTOR])
 @pytest.mark.parametrize("how", ["refused", "overdue"])
 async def test_a_pool_that_cannot_fill_stops_only_its_own_fills_and_raises_only_its_own_alarm(
-    keeper, lake, fails: SandboxProjectType, how: str
+    keeper, lake_configured, fails: SandboxProjectType, how: str
 ) -> None:
     """★ The plain pool runs first, so plain failing is the case that proves the flight-data pool
     still fills.

@@ -298,13 +298,11 @@ class AcaControlPlane:
 
         `identity_resource_id` is `None` for every container that was NOT granted a connector's
         data: no lake configured, the connector switched off for this project, or its owner not
-        approved. A start derives it from the coordinates already in `env`
-        (`services/lake/env.py::identity_resource_id_for_env`), so a container with the
-        coordinates always has the credential. Only a container made ahead of time for the
-        connector pool is given the credential without them: it belongs to no project until a
-        connector project's start claims it and hands it the coordinates. Any other caller
-        passing a resource id while `env` carries no coordinates would hand a container a
-        credential to data its owner was never granted."""
+        approved. A start derives it from the coordinates in `env`
+        (`services/lake/env.py::identity_resource_id_for_env`), so it never holds the coordinates
+        without the credential. Only a connector pool container gets the credential without them,
+        until a connector project's start claims it; any other caller passing one would hand a
+        container a credential to data its owner was never granted."""
         c = self._config
         return aca_models.ContainerApp(
             location=c.region,
@@ -568,23 +566,8 @@ class AcaControlPlane:
         they are only conflated here because the SDK gives one shape for both.
 
         NEVER log the returned value — this is how the supervisor bearer is recovered."""
-
-        def _run() -> str | None:
-            app = self._client.container_apps.get(self._config.resource_group, name)
-            return _env_value_of(app, key)
-
-        try:
-            return await asyncio.to_thread(_run)
-        except ResourceNotFoundError:
-            return None
-        except (ServiceRequestError, ServiceResponseError) as exc:
-            raise AcaTransientError("ACA get request failed") from exc
-        except HttpResponseError as exc:
-            if exc.status_code == 404:
-                return None
-            if is_transient(exc):
-                raise AcaTransientError("ACA get was throttled or 5xx'd") from exc
-            raise AcaError("ACA get failed") from exc
+        facts = await self.read_app(name=name, keys=(key,))
+        return None if facts is None else facts.env.get(key)
 
     async def read_app(self, *, name: str, keys: Collection[str]) -> ContainerFacts | None:
         """`keys`' values off a live container app and the identities attached to it, in one

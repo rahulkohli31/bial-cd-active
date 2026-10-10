@@ -32,7 +32,7 @@ from src.api.v1.build_sessions.schemas import (
 from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
 from src.db.models.harness_counter import HarnessCount, HarnessCounter
-from src.db.models.sandbox_start import SandboxProjectType, SandboxStart
+from src.db.models.sandbox_start import SandboxStart
 from src.services.build_sessions.alarms import SERVING_PROOF_ABSENT_AT_TEARDOWN
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.locks import lock_is_held
@@ -391,12 +391,9 @@ class RecordingAca(AcaControlPlane):
     async def get_app_fqdn(self, *, name: str) -> str | None:
         return self.fqdns.get(name) if name in self.created else None
 
-    async def get_app_env_value(self, *, name: str, key: str) -> str | None:
+    async def read_app(self, *, name: str, keys: Collection[str]) -> ContainerFacts | None:
         # Answers from the env recorded at CREATE: a fake that answered `None` here would
         # quietly re-create the very data-loss path this lane exists to test.
-        return self.created.get(name, {}).get(key)
-
-    async def read_app(self, *, name: str, keys: Collection[str]) -> ContainerFacts | None:
         if name not in self.created:
             return None
         identity = self.identities.get(name)
@@ -674,9 +671,7 @@ async def test_a_container_from_the_pool_is_the_persons_one_workspace(
     )
     member = a_fresh_sandbox_name()
     fqdn = aca_wire.aca.made_for_the_pool(member)
-    await a_ready_pool_row(
-        member, fqdn=fqdn, image_ref="acr/img:latest", project_type=SandboxProjectType.PLAIN
-    )
+    await a_ready_pool_row(member, fqdn=fqdn, image_ref="acr/img:latest")
     user, project_a = await _user_project(db_session, "rl-pool@rvaiglobal.com")
     project_b = await ProjectFactory.create(db_session, user.id)
     app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)

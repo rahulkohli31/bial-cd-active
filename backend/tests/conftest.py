@@ -392,7 +392,7 @@ async def empty_sandbox_pool():
 
 
 @pytest.fixture
-def lake(monkeypatch: pytest.MonkeyPatch) -> None:
+def lake_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     """A lake configured, as production has one, whose identity is `LAKE_IDENTITY`."""
     from src.services.lake.config import LakeConfig
     from tests.fakes import LAKE_IDENTITY

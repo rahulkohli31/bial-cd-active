@@ -13,7 +13,6 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.project_share import ProjectShare
-from src.db.models.sandbox_start import SandboxProjectType
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.inventory import (
     OwnedApp,
@@ -145,12 +144,7 @@ async def test_backfill_does_not_count_a_ready_pool_container_as_unowned(
     """A pool container carries a kind and no owner until its claim, which is exactly the shape
     the unowned count escalates; one the ledger holds is the pool's, not an orphan's."""
     member, stranger = a_fresh_sandbox_name(), a_fresh_sandbox_name()
-    await a_ready_pool_row(
-        member,
-        fqdn=f"{member}.example",
-        image_ref="acr/img:v1",
-        project_type=SandboxProjectType.PLAIN,
-    )
+    await a_ready_pool_row(member, fqdn=f"{member}.example", image_ref="acr/img:v1")
     tagger = _Tagger([])
     tagger.fleet = [
         a_fleet_member(member, tags=pool_member_tags()),

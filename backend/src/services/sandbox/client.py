@@ -1332,22 +1332,27 @@ class AcaSandboxClient(SandboxClient):
         *,
         app_id: uuid.UUID,
         kind: SandboxKind,
-        project_type: SandboxProjectType,
         identity_resource_id: str | None,
         shared_project_id: uuid.UUID | None,
         shared_owner_id: uuid.UUID | None,
     ) -> SandboxHandle | None:
         """Make a ready container from this start's pool its own, or answer `None` for the start
-        to create one; the start's stopwatch records which, and why not. A container of that pool
-        carries `identity_resource_id`, `None` for plain. A claimed container that fails a step
-        before its registry write is let go, or put back when the step learnt nothing of it, and
-        another tried, twice at most. Only the registry write fails the start, as it would fail a
-        create: a slot another start took meanwhile, or a registry that did not answer."""
+        to create one; the start's stopwatch records which, and why not. The start's identity
+        picks the pool: the connector pool, whose containers carry it, or the plain one when
+        `None`. A claimed container that fails a step before its registry write is let go, or put
+        back when the step learnt nothing of it, and another tried, twice at most. Only the
+        registry write fails the start, as it would fail a create: a slot another start took
+        meanwhile, or a registry that did not answer."""
         # Deferred: the ledger reaches `src.db`, which reaches `src.config`.
         from src.db.base import DB_UNREACHABLE
         from src.db.models.sandbox_start import SandboxProjectType
         from src.services.sandbox import pool
 
+        project_type = (
+            SandboxProjectType.PLAIN
+            if identity_resource_id is None
+            else SandboxProjectType.CONNECTOR
+        )
         stopwatch = running_stopwatch()
         if self._config.pool_size_at(datetime.now(UTC), project_type=project_type) == 0:
             if project_type is SandboxProjectType.CONNECTOR:
@@ -1570,14 +1575,13 @@ class AcaSandboxClient(SandboxClient):
 
     async def fill_one(self, target: int, *, project_type: SandboxProjectType) -> FillOutcome:
         """Make one ready container for the `project_type` pool unless that pool's filling and
-        ready rows of the configured image already number `target`. A connector one is made with
-        the lake's identity, and refused before anything is written while no lake is configured.
-        Its row is written before it waits for the pool's bound, so every count of the pool sees
-        it queued; its deadline restarts once the bound is held, and a fill whose row a pass let
-        go meanwhile makes nothing. The row is marked ready at the address Azure answers with once
-        its supervisor answers too. A create Azure refuses, a container that never answers, or a
-        fill cut short leaves no row, or a retiring one while the container may still stand. A
-        ledger failure raises."""
+        ready rows of the configured image already number `target`; a connector one carries the
+        lake's identity, and is refused unwritten while no lake is configured. Its row is written
+        before it waits for the pool's bound, so every count sees it queued; its deadline restarts
+        once the bound is held, and a fill whose row a pass let go meanwhile makes nothing. The row
+        is marked ready once Azure and then the supervisor answer. A refused create, a silent
+        container or a fill cut short leaves no row, or a retiring one while the container may
+        still stand. A ledger failure raises."""
         from src.db.models.sandbox_pool import SandboxPoolState
         from src.db.models.sandbox_start import SandboxProjectType
         from src.services.lake.env import lake_identity_resource_id
@@ -1734,28 +1738,19 @@ class AcaSandboxClient(SandboxClient):
         # answer; deriving it again would be a second place the platform decides who may read
         # BIAL's flight data. `None` means no identity block at all, so a container that was not
         # granted anything gets a spec byte-identical to the one this platform sent before
-        # connectors existed. The same answer picks the pool a claim may take from. A shared view
-        # is plain whatever it carries: a colleague viewing an app never holds its owner's grant.
+        # connectors existed. The same answer picks the pool a claim may take from.
         #
         # Imported lazily for the same reason the three `src.config` imports in this module are:
         # this file is reached from `src/services/sandbox/__init__.py`, which `src/settings/api.py`
         # imports, and the connector registry reaches `src/db/models/`.
-        from src.db.models.sandbox_start import SandboxProjectType
         from src.services.lake.env import identity_resource_id_for_env
 
-        identity_resource_id = (
-            None if kind == "shared_sandbox" else identity_resource_id_for_env(app_env)
-        )
+        identity_resource_id = identity_resource_id_for_env(app_env)
         claimed = await self._claim_a_ready_one(
             user_uuid,
             app_env,
             app_id=app_id,
             kind=kind,
-            project_type=(
-                SandboxProjectType.PLAIN
-                if identity_resource_id is None
-                else SandboxProjectType.CONNECTOR
-            ),
             identity_resource_id=identity_resource_id,
             shared_project_id=shared_project_id,
             shared_owner_id=shared_owner_id,

@@ -488,52 +488,16 @@ async def test_a_size_of_zero_creates_without_asking_the_ledger(world) -> None:
     assert await _ledger() == {member: SandboxPoolState.READY}
 
 
-async def test_a_connector_start_creates_its_own_with_the_identity_and_claims_nothing(
-    world, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("plain_size", [5, 0], ids=["plain-pool-on", "both-pools-off"])
+async def test_with_its_own_pool_off_a_connector_start_creates_its_own_and_claims_nothing(
+    world, lake_configured, plain_size: int
 ) -> None:
-    """★ The flight-data pool is switched off, so a flight-data start creates its own container
-    with the identity, and never takes the plain one that is ready.
+    """★ The miss names the pool the start could have claimed from, the ledger is not asked, and
+    the plain container that is ready is never taken.
 
     Mutation check: claim from the plain pool here and the start takes the ready row, and its app
     is handed the lake's coordinates in a container that holds no identity."""
-    from src.config import settings as app_settings
-    from src.services.lake.config import LakeConfig
-
-    resource_id = "/subscriptions/s/resourcegroups/rg/providers/x/y/the-lake-identity"
-    monkeypatch.setattr(
-        app_settings,
-        "connector_lake",
-        LakeConfig(
-            url="https://alakeaccount.blob.core.windows.net/acontainer/AOS/reports/",
-            identity_client_id="52b74947-0621-46e2-a523-a6b466f47c33",
-            identity_resource_id=resource_id,
-        ),
-    )
-    member = await _ready(world)
-    url_name, _ = connector_env_names(next(iter(CONNECTORS)))
-    env = {**_app_env(uuid.uuid4()), url_name: "https://lake.example/data/"}
-
-    stopwatch = Stopwatch()
-    with timed_by(stopwatch):
-        handle = await world.client.provision_new(
-            str(uuid.uuid4()), a_fresh_sandbox_name(), app_env=env
-        )
-
-    assert (stopwatch.claimed, stopwatch.miss_reason, stopwatch.ready_count) == (
-        False,
-        "connector",
-        None,
-    )
-    assert world.aca.created == [handle.app_name]
-    assert world.aca.identities[handle.app_name] == resource_id
-    assert await _ledger() == {member: SandboxPoolState.READY}
-
-
-async def test_with_both_pools_off_a_flight_data_start_records_that_its_own_pool_is_off(
-    world, lake
-) -> None:
-    """The miss names the pool the start could have claimed from, and the ledger is not asked."""
-    world.client._config = _config(pool_night_size=0, pool_day_days=frozenset())
+    world.client._config = _config(pool_day_size=plain_size, pool_night_size=plain_size)
     member = await _ready(world)
 
     handle, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4(), flight_data=True)
@@ -543,6 +507,7 @@ async def test_with_both_pools_off_a_flight_data_start_records_that_its_own_pool
         "connector",
         None,
     )
+    assert world.aca.created == [handle.app_name]
     assert world.aca.identities[handle.app_name] == LAKE_IDENTITY
     assert await _ledger() == {member: SandboxPoolState.READY}
 
@@ -552,10 +517,10 @@ def _with_a_flight_data_pool(world: SimpleNamespace) -> None:
 
 
 async def test_a_flight_data_start_takes_a_container_that_already_carries_the_identity(
-    world, lake
+    world, lake_configured
 ) -> None:
-    """★ The open that #297 exists for: no create, the lake's coordinates delivered on the
-    claim, and one replacement of the same type, which stops at that pool's size."""
+    """★ The fast open for a connector project: no create, the lake's coordinates delivered on
+    the claim, and one replacement of the same type, which stops at that pool's size."""
     _with_a_flight_data_pool(world)
     member = await _ready(world, project_type=CONNECTOR, identity=LAKE_IDENTITY)
     plain = await _ready(world)
@@ -579,7 +544,9 @@ async def test_a_flight_data_start_takes_a_container_that_already_carries_the_id
     assert await _types() == {replacement: CONNECTOR, plain: PLAIN}
 
 
-async def test_a_flight_data_claims_replacement_is_sized_by_its_own_pool(world, lake) -> None:
+async def test_a_flight_data_claims_replacement_is_sized_by_its_own_pool(
+    world, lake_configured
+) -> None:
     """A flight-data pool of one with two ready: the one left is enough, however large the plain
     pool is.
 
@@ -609,7 +576,7 @@ async def _types() -> dict[str, SandboxProjectType]:
     ],
 )
 async def test_a_start_never_takes_a_container_of_the_other_type(
-    world, lake, flight_data: bool, ready_type: SandboxProjectType, identity: str | None
+    world, lake_configured, flight_data: bool, ready_type: SandboxProjectType, identity: str | None
 ) -> None:
     """Each start finds its own pool empty, creates its own of its own type, and leaves the other
     pool's container ready."""
@@ -637,7 +604,7 @@ async def test_a_start_never_takes_a_container_of_the_other_type(
 
 
 async def test_a_shared_view_of_a_flight_data_app_never_takes_a_flight_data_container(
-    world, lake, fake_storage: FakeStorage
+    world, lake_configured, fake_storage: FakeStorage
 ) -> None:
     """A colleague viewing an app is never handed its owner's grant, so the view is plain."""
     _with_a_flight_data_pool(world)
@@ -673,7 +640,7 @@ _OTHER_IDENTITY = LAKE_IDENTITY.replace("the-lake-identity", "another-identity")
 )
 async def test_a_claimed_container_carrying_the_wrong_identity_never_reaches_the_project(
     world,
-    lake,
+    lake_configured,
     flight_data: bool,
     ready_type: SandboxProjectType,
     carried: str | None,
@@ -702,7 +669,7 @@ async def test_a_claimed_container_carrying_the_wrong_identity_never_reaches_the
 
 
 async def test_an_identity_azure_hands_back_in_another_case_is_the_same_identity(
-    world, lake
+    world, lake_configured
 ) -> None:
     _with_a_flight_data_pool(world)
     member = await _ready(world, project_type=CONNECTOR, identity=LAKE_IDENTITY.lower())
@@ -1325,7 +1292,7 @@ async def test_a_fill_is_on_the_ledger_before_azure_is_asked(world) -> None:
     ("project_type", "identity"), [(PLAIN, None), (CONNECTOR, LAKE_IDENTITY)], ids=str
 )
 async def test_a_fill_makes_its_own_pools_type_with_that_pools_identity_and_no_coordinates(
-    world, lake, project_type: SandboxProjectType, identity: str | None
+    world, lake_configured, project_type: SandboxProjectType, identity: str | None
 ) -> None:
     """The row's type and the identity come from the one type the fill was asked for.
 
@@ -1365,11 +1332,10 @@ async def test_a_flight_data_fill_with_no_lake_is_refused_before_anything_is_wri
 
 
 async def test_a_flight_data_create_azure_refuses_is_asked_once_and_starts_create_their_own(
-    world, lake
+    world, lake_configured
 ) -> None:
     """Without the grant to assign the identity Azure refuses the create, which is final: the fill
-    leaves nothing behind, and a flight-data start creates its own container as it did before
-    this pool existed."""
+    leaves nothing behind, and a flight-data start creates its own container with the identity."""
     _with_a_flight_data_pool(world)
     world.aca.refuses_to_create = True
 

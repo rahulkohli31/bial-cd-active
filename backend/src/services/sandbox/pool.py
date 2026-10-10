@@ -195,9 +195,17 @@ async def forget(member_id: uuid.UUID) -> None:
         await db.commit()
 
 
-async def the_ledger() -> list[SandboxPoolMember]:
+async def the_ledger(*, project_type: SandboxProjectType) -> list[SandboxPoolMember]:
     async with db_base.async_session_factory() as db:
-        return list((await db.scalars(sa.select(SandboxPoolMember))).all())
+        return list(
+            (
+                await db.scalars(
+                    sa.select(SandboxPoolMember).where(
+                        SandboxPoolMember.project_type == project_type
+                    )
+                )
+            ).all()
+        )
 
 
 async def _move(
