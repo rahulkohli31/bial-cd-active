@@ -25,6 +25,10 @@ opened from the pool in 8 seconds and read its data.
 > backend tells a flight-data build to run an install command that only the new image carries. On
 > an old image, including a workspace started before the image changed, the build reads the older
 > reference file and writes the data module by hand, so it keeps none of the flight-data saving.
+>
+> Run the migrations before the new backend and worker start: this release adds one, and the
+> worker reads it every minute. Leave the `SANDBOX__POOL_CONNECTOR_*` sizes unset until both run
+> this release, since an older release refuses to start while they are set.
 
 ### Added
 
