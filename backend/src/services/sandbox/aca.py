@@ -17,7 +17,7 @@ import asyncio
 import datetime as dt
 import time
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Final
 
 from azure.core.exceptions import (
@@ -274,7 +274,7 @@ class ContainerFacts:
     variables asked for, and the user-assigned identities attached to it. NEVER log `env`: a
     claim reads the supervisor bearer through it."""
 
-    env: dict[str, str]
+    env: dict[str, str] = field(repr=False)
     identities: frozenset[str]
 
 

@@ -48,7 +48,9 @@ class SandboxStartMiss(enum.StrEnum):
     NO_READY = "no_ready"
     UNHEALTHY = "unhealthy"
     CLAIM_FAILED = "claim_failed"
+    #: A plain start found the plain pool switched off.
     SIZE_ZERO = "size_zero"
+    #: A connector start found the connector pool switched off.
     CONNECTOR = "connector"
 
 

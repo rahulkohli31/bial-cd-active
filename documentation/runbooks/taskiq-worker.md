@@ -155,8 +155,8 @@ and the same sandbox image reference the backend holds. For the connector pool a
 more things: the right to attach the data identity, granted on that one identity, and the same
 `CONNECTOR_LAKE__*` settings the backend holds. Without the right, each connector create is
 refused; without the settings, each connector fill is refused before Azure is asked, with the
-warning `sandbox_pool_connector_fill_without_a_lake`. Either way only that pool stays empty, and
-the next tick after the missing piece arrives fills it.
+warning `sandbox_pool_connector_fill_without_a_lake`. Either way only that pool stays empty. The
+next tick after the grant fills it; the settings take effect when the worker restarts.
 
 **How to tell it is alive.** Like the sweep, it leaves no durable record. Each tick logs one line
 per pool: its outcome — which pool, the target, how many were ready as it ended, and what it

@@ -23,7 +23,7 @@ SANDBOX_POOL_CRON: Final = "* * * * *"
     schedule=[{"cron": SANDBOX_POOL_CRON, "schedule_id": SANDBOX_POOL_SCHEDULE_ID}],
 )
 async def keep_the_pool_at_its_size() -> None:
-    """One pass over the pool, or one line saying why there was none."""
+    """One pass over both pools, or one line saying why there was none."""
     from src.services.build_sessions.pool_pass import run_pool_pass
 
     await run_pool_pass()

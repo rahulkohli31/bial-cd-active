@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import subprocess
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from pathlib import Path
 
 import pytest
@@ -37,30 +37,41 @@ async def test_a_claimed_pool_container_takes_its_settings_once_and_redacts_them
     from src.services.redis import client as redis_client
     from src.services.redis import registry_key
     from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
-    from src.services.sandbox.aca import AcaControlPlane
-    from src.services.sandbox.base import SandboxError, SandboxHandle, a_fresh_sandbox_name
+    from src.services.sandbox.aca import AcaControlPlane, ContainerFacts
+    from src.services.sandbox.base import (
+        SandboxError,
+        SandboxHandle,
+        a_fresh_sandbox_name,
+        base_path_for,
+        new_alias,
+    )
     from src.services.sandbox.client import AcaSandboxClient
     from src.services.sandbox.config import SandboxConfig
     from src.services.sandbox.pool import ClaimedMember
 
-    name = a_fresh_sandbox_name()
+    name, base_path = a_fresh_sandbox_name(), base_path_for(new_alias())
     sbx = sandbox_factory(
         {
             "BIAL_POOL_MEMBER": "1",
             "BIAL_PORTAL_ORIGIN": "https://portal.example",
-            "BIAL_BASE_PATH": f"/a/{name}",
+            "BIAL_BASE_PATH": base_path,
         }
     )
     assert sbx.health().json() == {"ok": True, "configured": False}
 
     class Azure(AcaControlPlane):
-        """Knows one container: the pool member, and the bearer in its environment."""
+        """Knows one container: the pool member, what its environment carries, and no identity."""
 
         def __init__(self) -> None:
             pass
 
-        async def get_app_env_value(self, *, name: str, key: str) -> str | None:
-            return sbx.token if (name, key) == (member.name, "SUPERVISOR_TOKEN") else None
+        async def read_app(self, *, name: str, keys: Collection[str]) -> ContainerFacts | None:
+            if name != member.name:
+                return None
+            env = {"SUPERVISOR_TOKEN": sbx.token, "BIAL_BASE_PATH": base_path}
+            return ContainerFacts(
+                env={key: env[key] for key in keys if key in env}, identities=frozenset()
+            )
 
         async def aclose(self) -> None:
             return None
@@ -97,7 +108,13 @@ async def test_a_claimed_pool_container_takes_its_settings_once_and_redacts_them
     }
     try:
         handle = await client._make_it_theirs(
-            member, user, env, app_id=app_id, shared_project_id=None, shared_owner_id=None
+            member,
+            user,
+            env,
+            app_id=app_id,
+            identity_resource_id=None,
+            shared_project_id=None,
+            shared_owner_id=None,
         )
 
         assert sbx.health().json() == {"ok": True, "configured": True}

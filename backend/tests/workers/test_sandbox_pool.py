@@ -524,6 +524,26 @@ async def test_a_pool_that_cannot_fill_stops_only_its_own_fills_and_raises_only_
     ]
 
 
+async def test_a_worker_without_the_lake_fills_the_plain_pool_and_refuses_only_the_other(
+    keeper,
+) -> None:
+    """The worker may run without the lake's settings: no flight-data create is asked of Azure and
+    no row of that type is written."""
+    with capture_logs() as logged:
+        passes = await _passes(keeper, _config(day=2, night=2, flight_data=2), at=MONDAY_MORNING)
+
+    assert {t: (p.filled, p.ready, p.refused) for t, p in passes.items()} == {
+        PLAIN: (2, 2, False),
+        CONNECTOR: (0, 0, True),
+    }
+    assert list(keeper.aca.identities.values()) == [None, None]
+    assert len(await _ledger()) == 2
+    assert len(_events(logged, "sandbox_pool_connector_fill_without_a_lake")) == 1
+    assert [alarm["project_type"] for alarm in _events(logged, SANDBOX_POOL_BELOW_SIZE_EVENT)] == [
+        CONNECTOR
+    ]
+
+
 # --- one pass at a time ----------------------------------------------------------------------
 
 

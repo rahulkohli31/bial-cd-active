@@ -87,6 +87,8 @@ class PoolAca(AcaControlPlane):
         self.envs: dict[str, dict[str, str]] = {}
         self.tags: dict[str, dict[str, str]] = {}
         self.identities: dict[str, str | None] = {}
+        # An identity attached beside the one a container was made with, by a write from outside.
+        self.also_attached: dict[str, str] = {}
         self.create_attempts: list[str] = []
         self.created: list[str] = []
         self.filled: list[str] = []
@@ -177,10 +179,10 @@ class PoolAca(AcaControlPlane):
             raise AcaError("ACA refused the read")
         if name not in self.envs:
             return None
-        identity = self.identities.get(name)
+        attached = (self.identities.get(name), self.also_attached.get(name))
         return ContainerFacts(
             env={key: self.envs[name][key] for key in keys if key in self.envs[name]},
-            identities=frozenset() if identity is None else frozenset({identity}),
+            identities=frozenset(identity for identity in attached if identity is not None),
         )
 
     async def get_app_fqdn(self, *, name: str) -> str | None:
@@ -488,6 +490,24 @@ async def test_a_size_of_zero_creates_without_asking_the_ledger(world) -> None:
     assert await _ledger() == {member: SandboxPoolState.READY}
 
 
+async def test_a_plain_start_is_sized_by_the_plain_pool_alone(world, lake_configured) -> None:
+    """With only the flight-data pool on, a plain start finds its own pool switched off."""
+    world.client._config = _config(
+        pool_day_size=0, pool_night_size=0, pool_connector_day_size=1, pool_connector_night_size=1
+    )
+    member = await _ready(world, project_type=CONNECTOR, identity=LAKE_IDENTITY)
+
+    handle, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4())
+
+    assert (stopwatch.claimed, stopwatch.miss_reason, stopwatch.ready_count) == (
+        False,
+        "size_zero",
+        0,
+    )
+    assert world.aca.identities[handle.app_name] is None
+    assert await _ledger() == {member: SandboxPoolState.READY}
+
+
 @pytest.mark.parametrize("plain_size", [5, 0], ids=["plain-pool-on", "both-pools-off"])
 async def test_with_its_own_pool_off_a_connector_start_creates_its_own_and_claims_nothing(
     world, lake_configured, plain_size: int
@@ -603,10 +623,10 @@ async def test_a_start_never_takes_a_container_of_the_other_type(
     assert await _ledger() == {other: SandboxPoolState.READY}
 
 
-async def test_a_shared_view_of_a_flight_data_app_never_takes_a_flight_data_container(
+async def test_a_shared_view_born_without_the_coordinates_never_takes_a_flight_data_container(
     world, lake_configured, fake_storage: FakeStorage
 ) -> None:
-    """A colleague viewing an app is never handed its owner's grant, so the view is plain."""
+    """A view is born without its owner's grant (`test_shared_preview.py`), so it starts plain."""
     _with_a_flight_data_pool(world)
     member = await _ready(world, project_type=CONNECTOR, identity=LAKE_IDENTITY)
     app_id = uuid.uuid4()
@@ -631,11 +651,14 @@ _OTHER_IDENTITY = LAKE_IDENTITY.replace("the-lake-identity", "another-identity")
 
 
 @pytest.mark.parametrize(
-    ("flight_data", "ready_type", "carried"),
+    ("flight_data", "ready_type", "carried", "beside"),
     [
-        pytest.param(False, PLAIN, LAKE_IDENTITY, id="plain-carrying-an-identity"),
-        pytest.param(True, CONNECTOR, None, id="flight-data-carrying-none"),
-        pytest.param(True, CONNECTOR, _OTHER_IDENTITY, id="flight-data-carrying-another"),
+        pytest.param(False, PLAIN, LAKE_IDENTITY, None, id="plain-carrying-an-identity"),
+        pytest.param(True, CONNECTOR, None, None, id="flight-data-carrying-none"),
+        pytest.param(True, CONNECTOR, _OTHER_IDENTITY, None, id="flight-data-carrying-another"),
+        pytest.param(
+            True, CONNECTOR, LAKE_IDENTITY, _OTHER_IDENTITY, id="flight-data-carrying-one-more"
+        ),
     ],
 )
 async def test_a_claimed_container_carrying_the_wrong_identity_never_reaches_the_project(
@@ -644,13 +667,17 @@ async def test_a_claimed_container_carrying_the_wrong_identity_never_reaches_the
     flight_data: bool,
     ready_type: SandboxProjectType,
     carried: str | None,
+    beside: str | None,
 ) -> None:
     """★ Checked against what Azure attached, not what the ledger says: the container is let go
     before it answers anything, the alarm fires, and the start creates its own of its own type.
 
-    Mutation check: skip the comparison and the project's settings reach the container."""
+    Mutation check: skip the comparison and the project's settings reach the container; ask only
+    whether the expected identity is among those attached and the one-more case reaches it."""
     _with_a_flight_data_pool(world)
     member = await _ready(world, project_type=ready_type, identity=carried)
+    if beside is not None:
+        world.aca.also_attached[member] = beside
 
     with capture_logs() as logged:
         handle, stopwatch = await _start(
@@ -665,7 +692,12 @@ async def test_a_claimed_container_carrying_the_wrong_identity_never_reaches_the
     assert world.aca.created == [handle.app_name]
     assert world.aca.identities[handle.app_name] == (LAKE_IDENTITY if flight_data else None)
     [alarm] = [e for e in logged if e["event"] == SANDBOX_POOL_WRONG_IDENTITY_EVENT]
-    assert (alarm["app_name"], alarm["carried"]) == (member, [carried] if carried else [])
+    assert alarm["log_level"] == "error"
+    assert (alarm["app_name"], alarm["expected"], alarm["carried"]) == (
+        member,
+        LAKE_IDENTITY if flight_data else None,
+        sorted(identity for identity in (carried, beside) if identity is not None),
+    )
 
 
 async def test_an_identity_azure_hands_back_in_another_case_is_the_same_identity(
@@ -1124,6 +1156,8 @@ async def test_a_plain_claim_never_takes_a_connector_container(world) -> None:
 
     assert await pool.claim(IMAGE, project_type=PLAIN) is None
     assert await _ledger() == {old: SandboxPoolState.READY, current: SandboxPoolState.READY}
+    claimed = await pool.claim(IMAGE, project_type=CONNECTOR)
+    assert claimed is not None and claimed.name == current
 
 
 async def test_a_connector_claim_takes_its_own_type_before_a_current_plain_one(world) -> None:

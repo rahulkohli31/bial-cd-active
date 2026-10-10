@@ -8,8 +8,7 @@ would be theatre, and it would hand every citizen's build on the platform a cred
 flight data. **A start that hands a container the coordinates hands it the identity**, and this
 module is where that is made structural rather than remembered: `identity_resource_id_for_env`
 derives the grant from the presence of the coordinates, so a start cannot attach one without the
-other. Only an unclaimed connector pool container holds the identity without the coordinates
-(`lake_identity_resource_id`), and only a connector project's start may claim one.
+other.
 
 THE NAMES ARE GENERATED FROM THE CONNECTOR'S KEY. `backend/src/` may not contain the connector's
 name (enforced by a word-boundary grep), so the container's URL variable is built here by
@@ -122,6 +121,8 @@ def identity_resource_id_for_env(app_env: dict[str, str]) -> str | None:
 
 def lake_identity_resource_id() -> str | None:
     """The ARM resource id of the configured lake's identity, or `None` with no lake: what a
-    container made ahead of time for the connector pool is created with."""
+    container made ahead of time for the connector pool is created with. It is the only container
+    holding the identity without the coordinates, and only a connector project's start may claim
+    it."""
     lake = _configured_lake()
     return None if lake is None else lake.identity_resource_id
