@@ -843,6 +843,17 @@ describe('attachment chips survive a reload', () => {
     ])
   })
 
+  it("keeps each file's size, which tells the composer how much room the chat has left", () => {
+    // Mutation receipt: drop the `size` spread from `fileParts` and the first part loses its size.
+    const [msg] = withAttachments([
+      { attachmentId: 'att-1', kind: 'document', name: 'roster.pdf', mediaType: 'application/pdf', size: 4096 },
+      { attachmentId: 'att-gone', kind: '', name: '', mediaType: '', size: 'not a number' },
+    ])
+
+    expect(msg.parts[0].size).toBe(4096)
+    expect(msg.parts[1]).not.toHaveProperty('size')
+  })
+
   it('puts the files BEFORE the prose, matching how the message was composed', () => {
     // `buildUserParts` pushes files then text, so a reloaded turn must too or the same message
     // renders in two different orders depending on whether the page has been refreshed.

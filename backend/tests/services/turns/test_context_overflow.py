@@ -47,11 +47,17 @@ from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.manager import SessionManager
 from src.services.sandbox.config import SandboxConfig
 from src.services.turns import engine as engine_module
-from src.services.turns.copy import CHAT_TOO_LONG_CODE, CHAT_TOO_LONG_TEXT
+from src.services.turns.copy import (
+    ATTACHMENT_TOO_LARGE_CODE,
+    ATTACHMENT_TOO_LARGE_TEXT,
+    CHAT_TOO_LONG_CODE,
+    CHAT_TOO_LONG_TEXT,
+)
 from src.services.turns.engine import (
     DOCUMENT_TOO_LONG_CODE,
     DOCUMENT_TOO_LONG_TEXT,
     TurnEngine,
+    _is_attachment_too_large,
     _is_context_overflow,
     _is_document_too_long,
     set_turn_engine_for_tests,
@@ -88,6 +94,33 @@ PDF_PAGES_BODY: dict[str, Any] = {
         ),
     },
     "request_id": "req_011Ceyz4nptDfF5aTYkZmURj",
+}
+
+# THE CHAT'S FILES REFUSED FOR THEIR SIZE, each copied from a live call to the deployment in use,
+# and a damaged picture, which is not a size refusal. The request-size one is Azure's gateway, in
+# its own shape.
+IMAGE_DIMENSIONS_BODY: dict[str, Any] = {
+    "type": "error",
+    "error": {
+        "type": "invalid_request_error",
+        "message": (
+            "messages.0.content.0.image.source.base64.data: "
+            "At least one of the image dimensions exceed max allowed size: 8000 pixels"
+        ),
+    },
+    "request_id": "req_011Cfri5AtkfibTKNwiQ5gPQ",
+}
+DAMAGED_IMAGE_BODY: dict[str, Any] = {
+    "type": "error",
+    "error": {"type": "invalid_request_error", "message": "Could not process image"},
+    "request_id": "req_011Cfri5DcTyG21ZfUng2c6r",
+}
+REQUEST_TOO_LARGE_BODY: dict[str, Any] = {
+    "error": {
+        "code": "content_length_limit",
+        "message": "Request content length exceeded 32 MB limit.",
+        "details": "Request content length exceeded 32 MB limit.",
+    }
 }
 
 # A 400 from the same provider, the same error type, about something else entirely. This is the
@@ -559,3 +592,69 @@ def test_the_two_document_refusals_never_both_match() -> None:
     for body in (OVERFLOW_BODY, PDF_PAGES_BODY):
         error = ModelHTTPError(status_code=400, model_name="o", body=body)
         assert not (_is_context_overflow(error) and _is_document_too_long(error))
+
+
+# --- pictures and PDFs the provider will not read --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [IMAGE_DIMENSIONS_BODY, REQUEST_TOO_LARGE_BODY],
+    ids=["over_8000_pixels", "over_32_mb"],
+)
+async def test_files_the_provider_will_not_read_end_in_a_sentence_that_leaves_the_chat(
+    _fresh_engine, db_session, session_factory, body
+) -> None:
+    """Every stored attachment is replayed on every later turn, so a chat holding one of these
+    refuses every message after it, plain text included. "The assistant hit a problem" invites a
+    Retry that cannot work; the sentence has to send the citizen to a new chat.
+
+    Mutation check: delete the `_is_attachment_too_large` arm and this goes red on the generic
+    sentence."""
+    conv_id, state = await _run_until_settled(
+        _fresh_engine,
+        db_session,
+        session_factory,
+        _refusing_model(ModelHTTPError(status_code=400, model_name="opus", body=body)),
+    )
+
+    assert state.status == "failed"
+    assert _last_error(state) == ATTACHMENT_TOO_LARGE_TEXT
+    assert _terminal(state).reason == ATTACHMENT_TOO_LARGE_CODE
+    said = _last_error(state) or ""
+    assert "new chat" in said
+    for leak in ("messages.0", "base64", "req_011", "8000", "32 MB"):
+        assert leak not in said, f"{leak!r} reached the citizen"
+    assert conv_id not in _mid_reply
+
+
+def test_only_the_file_refusals_match() -> None:
+    """THE STATUS IS NOT THE MATCH: an unsupported media type, a bad tool schema or a damaged
+    picture is a 400 too, and telling the citizen their files are too large for those is untrue.
+
+    Mutation check: widen `_is_attachment_too_large` to `exc.status_code == 400` and the
+    other-400 cases go red."""
+    for body in (IMAGE_DIMENSIONS_BODY, REQUEST_TOO_LARGE_BODY):
+        assert _is_attachment_too_large(ModelHTTPError(status_code=400, model_name="o", body=body))
+    for other in (OVERFLOW_BODY, PDF_PAGES_BODY, UNSUPPORTED_MEDIA_BODY, DAMAGED_IMAGE_BODY):
+        assert not _is_attachment_too_large(
+            ModelHTTPError(status_code=400, model_name="o", body=other)
+        )
+    assert not _is_attachment_too_large(ModelHTTPError(status_code=400, model_name="o", body=None))
+    assert not _is_attachment_too_large(
+        ModelHTTPError(status_code=500, model_name="o", body=IMAGE_DIMENSIONS_BODY)
+    )
+
+
+def test_the_file_refusal_never_matches_alongside_another_named_refusal() -> None:
+    """Each takes its own arm with its own remedy; an overlap would make the sentence depend on the
+    order the arms are written in."""
+    for body in (
+        OVERFLOW_BODY,
+        PDF_PAGES_BODY,
+        IMAGE_DIMENSIONS_BODY,
+        REQUEST_TOO_LARGE_BODY,
+    ):
+        error = ModelHTTPError(status_code=400, model_name="o", body=body)
+        named = [_is_context_overflow(error), _is_document_too_long(error)]
+        assert not (_is_attachment_too_large(error) and any(named))

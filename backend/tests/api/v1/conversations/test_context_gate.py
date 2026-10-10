@@ -273,7 +273,7 @@ async def test_the_refusal_names_the_way_out(client, db_session) -> None:
     message = (await _send(client, user, conversation.id)).json()["error"]["message"]
 
     assert "new chat" in message
-    assert "stays exactly as it is" in message
+    assert "nothing is lost" in message
     assert str(DEFAULT_CONTEXT_HARD) not in message  # never quotes the number
     assert "200,000" not in message
 
@@ -524,18 +524,6 @@ async def test_an_accepted_turn_still_resolves_a_pending_card(
 # only kind of bound that can act before the provider has seen anything. The upload route
 # refuses a document over 30 pages (`test_attachments.py`); the send route refuses a third
 # document on one message. What shows up HERE is what they do to a real send.
-
-
-@pytest.fixture
-def shared_storage(fake_storage, monkeypatch):
-    """ONE store for both consumers of it. The upload route takes its store by injected
-    dependency; the send route's rehydrator reaches the accessor-level `get_storage()`. The
-    directory fixture binds only the first, so a test that uploads and then SENDS the upload
-    needs the accessor bound to the same object or the send answers 503 and proves nothing."""
-    from src.services.storage import accessor
-
-    monkeypatch.setattr(accessor, "_backend_singleton", fake_storage)
-    return fake_storage
 
 
 async def _upload(

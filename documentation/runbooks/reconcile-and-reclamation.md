@@ -81,18 +81,21 @@ Never do this to a ready sandbox the pool holds; drain the pool instead (next se
 ## The pool of ready sandboxes
 
 The pool keeps sandboxes made ahead of time so a start can take one instead of waiting for Azure to
-create one. `architecture.md` explains why it is shaped as it is, and `taskiq-worker.md` section 5
-says what its per-minute pass does. None of the four levers above manages it: its controls are its
-size settings and the procedures below.
+create one. There are two pools: the plain one, and the connector pool, whose sandboxes are made
+with the data identity and claimed only by data-connector projects. `architecture.md` explains why
+it is shaped as it is, and `taskiq-worker.md` section 5 says what its per-minute pass does. None of
+the four levers above manages it: its controls are its size settings and the procedures below.
 
 ### Draining the pool
 
 Draining removes every ready sandbox and makes no more. A sandbox somebody is using is never
 touched. Do it when the alarm below cannot be fixed, when spend must stop at once, and before a
-forced rollback.
+forced rollback. To drain one pool only, set only that pool's sizes.
 
 1. Set every pool size, day and night, to zero — in the worker first, then in the backend — and
-   restart each so the change takes effect. The worker goes first because only its pass retires
+   restart each so the change takes effect. Set the connector sizes to zero; never remove them
+   from the backend except as the last step of the rollback below, because their presence is what
+   keeps an older backend from starting. The worker goes first because only its pass retires
    ready sandboxes; the backend runs no pass of its own. A backend that still holds a size
    meanwhile can claim what is still ready, and the worker retires the replacement each such claim
    makes.
@@ -100,11 +103,14 @@ forced rollback.
    sandbox after another, each delete waiting for Azure to confirm it, so a large pool takes a few
    minutes. A delete Azure refuses leaves its row retiring, and the next pass tries it again.
 3. Confirm that none remains. In the platform database the pool's ledger holds no row that is
-   filling, ready or retiring:
+   filling, ready or retiring, in the pool drained:
 
    ```sql
-   select state, count(*) from sandbox_pool group by state;
+   select project_type, state, count(*) from sandbox_pool group by project_type, state;
    ```
+
+   A start's own create and a refused delete always show as `plain`, whichever project they are
+   for.
 
    A claimed row for a start still in flight — a claim, or a start creating its own sandbox — may
    show while it runs, and resolves itself. A row that stays retiring means Azure keeps refusing
@@ -120,9 +126,18 @@ failed claim. At size zero the next pass clears the row.
 To fill the pool again, restore the sizes in both processes and restart them. The worker's passes
 fill it one sandbox at a time, which takes a few minutes for a handful.
 
+### Changing the data identity
+
+The connector pool's sandboxes carry the data identity they were made with. Before the lake's
+identity or settings change, drain the connector pool and confirm it with the query above, change
+the `CONNECTOR_LAKE__*` settings on both processes, then raise the connector sizes again. If the
+drain is missed, each stale sandbox is let go as it is claimed, with the wrong-identity alarm
+below, and those opens are slower until the pool refills.
+
 ### The below-size alarm
 
-It means a pass ended with fewer ready sandboxes than the size, and something stopped it filling:
+It names the pool. It means that pool's run of a pass ended with fewer ready sandboxes than its
+size, and something stopped it filling:
 Azure refused a create, a new sandbox never answered, or a row sat filling past its deadline. That
 pass made no further create; the next, a minute later, tries again. It does not mean a start
 failed. A start
@@ -134,6 +149,10 @@ if an operator-owned rule turns the log event into a notification.
 2. Match it to a cause:
    - **A refusal about authorization.** The worker's identity lacks the container-apps write or
      the environment-join action on the sandbox resource group. Grant them (`../deployment.md`).
+     When only the connector pool is refused, it is the right to attach the data identity: grant
+     it on that one identity, never its resource group.
+   - **A connector fill refused with `sandbox_pool_connector_fill_without_a_lake`.** The worker
+     has no `CONNECTOR_LAKE__*` settings. Give it the backend's values; the next pass fills.
    - **A row left filling past its deadline.** A process — the worker or the backend — stopped in
      the middle of a create, usually in a deploy or a restart; the pass that found it deleted the
      container, and the next one fills again. The alarm comes only when the row is found, a little
@@ -153,8 +172,22 @@ if an operator-owned rule turns the log event into a notification.
      addresses and cores on top of those in use, and an image swap briefly needs twice the pool.
      Lower the sizes, or raise the capacity first.
    - **A refusal that clears by itself.** Nothing to do; the next pass restores the count.
-3. If it cannot be fixed soon, drain the pool. That silences the alarm and stops the spend, and
+3. If it cannot be fixed soon, drain that pool. That silences the alarm and stops the spend, and
    starts carry on as before.
+
+### The wrong-identity alarm
+
+It means a start claimed a ready sandbox that did not carry exactly the identity its pool requires.
+The sandbox was deleted before the project's settings reached it, and the start created its own, so
+nobody lost anything. The event (`backend/src/core/alarms.py`) names the identity expected and the
+ones Azure had attached.
+
+- **A connector sandbox carrying another identity in place of the data identity, or none.** The
+  data identity changed without a drain, or the worker and the backend hold different
+  `CONNECTOR_LAKE__*` settings. Make them equal, then follow "Changing the data identity" above.
+- **A connector sandbox carrying the data identity and one more, or a plain sandbox carrying any
+  identity.** Something outside the platform changed it. Drain that pool and find out how before
+  anything else.
 
 ### Deploying the release that introduced the pool
 
@@ -191,6 +224,21 @@ If a rollback is forced:
    scheduled sweep retries each owed deletion every five minutes. An older release that retried one
    of these would write a shared view, or a discarded container's tree, over an app's saved copy.
 4. Only then start the older code.
+
+### Rolling back past the release that brought the connector pool
+
+An older release than that one would hand a ready sandbox carrying the data identity to any
+project. It cannot start while the backend holds either `SANDBOX__POOL_CONNECTOR_*` setting, and
+that refusal is deliberate: do not clear it by deleting the setting under pressure. Only the
+connector pool needs draining; the plain pool can stay on.
+
+1. Set both connector sizes to zero on the worker and the backend, and restart each.
+2. Wait until the ledger holds no connector row but retiring ones (the query under "Draining the
+   pool"). A claimed one clears within the row deadline; one whose claim found Azure throttling
+   goes back to ready, and the next pass retires it.
+3. Remove the connector settings and the worker's `CONNECTOR_LAKE__*`, the worker first and the
+   backend last.
+4. Start the older code. The ledger's extra column needs no downgrade for it to run.
 
 ### The orphan report leaves out what the platform still holds
 

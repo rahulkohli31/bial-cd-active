@@ -2,7 +2,7 @@
 
 WHY THIS FILE EXISTS
 Anthropic allows four cache breakpoints per request and answers a fifth with an HTTP 400. A
-request carrying the turn-scoped system message — a Plan or BIAL Chat turn's, never a Build
+request carrying the turn-scoped system message — a Plan turn's, never a Build or BIAL Chat
 turn's — spends them like this, and the arithmetic is the reason no second marker rides beside
 its pin:
 

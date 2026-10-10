@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import get_args
 
+import pytest
 import sqlalchemy as sa
 from pydantic_ai.messages import (
     BinaryContent,
@@ -36,6 +37,7 @@ from sqlalchemy import event
 
 from src.api.v1.build_sessions.schemas import ErrorSource
 from src.api.v1.conversations.schemas import DiagnosticFrame
+from src.core.prompt_blocks import FLIGHT_DATA_ADOPT_PATH
 from src.core.redaction import redact_secrets
 from src.db.models.attachment import Attachment
 from src.db.models.conversation import ChatKind
@@ -65,6 +67,7 @@ from src.services.messages.projection import (
     _friendly_area,
     _user_text_and_refs,
     classify_tool_call,
+    command_needs_the_long_timeout,
     command_only_inspects,
     label_when_settled,
     long_operation_line,
@@ -952,6 +955,23 @@ def test_classify_command_maps_the_pinned_commands() -> None:
     assert _classify_argv(["tsc", "--noEmit"])[0] == "Making sure everything fits together"
     assert _classify_argv(["npm", "run", "build"])[0] == "Making sure everything fits together"
     assert _classify_argv(["npm", "run", "lint"])[0] == "Tidying things up"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["node", FLIGHT_DATA_ADOPT_PATH],
+        [FLIGHT_DATA_ADOPT_PATH],
+        ["bash", "-lc", f"cd /workspace/app && node {FLIGHT_DATA_ADOPT_PATH}"],
+    ],
+    ids=["node", "direct", "shell"],
+)
+def test_the_flight_data_install_command_is_an_install(argv: list[str]) -> None:
+    """It runs `npm install` itself and stops npm inside the long bound, so every way of running
+    it takes that bound; any other `node` script keeps the short one."""
+    assert _classify_argv(argv) == ("Setting up the tools your app needs", False)
+    assert command_needs_the_long_timeout(argv) is True
+    assert command_needs_the_long_timeout(["node", "scripts/seed.mjs"]) is False
 
 
 def test_classify_command_shows_reads_and_hides_only_housekeeping() -> None:
@@ -2444,13 +2464,15 @@ async def test_a_turn_with_nothing_left_after_the_dedupe_is_not_drawn(db_session
 # --- the enrichment entry point -----------------------------------------------------------
 
 
-async def _stored_attachment(db_session, user_id, attachment_id: str, name: str, media_type: str):
+async def _stored_attachment(
+    db_session, user_id, attachment_id: str, name: str, media_type: str, size: int = 1
+):
     row = Attachment(
         user_id=user_id,
         attachment_id=attachment_id,
         media_type=media_type,
         name=name,
-        size=1,
+        size=size,
         storage_key=f"att/{user_id}/{attachment_id}",
     )
     db_session.add(row)
@@ -2459,10 +2481,13 @@ async def _stored_attachment(db_session, user_id, attachment_id: str, name: str,
 
 
 async def test_a_chip_is_filled_in_from_the_attachment_row(db_session) -> None:
-    """`project_rows` is pure and carries only the id; the name and media type live in the
-    attachments table. This is the seam that joins them, and it is what every route calls."""
+    """`project_rows` is pure and carries only the id; the name, media type and size live in the
+    attachments table. This is the seam that joins them, and it is what every route calls. The
+    size is what lets a reopened chat's composer know how much of its file room is already used."""
     user, _, conversation = await _thread(db_session)
-    await _stored_attachment(db_session, user.id, "att_sheet", "movements.xlsx", EXCEL_MEDIA_TYPE)
+    await _stored_attachment(
+        db_session, user.id, "att_sheet", "movements.xlsx", EXCEL_MEDIA_TYPE, size=4096
+    )
     await _code_lane_turn(db_session, user, conversation, "what is in this?", ["att_sheet"])
 
     rows = await _rows(db_session, user, conversation)
@@ -2473,7 +2498,7 @@ async def test_a_chip_is_filled_in_from_the_attachment_row(db_session) -> None:
     ]
 
     chip = items[0].attachments[0]
-    assert (chip.name, chip.media_type) == ("movements.xlsx", EXCEL_MEDIA_TYPE)
+    assert (chip.name, chip.media_type, chip.size) == ("movements.xlsx", EXCEL_MEDIA_TYPE, 4096)
     assert chip.kind == chip_kind_for(EXCEL_MEDIA_TYPE)
 
 
@@ -2507,6 +2532,7 @@ async def test_a_transcript_naming_another_citizens_attachment_learns_nothing_ab
     assert chip.attachment_id == "att_theirs"  # the reference survives — it is in their payload
     assert chip.name == ""
     assert chip.media_type == ""
+    assert chip.size == 0
 
 
 async def test_a_reference_whose_row_is_gone_reads_as_unavailable_rather_than_failing(

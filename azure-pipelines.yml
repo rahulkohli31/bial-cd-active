@@ -1,0 +1,295 @@
+# Production release from `main`. Each run builds the images, waits for approval on the
+# `citizen-prod` environment, then migrates the database and moves the portal, the control plane
+# and the worker onto the new images, proving each one started before moving to the next.
+#
+# Set up once in Azure DevOps:
+# - agent pool `citizen-developer`, with an agent on the Windows build VM. The database and the
+#   portal's private address are reachable only from inside BIAL's network.
+# - Azure Resource Manager service connection `citizen-prod-azure`, allowed to build and import
+#   images in the registry, read, change settings on and restart both web apps, and update the
+#   worker container app in its Container Apps environment.
+# - environment `citizen-prod` with an approval check. Create it before the first run: a run that
+#   finds no environment creates one with no check.
+#
+# Not for a release that needs the control plane stopped, or a migration applied only after the
+# new image serves. Its CHANGELOG note says so, and it is deployed by hand.
+
+trigger:
+  batch: true
+  branches:
+    include:
+      - main
+
+pr: none
+
+pool: citizen-developer
+
+variables:
+  serviceConnection: citizen-prod-azure
+  resourceGroup: BIAL-GENAI-APP-RG
+  registry: bialgenaicr
+  backendApp: bial-citizen-developer-backend-prod-app-01
+  portalApp: bial-citizen-developer-frontend-prod-app-01
+  workerApp: bial-citizen-worker-prod-app-01
+  backendRepository: vibe-coding-backend-prod
+  portalRepository: vibe-coding-frontend-prod
+  sandboxRepository: citizen-prod-sandbox
+  portalHost: blrcitizen.bialairport.com
+  portalAddress: 10.80.12.108
+  uvVersion: 0.12.24
+  uvSha256: 7c38608c8a18ee137d748a1773053b07ec8f3a30fab49aebaa6f4e4efeceb019
+
+stages:
+  - stage: Build
+    displayName: Build the images
+    # A manual run on any other branch builds and deploys nothing.
+    condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+    jobs:
+      - job: Build
+        timeoutInMinutes: 90
+        steps:
+          - checkout: self
+            clean: true
+            fetchDepth: 1
+
+          - task: AzureCLI@3
+            displayName: Build the portal, control plane and sandbox images
+            inputs:
+              workingDirectory: $(Build.SourcesDirectory)
+              azureSubscription: ${{ variables.serviceConnection }}
+              scriptType: ps
+              scriptLocation: inlineScript
+              powerShellErrorActionPreference: continue
+              powerShellIgnoreLASTEXITCODE: true
+              inlineScript: |
+                # Every tag here is new, and none is one production runs or a webhook watches, so
+                # nothing built here reaches production before the approval.
+                # `--no-logs`: az still waits for the build and fails with it, but streaming the
+                # build's log through a pipe on Windows dies on its first non-ANSI character.
+                Write-Host '##[section]Portal'
+                Set-Location portal
+                az acr build --registry $(registry) --no-logs --image "$(portalRepository):$(Build.SourceVersion)" .
+                if ($LASTEXITCODE -ne 0) { throw "The portal image did not build. Its log is under the registry's task runs." }
+
+                Write-Host '##[section]Control plane'
+                Set-Location ../backend
+                az acr build --registry $(registry) --no-logs --image "$(backendRepository):$(Build.SourceVersion)" .
+                if ($LASTEXITCODE -ne 0) { throw "The control plane image did not build. Its log is under the registry's task runs." }
+
+                # The sandbox image is tagged with the git hash of `sandbox/`, so it is built only
+                # when that folder changes, and a tag production runs is never built over.
+                Write-Host '##[section]Sandbox'
+                Set-Location ../sandbox
+                $sandboxTag = 'tree-' + (git rev-parse HEAD:sandbox).Trim()
+                $built = az acr repository show-tags -n $(registry) --repository $(sandboxRepository) --query "contains(@, '$sandboxTag')" -o tsv
+                if ($LASTEXITCODE -ne 0) { throw 'Could not read the sandbox image tags, so nothing was built.' }
+                if ($built -eq 'true') {
+                  Write-Host "Unchanged: $(sandboxRepository):$sandboxTag is already built."
+                } else {
+                  az acr build --registry $(registry) --no-logs --file Dockerfile.sandbox --image "$(sandboxRepository):$sandboxTag" .
+                  if ($LASTEXITCODE -ne 0) { throw "The sandbox image did not build. Its log is under the registry's task runs." }
+                }
+
+  - stage: Deploy
+    displayName: Deploy to production
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: Deploy
+        environment: citizen-prod
+        timeoutInMinutes: 60
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: none
+                - checkout: self
+                  clean: true
+                  fetchDepth: 1
+
+                - task: AzureCLI@3
+                  displayName: Read what is live and print the rollback
+                  inputs:
+                    workingDirectory: $(Build.SourcesDirectory)
+                    azureSubscription: ${{ variables.serviceConnection }}
+                    scriptType: ps
+                    scriptLocation: inlineScript
+                    powerShellErrorActionPreference: continue
+                    powerShellIgnoreLASTEXITCODE: true
+                    inlineScript: |
+                      az extension add --name containerapp --upgrade --only-show-errors
+                      $login = '$(registry).azurecr.io'
+                      function Get-Digest([string]$Repository, [string]$Tag) {
+                        $digest = az acr repository show -n $(registry) --image "${Repository}:$Tag" --query digest -o tsv 2>$null
+                        if ($LASTEXITCODE -eq 0) { return "$digest".Trim() }
+                      }
+
+                      $backend = Get-Digest '$(backendRepository)' '$(Build.SourceVersion)'
+                      $portal = Get-Digest '$(portalRepository)' '$(Build.SourceVersion)'
+                      $sandboxTag = 'tree-' + (git rev-parse HEAD:sandbox).Trim()
+                      if (-not $backend -or -not $portal -or -not (Get-Digest '$(sandboxRepository)' $sandboxTag)) {
+                        throw 'The images for this commit are missing: the build stage did not finish.'
+                      }
+                      $sandboxRef = "$login/$(sandboxRepository):$sandboxTag"
+
+                      $liveBackend = Get-Digest '$(backendRepository)' 'latest'
+                      $livePortal = Get-Digest '$(portalRepository)' 'latest'
+                      $liveWorker = az containerapp show -n $(workerApp) -g $(resourceGroup) --query 'properties.template.containers[0].image' -o tsv
+                      $liveRef = az webapp config appsettings list -g $(resourceGroup) -n $(backendApp) --query "[?name=='SANDBOX__IMAGE_REF'].value" -o tsv
+                      $liveRef = "$liveRef".Trim()
+                      $sandboxChanges = [string]($liveRef -ne $sandboxRef)
+
+                      Write-Host "Portal         $livePortal -> $portal"
+                      Write-Host "Control plane  $liveBackend -> $backend"
+                      Write-Host "Worker         $liveWorker -> $login/$(backendRepository)@$backend"
+                      Write-Host "Sandbox image  $liveRef -> $sandboxRef (changes: $sandboxChanges)"
+                      Write-Host ''
+                      Write-Host 'Rollback, if a later step fails (control plane and worker first, then the portal).'
+                      Write-Host 'These are the values before this attempt: after a failed attempt, use that attempt''s lines.'
+                      Write-Host "  az acr import -n $(registry) --source $login/$(backendRepository)@$liveBackend -t $(backendRepository):latest --force"
+                      Write-Host "  az webapp config appsettings set -g $(resourceGroup) -n $(backendApp) --settings SANDBOX__IMAGE_REF=$liveRef --output none"
+                      Write-Host "  az containerapp update -n $(workerApp) -g $(resourceGroup) --image $liveWorker --set-env-vars SANDBOX__IMAGE_REF=$liveRef --output none"
+                      Write-Host "  az acr import -n $(registry) --source $login/$(portalRepository)@$livePortal -t $(portalRepository):latest --force"
+                      Write-Host "  az webapp restart -g $(resourceGroup) -n $(portalApp)"
+
+                      Write-Host "##vso[task.setvariable variable=backendDigest]$backend"
+                      Write-Host "##vso[task.setvariable variable=portalDigest]$portal"
+                      Write-Host "##vso[task.setvariable variable=sandboxRef]$sandboxRef"
+                      Write-Host "##vso[task.setvariable variable=sandboxChanges]$sandboxChanges"
+
+                - powershell: |
+                    $dir = Join-Path '$(Agent.ToolsDirectory)' 'uv\$(uvVersion)'
+                    if (-not (Test-Path (Join-Path $dir 'uv.exe'))) {
+                      New-Item -ItemType Directory -Path $dir -Force | Out-Null
+                      $zip = Join-Path $dir 'uv.zip'
+                      $ProgressPreference = 'SilentlyContinue'
+                      Invoke-WebRequest -UseBasicParsing -OutFile $zip -Uri 'https://github.com/astral-sh/uv/releases/download/$(uvVersion)/uv-x86_64-pc-windows-msvc.zip'
+                      if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne '$(uvSha256)') {
+                        Remove-Item $zip
+                        throw 'The uv download does not match its pinned checksum.'
+                      }
+                      Expand-Archive $zip -DestinationPath $dir -Force
+                      Remove-Item $zip
+                    }
+                    Write-Host "##vso[task.prependpath]$dir"
+                  displayName: Install uv
+
+                - task: AzureCLI@3
+                  displayName: Migrate the database
+                  inputs:
+                    workingDirectory: $(Build.SourcesDirectory)
+                    azureSubscription: ${{ variables.serviceConnection }}
+                    scriptType: ps
+                    scriptLocation: inlineScript
+                    powerShellErrorActionPreference: continue
+                    powerShellIgnoreLASTEXITCODE: true
+                    inlineScript: |
+                      # Alembic loads the control plane's full settings, so it runs with the live ones.
+                      # Values of 8 characters or more are masked for the rest of this job.
+                      $json = az webapp config appsettings list -g $(resourceGroup) -n $(backendApp) -o json
+                      if ($LASTEXITCODE -ne 0) { throw 'Could not read the control plane settings.' }
+                      foreach ($setting in (($json -join "`n") | ConvertFrom-Json)) {
+                        $value = [string]$setting.value
+                        if ($value.Length -ge 8) { Write-Host ('##vso[task.setsecret]' + $value.Replace('%', '%AZP25')) }
+                        [Environment]::SetEnvironmentVariable($setting.name, $value)
+                      }
+
+                      Set-Location backend
+                      $output = uv run --frozen --no-dev alembic upgrade head 2>&1 | ForEach-Object { "$_" }
+                      $failed = $LASTEXITCODE -ne 0
+                      # A settings error quotes cut-down pieces of the values it was given, which no
+                      # mask matches, so those quotes are removed before anything is printed.
+                      $output -replace 'input_value=.*?, input_type=', 'input_value=(hidden), input_type=' | Write-Host
+                      if ($failed) { throw 'The migration failed. Nothing else has changed.' }
+                      uv run --frozen --no-dev alembic current
+
+                - task: AzureCLI@3
+                  displayName: Move the portal to the new image
+                  inputs:
+                    azureSubscription: ${{ variables.serviceConnection }}
+                    scriptType: ps
+                    scriptLocation: inlineScript
+                    powerShellErrorActionPreference: continue
+                    powerShellIgnoreLASTEXITCODE: true
+                    inlineScript: |
+                      az acr import -n $(registry) --source "$(registry).azurecr.io/$(portalRepository)@$(portalDigest)" -t "$(portalRepository):latest" --force
+                      if ($LASTEXITCODE -ne 0) { throw 'Could not move the portal to the new image. Nothing else has changed.' }
+                      $started = [DateTime]::UtcNow.ToString('s')
+                      az webapp restart -g $(resourceGroup) -n $(portalApp)
+
+                      # A health check cannot tell which image serves. App Service's own record of a
+                      # start after the move can, and every start after it pulls the new image.
+                      $site = az webapp show -g $(resourceGroup) -n $(portalApp) --query id -o tsv
+                      $log = Join-Path '$(Agent.TempDirectory)' 'portal-starts.log'
+                      $deadline = (Get-Date).AddMinutes(10)
+                      do {
+                        Start-Sleep -Seconds 15
+                        az rest --method post --url "https://management.azure.com$site/containerlogs?api-version=2023-12-01" --output-file $log 2>$null
+                        $start = Select-String -Path $log -Pattern '^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\S* Site started\.' -ErrorAction SilentlyContinue | Select-Object -Last 1
+                        $up = $start -and $start.Matches[0].Groups[1].Value -gt $started -and (curl.exe -s -o NUL -w '%{http_code}' --max-time 15 --resolve '$(portalHost):443:$(portalAddress)' 'https://$(portalHost)/') -eq '200'
+                      } until ($up -or (Get-Date) -gt $deadline)
+                      if (-not $up) { throw 'The new portal did not start within 10 minutes. Run the portal rollback lines.' }
+                      Write-Host 'The new portal is serving.'
+
+                - task: AzureCLI@3
+                  displayName: Move the control plane to the new image
+                  inputs:
+                    azureSubscription: ${{ variables.serviceConnection }}
+                    scriptType: ps
+                    scriptLocation: inlineScript
+                    powerShellErrorActionPreference: continue
+                    powerShellIgnoreLASTEXITCODE: true
+                    inlineScript: |
+                      az acr import -n $(registry) --source "$(registry).azurecr.io/$(backendRepository)@$(backendDigest)" -t "$(backendRepository):latest" --force
+                      if ($LASTEXITCODE -ne 0) { throw 'Could not move the control plane to the new image. The new portal works against the old control plane.' }
+                      $started = [DateTime]::UtcNow.ToString('s')
+                      if ('$(sandboxChanges)' -eq 'True') {
+                        # Writing the setting restarts the app onto the new image. `--output none`
+                        # because `appsettings set` prints every setting, secrets included.
+                        az webapp config appsettings set -g $(resourceGroup) -n $(backendApp) --settings 'SANDBOX__IMAGE_REF=$(sandboxRef)' --output none
+                      } else {
+                        az webapp restart -g $(resourceGroup) -n $(backendApp)
+                      }
+                      if ($LASTEXITCODE -ne 0) { throw 'Could not restart the control plane. Run the rollback lines.' }
+
+                      $site = az webapp show -g $(resourceGroup) -n $(backendApp) --query id -o tsv
+                      $log = Join-Path '$(Agent.TempDirectory)' 'backend-starts.log'
+                      $deadline = (Get-Date).AddMinutes(10)
+                      do {
+                        Start-Sleep -Seconds 15
+                        az rest --method post --url "https://management.azure.com$site/containerlogs?api-version=2023-12-01" --output-file $log 2>$null
+                        $start = Select-String -Path $log -Pattern '^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\S* Site started\.' -ErrorAction SilentlyContinue | Select-Object -Last 1
+                        $up = $start -and $start.Matches[0].Groups[1].Value -gt $started -and (curl.exe -s -o NUL -w '%{http_code}' --max-time 15 --resolve '$(portalHost):443:$(portalAddress)' 'https://$(portalHost)/api/v1/auth/me') -eq '401'
+                      } until ($up -or (Get-Date) -gt $deadline)
+                      if (-not $up) { throw 'The new control plane did not start within 10 minutes. The worker is untouched. Run the rollback lines.' }
+                      Write-Host 'The new control plane is serving.'
+
+                - task: AzureCLI@3
+                  displayName: Move the worker to the new image
+                  inputs:
+                    azureSubscription: ${{ variables.serviceConnection }}
+                    scriptType: ps
+                    scriptLocation: inlineScript
+                    powerShellErrorActionPreference: continue
+                    powerShellIgnoreLASTEXITCODE: true
+                    inlineScript: |
+                      az extension add --name containerapp --upgrade --only-show-errors
+                      # By digest: the worker runs the control plane image, and a `latest` that has
+                      # not changed as far as Container Apps can see creates no new revision.
+                      $image = '$(registry).azurecr.io/$(backendRepository)@$(backendDigest)'
+                      # The sandbox image is always written: the worker fills the pool of ready
+                      # sandboxes from it, so it must match the control plane's. An unchanged image
+                      # and setting create no new revision.
+                      az containerapp update -n $(workerApp) -g $(resourceGroup) --image $image --set-env-vars 'SANDBOX__IMAGE_REF=$(sandboxRef)' --output none
+                      if ($LASTEXITCODE -ne 0) { throw 'Could not update the worker. The portal and control plane are on the new images.' }
+
+                      $deadline = (Get-Date).AddMinutes(10)
+                      do {
+                        Start-Sleep -Seconds 15
+                        $json = az containerapp revision list -n $(workerApp) -g $(resourceGroup) --query "[?properties.active].{health:properties.healthState, image:properties.template.containers[0].image}" -o json
+                        $active = ($json -join "`n") | ConvertFrom-Json
+                        $active = @($active)
+                        $up = $active.Count -eq 1 -and $active[0].health -eq 'Healthy' -and $active[0].image -eq $image
+                      } until ($up -or (Get-Date) -gt $deadline)
+                      if (-not $up) { throw 'The worker is not on one healthy revision of the new image after 10 minutes. Run the worker rollback line.' }
+                      Write-Host 'The worker is on the new image.'

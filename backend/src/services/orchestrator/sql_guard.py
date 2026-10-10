@@ -83,12 +83,12 @@ def _unmask(text: str) -> str:
 
 def _refusal(offense: str) -> str:
     """The corrective message — it must teach, not dead-end: WHY the command was blocked, what
-    verification looks like instead, and the one sanctioned channel for schema changes."""
+    checks the work instead, and the one sanctioned channel for schema changes."""
     return (
         f"This command was blocked before it ran: it carries destructive SQL ({offense}) aimed "
         "at the app's real database, which may already hold the user's records. Improvised data "
         "mutations are never part of a build — never DELETE, TRUNCATE, DROP, or UPDATE records "
-        "to test, demo, or clean up. Verify your work by type-checking and rendering instead. "
+        "to test, demo, or clean up. The harness checks the app when your turn ends. "
         "If the user's requirements change the schema (including removing a table or column), "
         f"{MIGRATION_CHANNEL} — that is the sanctioned channel — and state plainly in your "
         "done-summary that the removed feature's data goes with it."

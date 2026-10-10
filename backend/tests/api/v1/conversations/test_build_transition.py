@@ -87,6 +87,9 @@ def wire(app, db_session, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     app.dependency_overrides[session_manager_dependency] = lambda: manager
     app.dependency_overrides[sandbox_dependency] = lambda: sbx
     app.dependency_overrides[sandbox_or_none_dependency] = lambda: sbx
+    # A start row's write and its watcher's close would share this test's one session with the
+    # turn, and these tests are about the handoff, not start timing.
+    monkeypatch.setattr(StartRecord, "open", _not_on_the_books)
     return SimpleNamespace(app=app, manager=manager, sbx=sbx)
 
 
@@ -679,9 +682,6 @@ async def test_a_plan_chat_deleted_before_its_answer_is_written_still_answers_st
     monkeypatch.setattr(
         "src.api.v1.conversations.transition.record_build_started", _plan_chat_deleted_first
     )
-    # The nested delete and the turn's sandbox start share this test's one session, and a start
-    # row's own commit would land in the middle of the delete's flush.
-    monkeypatch.setattr(StartRecord, "open", _not_on_the_books)
 
     resp = await client.post(_build_url(plan_chat), headers=headers, json={"chatId": str(minted)})
     await _settle(_fresh_engine, minted)

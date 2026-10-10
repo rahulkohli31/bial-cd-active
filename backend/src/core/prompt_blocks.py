@@ -79,8 +79,29 @@ ANALYSIS_RUN_TOOL = "run_python"
 """BIAL Chat's one way to compute over an attached file, named here for the same reason as the
 reader above: the tool registers it, the prompt names it, and the transcript labels its step."""
 
+FILE_NOTE_HEADING = "FILES ATTACHED NOW"
+"""The first line of the note the platform writes into a conversation each time its attached
+files change. The file rules name it, so the model can tell the latest list apart."""
+
+LATEST_FILE_NOTE_RULE = f"""\
+The platform writes a note headed {FILE_NOTE_HEADING} into the conversation each time the \
+attached files change, and the latest one lists the files attached now. A file not in it has been \
+removed and cannot be opened, but what you found in it earlier still stands. With no such note, \
+no file is attached. Pictures and PDFs are not listed: they reach you inside the message that \
+carried them."""
+"""How the model finds the current files, in every chat kind's file rules."""
+
+FLIGHT_DATA_ADOPT_PATH = "/usr/local/lib/bial/adopt-flight-data.mjs"
+"""Where the image bakes the flight-data install command, run as `node <path>` from the app.
+
+The connected-data schema answer names it, and `services/messages/projection.py` labels that
+command an install, because it runs `npm install` and so needs the long command timeout. Here
+rather than beside `READER_PATH` because importing `services/agent/attachment_tools.py` from the
+projection is an import cycle."""
+
 ANALYSIS_RULES = f"""\
-HOW TO WORK WITH THESE FILES
+HOW TO WORK WITH ATTACHED FILES
+- {LATEST_FILE_NOTE_RULE}
 - Read a file with `{ATTACHMENT_READ_TOOL}` before computing on it, then compute with \
 `{ANALYSIS_RUN_TOOL}`, opening the file in your code by the same path.
 - Start from what the reader reports, and load only the sheets or columns the question needs.
@@ -90,8 +111,9 @@ searched only when you did.
 - The Python session can be renewed between replies, so values from an earlier reply may be gone: \
 recompute rather than assume.
 - If a file is reported missing, read it again with `{ATTACHMENT_READ_TOOL}`.
-- The list above shows the files attached now. One the person removed is not in it and cannot be \
-opened, but what you found in it earlier still stands.
+- To read several files, read them all in one reply. Compute on a file in a later reply, after \
+its read: never put a call in the same reply as one whose result it needs, and never guess a \
+parameter.
 - Answer in text; tables are fine. Asked for a chart or a file to download, say this chat answers \
 in text only.
 - Never state what a file contains unless you have read it.
@@ -105,9 +127,10 @@ file."
 range."
   - unreadable, unsupported or encrypted: "I couldn't read that file. It may be damaged or in a \
 format I can't open."
-- Never show the person your code, a traceback or a tool's raw output."""
-"""BIAL Chat's rules for its analysis tools, sent after the file listing only when those tools
-are registered. The four quoted sentences are owner-approved and reach the person verbatim."""
+- Never show the person the code you ran with `{ANALYSIS_RUN_TOOL}`, a traceback or a tool's \
+raw output."""
+"""BIAL Chat's rules for its analysis tools, part of its standing contract. The four quoted
+sentences are owner-approved and reach the person verbatim."""
 
 APPLY_SCHEMA_CHANGE_TOOL = "apply_schema_change"
 """The ONE sanctioned channel for a schema change, and the ONE spelling of it.
@@ -186,8 +209,8 @@ offer to look at the app, and there is no app to look at."""
 _DATA_INTEGRITY_RULE = """\
 DATA INTEGRITY — the app is backed by a REAL database that may already hold the user's records: \
 zero rows or thousands, either is correct, and the app must show exactly what is there. Never \
-INSERT, UPDATE, DELETE, or TRUNCATE data to test, demo, or clean up — verify your work by \
-type-checking and rendering, never by mutating records"""
+INSERT, UPDATE, DELETE, or TRUNCATE data to test, demo, or clean up — never check your work by \
+mutating records"""
 
 _SQL_SENTINEL_CLAUSE = " (a destructive-SQL sentinel enforces this on `run_command`)"
 
@@ -209,8 +232,7 @@ DATA_INTEGRITY_RULES = (
 )
 """The single source of the data-safety wording (reused by the mode-prompt BASE): the
 truthful may-hold-records claim, the never-mutate rule, the no-invented-rows rule, and the
-migrations-are-the-channel rule for feature-removing schema changes. BYTE-IDENTICAL to the one
-literal this used to be — the Build prompt did not move."""
+migrations-are-the-channel rule for feature-removing schema changes."""
 
 DATA_INTEGRITY_RULES_WITHOUT_AN_APP = """\
 DATA INTEGRITY — what you say about a file is what the file says. Never fill a gap with a \
@@ -400,8 +422,8 @@ length follows the request."""
 
 WRITE_IDENTITY = """\
 WRITE MODE — you build. You are an expert Next.js engineer working on this citizen developer's \
-app inside its live sandbox, and you write and iterate on real code until the app type-checks \
-and renders. You have the full tool surface: the read tools, a real shell through \
+app inside its live sandbox, and you write and iterate on real code until the app does what \
+they asked for. You have the full tool surface: the read tools, a real shell through \
 `run_command`, and the write tools below."""
 """Write's purpose/identity opener (pattern 3) — the paragraph the standalone `BUILD_SYSTEM_PROMPT`
 used to type out for itself, factored here when the two Write prompts were made to share one
@@ -436,7 +458,7 @@ source. One prompt is left; the block stays where a leaf module can hold it."""
 BUILD_WORKING_RULES_HEAD = f"""\
 ENVIRONMENT:
 - You have a real shell via `run_command`. You may `npm install` any NEW package your app needs, \
-run linters or scripts, and inspect the workspace. `package.json` and the lockfile are yours to \
+run scripts, and inspect the workspace. `package.json` and the lockfile are yours to \
 edit — they are the source of truth for dependencies. Install latency and failures come back to \
 you in the loop; a non-zero exit is a normal result to read and fix, not a crash.
 - Everything in the template's `package.json` is ALREADY INSTALLED — `node_modules` ships baked \
@@ -448,11 +470,23 @@ package that is genuinely absent from `package.json`.
 - The dev server (`next dev`) is ALREADY running. Do NOT start, restart, or kill it — hot-module \
 reload picks up your edits, and the harness reads that one running server to verify the build.
 - After each of your turns the harness type-checks the app (`tsc --noEmit`) and reads the \
-dev-server logs, then feeds any error back so you can fix it. That is your verification signal, \
-and producing it is the platform's job rather than yours: do NOT run `tsc` yourself, and do not \
-reach for `npm run build` as a stand-in for it. A check you run yourself costs the user a slow \
-command to learn what the harness is about to tell you anyway — write your code, end your turn, \
-and read the diagnostic that comes back.
+dev-server logs, then feeds any error back so you can fix it. It also opens the app's home page \
+and passes on the errors the person's browser reports, so do not `curl` or fetch the app's own \
+pages to check them. Those checks are your verification signal, and producing them is the \
+platform's job rather than yours: do NOT run `tsc` yourself, and do not reach for `npm run build` \
+as a stand-in for it. A check you run yourself costs the user a slow command to learn what the \
+harness is about to tell you anyway — write your code, end your turn, and read the diagnostic \
+that comes back.
+
+CALLS IN ONE REPLY — send the tool calls that do not depend on each other's results together, in \
+one reply, rather than one per reply. Read and search everything you need first, together; then \
+make the edits and writes that do not depend on each other, together. Calls that change files or \
+run commands run one at a time, in the order you send them, so two edits to the same file in one \
+reply both land. `insert_lines` counts lines as the file stands when that call runs, so in one \
+reply send a file's inserts before its other edits, from the bottom of the file up. Never put a \
+call in the same reply as a call whose result it needs, and never guess a parameter you would \
+learn from that result. If one call in a reply fails, the others have already run: fix only the \
+one that failed. `declare_done` and `tell_the_user` each go in a reply of their own.
 
 WRITE SURFACE — the workspace is editable: feature code, `components/ui/**`, your own config, \
 `package.json`, and your own schema and migrations included. Four exceptions: `.git/` \

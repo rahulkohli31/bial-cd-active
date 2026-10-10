@@ -45,12 +45,11 @@ if TYPE_CHECKING:
 class ChatDeps:
     """Per-request agent dependencies. `user_id` scopes any tool to the caller. `kind` and
     `prompt_context` are required: every run composes its prompt from the kind's standing
-    contract plus this conversation's own facts, and there is no shape that omits either. `db`
-    is OPTIONAL (no tool reads it) since holding a pooled connection across a minutes-long
-    Write turn would pin it idle-in-transaction, what short-lived harness sessions avoid.
-    `workspace` and BUILD-only `sandbox` are `None` off their paths; both accessors fail-first
-    rather than degrade. `analysis` is BIAL Chat's handle on its file session, set only on a reply
-    that registers the analysis tools.
+    contract plus this conversation's own facts, and there is no shape that omits either. `db` is
+    OPTIONAL (no tool reads it) since holding a pooled connection across a minutes-long Write turn
+    would pin it idle-in-transaction, what short-lived harness sessions avoid. `workspace` and
+    BUILD-only `sandbox` are `None` off their paths; both accessors fail-first rather than degrade.
+    `analysis` is BIAL Chat's handle on its file session, set on every BIAL Chat reply.
     """
 
     user_id: uuid.UUID

@@ -88,6 +88,8 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # 0052_sandbox_starts adds the table that keeps one row of stage timings per sandbox start.
     # 0054_teardown_write_back says whether an owed container's tree is written back first.
     # 0055_sandbox_pool adds the ledger of containers made ahead of time for the pool.
+    # 0056_start_miss_connector adds the miss a flight-data start records while its pool is off.
+    # 0057_sandbox_pool_project_type says which pool each ledger row's container was made for.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0055_sandbox_pool"]
+    assert heads == ["0057_sandbox_pool_project_type"]

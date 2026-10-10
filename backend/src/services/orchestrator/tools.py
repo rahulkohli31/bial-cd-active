@@ -56,7 +56,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Final, cast
 
-from pydantic_ai import ModelRetry, RunContext
+from pydantic_ai import ModelRetry, RunContext, Tool
 from pydantic_ai.toolsets.function import FunctionToolset
 
 from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL
@@ -794,13 +794,13 @@ def sandbox_toolset[DepsT](
 
     async def run_command(ctx: RunContext[Any], command: list[str]) -> str:
         """Run a shell command in the app workspace and get its output back. Pass the command as a
-        list of argv tokens — e.g. `["npm", "install", "zod"]`, `["npm", "run", "lint"]`, `["ls",
-        "app"]`. It runs as an unprivileged user; the output is secret-redacted and length-capped
-        before you see it. A non-zero exit code comes back as a normal result — read the output and
-        fix the cause. A long output is cut to its first and last lines, and the notice in the
-        middle names a handle — pass that handle to `fetch_output_slice` to read what was cut,
-        instead of running the command again. Do NOT start or restart the dev server (`next dev`);
-        it is already running and the harness reads it for you."""
+        list of argv tokens — e.g. `["npm", "install", "zod"]`, `["ls", "app"]`. It runs as an
+        unprivileged user; the output is secret-redacted and length-capped before you see it. A
+        non-zero exit code comes back as a normal result — read the output and fix the cause. A
+        long output is cut to its first and last lines, and the notice in the middle names a handle
+        — pass that handle to `fetch_output_slice` to read what was cut, instead of running the
+        command again. Do NOT start or restart the dev server (`next dev`); it is already running
+        and the harness reads it for you."""
         session = sandbox_of(ctx)
         # alias keeps the call off the JS-oriented exec guard
         transport = session.sandbox_client.exec
@@ -994,16 +994,19 @@ def sandbox_toolset[DepsT](
             session, outcomes, budget=output_budget_for_exit(0 if succeeded else 1)
         )
 
+    # The tools that change files or run commands run one at a time, in the order the model sent
+    # them: two calls in one reply otherwise start together, and two edits to one file race the
+    # supervisor's unlocked read-change-write. The reads stay concurrent.
     toolset = FunctionToolset[Any](
         [
             read_file,
-            write_file,
-            edit_file,
-            insert_lines,
+            Tool(write_file, sequential=True),
+            Tool(edit_file, sequential=True),
+            Tool(insert_lines, sequential=True),
             declare_done,
-            run_command,
+            Tool(run_command, sequential=True),
             fetch_output_slice,
-            apply_schema_change,
+            Tool(apply_schema_change, sequential=True),
         ],
         id="sandbox-tools",
     )

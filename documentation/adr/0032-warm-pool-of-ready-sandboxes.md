@@ -27,16 +27,19 @@ inside their request, about half a minute of it, rather than in the background.
 
 **A pool of ready containers, each used once and each holding nothing that belongs to a
 project.** A pool container is created, booted and healthy, with no app identity, no storage
-credential, no database address and no data identity. When it is claimed it serves one start and,
-when that project leaves, is saved and deleted exactly as a container created on demand is. It is
-never returned to the pool: generated code has run in it, so reuse would risk carrying one
-project's files, packages or processes into the next.
+credential and no database address. A plain pool container has no data identity either; one in the
+connector pool, below, carries the single data identity that every connector project is given, and
+nothing of any project's. When it is claimed it serves one start and, when that project leaves, is
+saved and deleted exactly as a container created on demand is. It is never returned to the pool:
+generated code has run in it, so reuse would risk carrying one project's files, packages or
+processes into the next.
 
 **Every kind of start claims from it, at the one place every start already creates a container.**
 Reopening, a new project, a chat message, a switch and a shared view all pass through the same
-create step, so one claim there covers all of them, and no start kind or project type is treated
-differently. If nothing ready can be claimed, the same step creates a container the way it always
-has, so a failure in the pool can never fail a start that would have succeeded without it.
+create step, so one claim there covers all of them, and no start kind is treated differently. A
+connector project's start claims only from the connector pool, below. If nothing ready can be
+claimed, the same step creates a container the way it always has, so a failure in the pool can never
+fail a start that would have succeeded without it.
 
 **Settings reach a claimed container through the supervisor, once, after the claim.** The supervisor
 accepts one new authenticated call that takes the project's settings. It is limited to the
@@ -80,8 +83,8 @@ re-deriving a name. That is what lets a container carry any name, and it removes
 telling a shared view from a build sandbox by the prefix of its name decided whether a colleague's
 copy would be written over the owner's saved work, and whether a removed colleague kept a running
 copy of the owner's app. The pool's own state lives in the platform database, one row per pool
-container: its name, its address, the image it was made from, a state (filling, ready, claimed,
-retiring) and the time of the last change. A start that creates its own container writes a row for
+container: its name, its address, the image it was made from, which pool it was made for (plain or
+connector), a state (filling, ready, claimed, retiring) and the time of the last change. A start that creates its own container writes a row for
 it too, claimed from the outset, because a create outlives a cancelled start and until the registry
 records the container nothing else names it. When the registry write succeeds, or the container is
 confirmed gone, the row is deleted, and from then on the registry describes the container like any
@@ -89,10 +92,11 @@ other. The ledger is in the database, not the coordination store, for the reason
 the coordination store can lose what it holds, and a container nobody records keeps billing. An
 exclusive hand-over between processes also needs a lock the database provides.
 
-**The claim is a compare-and-set on the ledger.** One statement locks a ready row, skipping rows
-another claim already holds, and marks it claimed: rows made from the current image first, rows
-from an older image only when none of those is ready. Two starts never receive the same container,
-even through the overlap of a deploy, when two instances of the backend briefly run side by side.
+**The claim is a compare-and-set on the ledger.** One statement locks a ready row of the start's
+own pool, skipping rows another claim already holds, and marks it claimed: rows made from the
+current image first, rows from an older image only when none of those is ready. Two starts never
+receive the same container, even through the overlap of a deploy, when two instances of the
+backend briefly run side by side.
 Every retire is the same kind of statement, conditional on the state the row was read in, so the
 retire of a ready container can never take one a start has just claimed.
 
@@ -124,8 +128,9 @@ Azure reports it made; one that has not answered within minutes is deleted like 
 Creates, deletes and restamps share a bound of two at a time in each process, which leaves that
 process's own Azure worker threads free for live starts.
 
-**Size follows the working day, in India time.** Each environment sets a day size, a night size,
-the day's hours and the day's days; zero is a valid size, and dev may hold none at night. Each size
+**Size follows the working day, in India time.** Each environment sets a day size and a night size
+for each pool, and the day's hours and days for both; zero is a valid size, and dev may hold none at
+night. Each size
 has a ceiling of twenty, and a value above it stops the process from starting, so a mistyped size
 fails a deploy rather than quietly running dozens of containers. At the change from night to day
 the worker's pass fills the difference, so the pool grows from the day's start; an operator who
@@ -141,13 +146,31 @@ are swapped. The platform learns that an image was deployed only from the image 
 changing, so each sandbox deploy sets it to the new immutable tag in both the backend and the
 worker; a moving tag would hide the deploy.
 
-**The pool ships switched off.** Every size is zero when this lands. A connector project's app
-reads tenant data through an identity that Azure attaches when the container is created, and a
-ready container has no project yet, so it cannot carry it. Until a follow-up gives a connector
-project's claim that identity — by attaching it after the claim, or by a second small pool created
-with it — a ready container that a connector project could claim without it must not exist, and no
-condition by project type is added to make an exception. The sizes are raised once that has
-shipped.
+**A connector project's start claims from a second, small pool made with the identity.** Its app
+reads tenant data through an identity that Azure attaches only when a container is created, so a
+plain ready container can never serve it. The connector pool holds containers created with that
+identity, which every connector project shares, and with nothing of any project's: the connector's
+coordinates arrive with the project's other settings at the claim. Which pool a start claims from
+is decided once, before the claim, from the fact the create already reads from the start's
+environment. A shared view always claims a plain container, because a colleague viewing an app is
+never given its owner's grant. Each pool has its own day and night sizes, under the same ceiling
+and the same day, and the worker's pass holds both: plain first, then connector, each with its own
+retire, fills, outcome line and alarm, so a refused create or an overdue fill in one never stops
+the other's fills. A claim refills its own pool.
+
+**The identity a claimed container carries is checked against Azure, not the ledger.** The read
+that fetches a claimed container's bearer also returns the identities Azure attached to it. A plain
+start uses a container only if it carries none, and a connector project's start only if it carries
+exactly the configured identity. Anything else is let go before the project's settings reach it,
+with an alarm, and the start creates its own. This catches what the ledger cannot: a container whose
+identity changed after it was made, a lake identity changed without the connector pool being
+drained first, and a worker whose lake settings differ from the backend's.
+
+**The connector pool fails soft.** Creating a container with the identity needs the right to assign
+that identity, and the worker needs the lake's settings. Without either, each connector fill is
+refused with a warning and the connector alarm, every other job in the worker runs on, and a
+connector project's start creates its own container as it would with that pool's sizes at zero.
+When the missing piece arrives, the next pass fills, with no deploy. Both pools ship switched off.
 
 ## Consequences
 
@@ -157,8 +180,9 @@ shipped.
   is recorded once with whether it claimed and, if not, why; the records are read only as
   superadmin aggregates.
 - A start the pool cannot serve is today's start, unannounced and recorded with its reason: none
-  ready (more starts than ready containers, or Azure refusing creates), a size of zero, a claimed
-  container that failed its health check, or a later step of a claim that failed.
+  ready in its own pool (more starts than ready containers, or Azure refusing creates), a size of
+  zero (recorded apart for a connector project, whose own pool is off), a claimed container that
+  failed its health check, or a later step of a claim that failed, the identity check among them.
 - Ready containers cost money. They are billed as running containers, and whether a lower idle
   rate applies in this tenant is not established. The size settings are the lever, the night size
   keeps the idle cost down, and an image swap briefly doubles the pool inside the environment's
@@ -166,7 +190,7 @@ shipped.
 - A claimed pool container never has its project's database address or storage key in Azure's own
   record of it, because they were delivered over the supervisor's channel after the claim. A
   container created on a miss still carries them there, as every container did before.
-- **This amends ADR-0029 twice.** It says identity is written into the creation request so that
+- **This amends ADR-0029 three times.** It says identity is written into the creation request so that
   every container is judgeable from the first moment; a pool container is created with only its
   kind, control-plane and pool tags, and owner, app and creation time are written at the claim, so
   between fill and claim a container with a pool tag and no owner is expected. And it says the
@@ -175,9 +199,20 @@ shipped.
   and the environment-join action on the sandbox resource group — actions the control plane's own
   role already holds. The worker still runs no user-supplied code and creates containers only from
   the platform's own image, but a compromise of it is now also the power to create billable
-  containers there.
+  containers there. And the worker now creates the connector pool's containers with the lake's
+  identity, which needs the right to assign that identity, granted on that one identity alone; a
+  compromise of the worker is therefore also the power to create containers that can read the
+  lake.
 - The worker builds each pool container's environment, including the portal's origin, so it has a
-  required setting for that origin, validated as the API validates it.
+  required setting for that origin, validated as the API validates it. It also carries the lake's
+  settings, optional and shaped as the API's, for the connector pool.
+- **Rolling back past the release that brought the connector pool drains that pool alone.** Its
+  sizes go to zero on both processes, the ledger is watched until it holds no connector row but
+  retiring ones, and only then do its settings come off, the worker's first. The backend's copy of
+  those settings is the interlock: an older release refuses to start while one is present, so an
+  older backend, which would claim any ready container, never meets one carrying the identity. The
+  plain pool can stay on throughout. A lake identity change is the same drain, then the new
+  settings on both processes, then the sizes back up.
 - The orphan inventory and the tag backfill's unowned count leave out containers the ledger holds,
   a container a start is still creating among them, and containers whose deletion is still owed.
   The sweep needs nothing for the pool: it reaches only containers a registry names.
@@ -231,6 +266,15 @@ shipped.
   managed platform already serves. Reconsidered if a hard isolation requirement appears.
 - **Sizing the pool from demand.** Sizes are operator settings; automatic sizing needs arrival data
   the per-start records have yet to gather.
+- **Attaching the identity to a plain container after its claim.** It works only if every pool
+  container is made with a placeholder identity, and it adds about seven seconds to the open. It is
+  the successor if a second connector ever needs a pool of its own.
+- **Recording on each ledger row the identity its container was made with.** The identity check at
+  the claim gives the same safety with no column, and a lake identity change is a drain.
+- **Filling the two pools side by side within a pass.** It would keep a create that hangs in one
+  pool from holding the other, at the cost of concurrent fills and their cancellation. A refusal or
+  an overdue fill already stops only its own pool, and the backend refills the connector pool after
+  each claim meanwhile.
 
 ## Accepted risks
 
@@ -246,8 +290,13 @@ once no create could still be running; until then, under half an hour, it keeps 
 A start whose ledger write fails creates all the same, and such a container is left to the orphan
 report.
 
-The environment's capacity for twice the pool on top of peak live workspaces is not verified. The
-ceiling bounds the exposure, and capacity is to be checked before any size is raised.
+A connector pool container holds a live identity to the lake from the moment it is made. No project
+code runs in it before a claim, its supervisor answers only to its own bearer, and only a connector
+project's start may claim it.
+
+The environment's capacity for both pools, twice over during an image swap, on top of peak live
+workspaces is not verified. Each size has the ceiling and there is no combined one, so capacity is
+to be checked before any size is raised.
 
 The below-size alarm is a log event, like the platform's other alarms, and is met only when an
 alerting rule and a named recipient exist for it. It must not be read as met on the strength of the

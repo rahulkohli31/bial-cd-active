@@ -1,5 +1,5 @@
-"""The pass that holds the pool of ready sandboxes at its size, run every minute by the worker, one
-at a time under an advisory lock.
+"""The pass that holds each pool of ready sandboxes, plain and connector, at its size, run every
+minute by the worker, one at a time under an advisory lock.
 
 It acts only on containers the pool's ledger holds, never on one a registry names: a claimed row
 left past its deadline loses its container only when no registry record and no owed teardown names
@@ -22,6 +22,7 @@ from src.core.alarms import SANDBOX_POOL_BELOW_SIZE_EVENT
 from src.db import base as db_base
 from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.sandbox_pool import SandboxPoolMember, SandboxPoolState
+from src.db.models.sandbox_start import SandboxProjectType
 from src.services.build_sessions.destroy import single_flight_lock
 from src.services.build_sessions.inventory import registered_app_names
 from src.services.redis import get_redis
@@ -53,9 +54,10 @@ POOL_PASS_DISABLED_EVENT: Final = "sandbox_pool_pass_disabled"
 
 @dataclass(frozen=True)
 class PoolPass:
-    """What one pass found and did. `ready` is counted as the pass ends; `overdue` says it found a
-    filling row past `ROW_DEADLINE`."""
+    """What one pass found and did for one pool. `ready` is counted as that pool's run ends;
+    `overdue` says it found a filling row past `ROW_DEADLINE`."""
 
+    project_type: SandboxProjectType
     target: int
     ready: int
     filled: int
@@ -87,15 +89,28 @@ async def keep_the_pool_under_the_lock(client: AcaSandboxClient) -> None:
         await keep_the_pool(client, at=datetime.now(UTC))
 
 
-async def keep_the_pool(client: AcaSandboxClient, *, at: datetime) -> PoolPass:
-    """One pass over the ledger at `at`, an aware instant, logged as one line. It clears rows left
-    past `ROW_DEADLINE` and retries deletes that failed; retires ready rows above the size for
-    `at`, older images first, which swaps an image change in new before old; then fills until the
-    configured image's rows reach the size. A refused create, or a filling row past its deadline,
-    ends the filling for this pass, and the alarm fires if the pool is left below its size."""
+async def keep_the_pool(
+    client: AcaSandboxClient, *, at: datetime
+) -> dict[SandboxProjectType, PoolPass]:
+    """One pass at `at`, an aware instant: the plain pool, then the connector pool, each over its
+    own rows and logged as its own line. A start's own create and a held delete are plain rows."""
+    return {
+        project_type: await _keep_one_pool(client, project_type, at=at)
+        for project_type in (SandboxProjectType.PLAIN, SandboxProjectType.CONNECTOR)
+    }
+
+
+async def _keep_one_pool(
+    client: AcaSandboxClient, project_type: SandboxProjectType, *, at: datetime
+) -> PoolPass:
+    """One pool's run of a pass. It clears that pool's rows left past `ROW_DEADLINE` and retries
+    deletes that failed; retires ready rows above its size for `at`, older images first, which
+    swaps an image change in new before old; then fills until the configured image's rows reach
+    the size. A refused create, or a filling row past its deadline, ends that pool's filling for
+    this pass, and its alarm fires if it is left below its size."""
     config = client.config
-    target = config.pool_size_at(at)
-    members = await pool.the_ledger()
+    target = config.pool_size_at(at, project_type=project_type)
+    members = await pool.the_ledger(project_type=project_type)
     overdue = [
         member
         for member in members
@@ -132,13 +147,14 @@ async def keep_the_pool(client: AcaSandboxClient, *, at: datetime) -> PoolPass:
     filled = 0
     made: FillOutcome = "at_target"
     for _ in range(0 if filling_overdue else target):
-        if (made := await client.fill_one(target)) != "filled":
+        if (made := await client.fill_one(target, project_type=project_type)) != "filled":
             break
         filled += 1
 
     outcome = PoolPass(
+        project_type=project_type,
         target=target,
-        ready=await pool.ready_count(),
+        ready=await pool.ready_count(project_type=project_type),
         filled=filled,
         retired=retired,
         deleted=deleted,
@@ -149,6 +165,7 @@ async def keep_the_pool(client: AcaSandboxClient, *, at: datetime) -> PoolPass:
     if outcome.ready < target and (outcome.refused or outcome.overdue):
         _log.warning(
             SANDBOX_POOL_BELOW_SIZE_EVENT,
+            project_type=project_type,
             target=target,
             ready=outcome.ready,
             refused=outcome.refused,

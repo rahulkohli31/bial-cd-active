@@ -13,11 +13,11 @@ gets the runtime's unknown-tool rejection, never a policy check that could be by
 |---------|----------------------|-------------------|--------|----------------------|
 | Plan    | yes (live workspace) | allowlisted, read | —      | yes                  |
 | Build   | yes (live workspace) | full (+SQL guard) | yes    | —                    |
-| Generic | —                    | —                 | —      | —                    |
+| Generic | attached files only  | —                 | —      | —                    |
 
 Plan and Build also carry `CONVERSATION_TOOLSET` and `app_state_toolset` (each registered once,
-so the two lists can't drift); a Generic run is handed none, or only the analysis tools when its
-caller passes `analysis_of`.
+so the two lists can't drift). Plan also carries `read_attachment`, and a Generic run carries the
+analysis tools, whenever the caller passes their accessors — which every chat turn does.
 `toolsets_for_kind` is the ONLY place permitted to read the chat kind to decide capability —
 see its own docstring. Two more things live here, not the registry: the citizen-facing chat-kind
 CATALOGUE (served on `GET /v1/auth/me`) and the registry read the gating guards ask their
@@ -465,10 +465,10 @@ async def registered_tool_definitions(
     """Exactly what `kind` registers, in registration order, as pydantic-ai hands it to the
     model — names AND descriptions, straight off `toolsets_for_kind`.
 
-    The accessors are the ones that raise: resolving a workspace or a sandbox is what a tool
-    CALL needs, and nothing here calls a tool. That is deliberate rather than convenient — a
-    reader that needed a live sandbox to describe the surface could not run in a test, and a
-    gating guard that cannot run is not a guard.
+    The accessors are the ones that raise: resolving a workspace, a sandbox, a reader or a file
+    session is what a tool CALL needs, and nothing here calls a tool. That is deliberate rather
+    than convenient — a reader that needed a live sandbox to describe the surface could not run in
+    a test, and a gating guard that cannot run is not a guard.
 
     `connected_systems` MIRRORS `toolsets_for_kind`'s, DEFAULT AND ALL. It has to: without it the
     connector-on registration is not expressible from a test, and a different default here would
@@ -480,7 +480,9 @@ async def registered_tool_definitions(
         kind,
         _reading_the_registry_never_calls_a_tool,
         sandbox_of,
+        _reading_the_registry_never_calls_a_tool,
         connected_systems=connected_systems,
+        analysis_of=_reading_the_registry_never_calls_a_tool,
     )
     for toolset in surface.toolsets:
         for name, tool in (await toolset.get_tools(ctx)).items():

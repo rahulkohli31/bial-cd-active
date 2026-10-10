@@ -42,6 +42,7 @@ from src.services.sandbox import (
     ExecResult,
     FileOp,
     FileResult,
+    FileStrReplace,
     FileView,
     SandboxError,
     SandboxGoneError,
@@ -50,7 +51,7 @@ from src.services.sandbox import (
 from src.services.turns import engine as engine_module
 from src.services.turns.engine import _TurnState
 from tests.fakes import ToolDeps
-from tests.services.orchestrator.conftest import build_tool_agent
+from tests.services.orchestrator.conftest import _sandbox_of, build_tool_agent
 from tests.services.orchestrator.fake_sandbox import FAKE_SUPERVISOR_TOKEN, FakeSandbox
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
@@ -275,6 +276,79 @@ async def test_str_replace_bad_then_fixed_recovers_in_run() -> None:
     assert captured["output"] == "done"
 
 
+class _UnlockedReadChangeWrite(FakeSandbox):
+    """An edit the way the supervisor's `/files` makes it: read the file, change it, write it back,
+    with no lock. The read waits briefly for a second reader, so two edits dispatched together
+    really do overlap, and it records the most reads it ever saw in flight."""
+
+    def __init__(self, seed_files: dict[str, str]) -> None:
+        super().__init__(seed_files=seed_files)
+        self.in_flight = 0
+        self.peak = 0
+        self.landed: list[str] = []
+
+    async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:
+        if not isinstance(op, FileStrReplace):
+            return await super().files(handle, op)
+        content = self.workspace[op.path]
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            for _ in range(20):
+                if self.in_flight > 1:
+                    break
+                await asyncio.sleep(0.005)
+        finally:
+            self.in_flight -= 1
+        if content.count(op.old_str) != 1:
+            raise SandboxError("str_replace found no single match")
+        self.workspace[op.path] = content.replace(op.old_str, op.new_str, 1)
+        self.landed.append(op.old_str)
+        return FileResult(ok=True, detail={"replacements": 1})
+
+
+async def test_two_edits_to_one_file_in_one_reply_both_land_in_the_order_sent() -> None:
+    """Two edits to one file in one reply race the supervisor's unlocked read-change-write unless
+    the changing tools run one at a time.
+
+    Mutation receipt: drop `sequential=True` from `edit_file` and the peak reaches 2 with one
+    replacement missing."""
+    fake = _UnlockedReadChangeWrite(seed_files={"app/x.tsx": "alpha\nbeta\n"})
+    both = ModelResponse(
+        parts=[
+            ToolCallPart(
+                tool_name="edit_file",
+                args={"path": "app/x.tsx", "old_str": "alpha", "new_str": "ALPHA"},
+                tool_call_id="edit-1",
+            ),
+            ToolCallPart(
+                tool_name="edit_file",
+                args={"path": "app/x.tsx", "old_str": "beta", "new_str": "BETA"},
+                tool_call_id="edit-2",
+            ),
+        ]
+    )
+
+    await _run(fake, [both, text_turn()])
+
+    assert fake.peak == 1
+    assert fake.workspace["app/x.tsx"] == "ALPHA\nBETA\n"
+    assert fake.landed == ["alpha", "beta"]
+
+
+def test_only_the_tools_that_change_things_run_one_at_a_time() -> None:
+    """Every tool that writes a file or runs a command is a barrier; the reads stay concurrent,
+    and so does `declare_done`, which changes nothing."""
+    toolset = tools_module.sandbox_toolset(_sandbox_of)
+    assert {name for name, tool in toolset.tools.items() if tool.sequential} == {
+        "write_file",
+        "edit_file",
+        "insert_lines",
+        "run_command",
+        "apply_schema_change",
+    }
+
+
 async def test_no_tool_leaks_the_supervisor_token() -> None:
     fake = FakeSandbox()
     # A failing read (missing file) plus a denied write — neither must render handle.token.
@@ -438,6 +512,7 @@ async def test_run_command_sandbox_gone_escalates() -> None:
         (["npm", "ci"], True),
         (["npx", "tsc", "--noEmit"], True),
         (["npm", "run", "build"], True),
+        (["node", prompt_blocks.FLIGHT_DATA_ADOPT_PATH], True),
         # …and the ones that must NOT get ten minutes to hang in:
         (["npx", "drizzle-kit", "generate", "--name", "add_visits"], False),
         (["npm", "run", "lint"], False),

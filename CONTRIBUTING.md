@@ -146,6 +146,8 @@ repository's job, and the values are asserted by a test rather than left to insp
 
 Trunk-based, on short-lived branches off `main` that live a day or two. Prefixes: `feat/`, `fix/`,
 `chore/`, `docs/`, `refactor/`. Conventional commit messages. Small pull requests, squash-merged.
+A merge to `main` starts a production release (`azure-pipelines.yml`), which changes nothing until
+someone approves it.
 
 Release automation that would commit generated artefacts into the repository is deliberately absent.
 

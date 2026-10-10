@@ -39,6 +39,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RunUsage
 from structlog.testing import capture_logs
 
+from src.core.prompt_blocks import FLIGHT_DATA_ADOPT_PATH
 from src.db.models.conversation import ChatKind
 from src.services.agent.agent import ChatDeps
 from src.services.agent.connector_tools import (
@@ -135,7 +136,7 @@ async def test_the_answer_states_its_own_completeness_and_points_at_the_worked_e
     for rule in (
         "latest complete copy",
         "a daily file's row replaces the copy's",
-        "cachedAsyncBuffer",
+        "one row group at a time",
         "globalThis",
         "one page of rows",
     ):
@@ -143,6 +144,16 @@ async def test_the_answer_states_its_own_completeness_and_points_at_the_worked_e
     assert "it is an older copy: follow the rules here" in answer
     # The artefact itself is untouched and comes FIRST — the sentence is a tail, not a preface.
     assert answer.startswith(SHIPPED)
+
+
+async def test_only_a_build_chat_is_asked_to_run_the_install_command() -> None:
+    """The answer reaches Plan too, whose read-only `run_command` refuses `node`; an old
+    workspace without the command falls back to the reference file."""
+    answer = await connector_schema(_ctx(connected=(SYSTEM,)), SYSTEM.key)
+    assert f"In a build chat, run `node {FLIGHT_DATA_ADOPT_PATH}`" in answer
+    assert f'["node", "{FLIGHT_DATA_ADOPT_PATH}"]' in answer
+    assert "a planning chat cannot run it and leaves it to the build" in answer
+    assert "If the command is missing, the workspace predates it" in answer
 
 
 async def test_the_key_and_the_display_name_both_resolve() -> None:

@@ -24,8 +24,10 @@
  * and a base64 blob must never be one of them.
  */
 import {
+  chatFileWeight,
   fileToBase64,
   newAttachmentId,
+  pixelLimitRefusal,
   resolveMediaType,
   validateAttachmentFiles,
 } from '../../../utils/attachmentInput'
@@ -74,6 +76,9 @@ export interface AttachmentAdapterOptions {
    * with the screen. The claim list below is what counts both.
    */
   staged: () => readonly Attachment[]
+  /** Bytes of the pictures and PDFs already sent in this chat, read at ADD time like `staged`,
+   *  leaving out the ids in `exclude`. */
+  sentFileBytes: (exclude: ReadonlySet<string>) => number
   /**
    * SAY A REFUSAL OUT LOUD, because the library will not. The dropzone and paste handler
    * both wrap `addAttachment` in `try { … } catch {}`, so an oversized file, a fifth file
@@ -106,16 +111,23 @@ function kindOf(mediaType: string): PendingAttachment['type'] {
   return 'file'
 }
 
-export function createAttachmentAdapter({ accept, staged, onRefused, onReadingChanged }: AttachmentAdapterOptions): AttachmentAdapter {
+export function createAttachmentAdapter({
+  accept,
+  staged,
+  sentFileBytes,
+  onRefused,
+  onReadingChanged,
+}: AttachmentAdapterOptions): AttachmentAdapter {
   /**
    * A local `claimed` count above `staged()`, because concurrent `add()` calls (one drop
    * gesture is N parallel calls) all read `staged()` before any of them publish — without
    * this, a five-file cap let eight files through. A claim retires when: the composer now
    * holds the file (it's in `staged()`); the user removed the chip (`remove`); or every read
    * has settled with nothing left unpublished (a cancelled `clearAttachments()`). A failed
-   * read releases its claim immediately.
+   * read releases its claim immediately. Each claim holds the bytes it adds to the chat's
+   * pictures and PDFs, zero for any other file.
    */
-  const claimed = new Set<string>()
+  const claimed = new Map<string, number>()
   let reading = 0
 
   /** Move the in-flight count and tell whoever is drawing the composer. */
@@ -124,12 +136,23 @@ export function createAttachmentAdapter({ accept, staged, onRefused, onReadingCh
     onReadingChanged?.(reading)
   }
 
-  /** What the caps must count right now: what the composer holds, plus what is still being read. */
-  function countable(): number {
+  /** What the caps must count right now: the files this message holds — staged, plus still being
+   *  read — and the bytes of pictures and PDFs in the chat, sent ones included. */
+  function held(): { files: number; bytes: number } {
     const stagedNow = payloadsOf(staged())
     if (reading === 0) claimed.clear()
     else for (const p of stagedNow) claimed.delete(p.id)
-    return stagedNow.length + claimed.size
+    // A file still staged while its send is in flight is in the transcript too; count it once.
+    let bytes = sentFileBytes(new Set(stagedNow.map((p) => p.id)))
+    for (const p of stagedNow) bytes += chatFileWeight(p.mediaType, p.size)
+    for (const claim of claimed.values()) bytes += claim
+    return { files: stagedNow.length + claimed.size, bytes }
+  }
+
+  /** Say the refusal, then throw so the library discards the file. */
+  function refuse(message: string): never {
+    onRefused(message)
+    throw new AttachmentRefusal(message)
   }
 
   return {
@@ -140,11 +163,9 @@ export function createAttachmentAdapter({ accept, staged, onRefused, onReadingCh
       // The per-message file cap is cumulative, so the check has to see both lists rather than
       // only the arriving file.
       const mediaType = resolveMediaType(file)
-      const verdict = validateAttachmentFiles([file], countable())
-      if ('error' in verdict && verdict.error) {
-        onRefused(verdict.error)
-        throw new AttachmentRefusal(verdict.error)
-      }
+      const { files, bytes } = held()
+      const verdict = validateAttachmentFiles([file], files, bytes)
+      if ('error' in verdict && verdict.error) refuse(verdict.error)
       // BEFORE THE READ, NOT AFTER IT. `fileToBase64` is the await the siblings would slip
       // through; claiming the slot first is what makes the check above see them.
       //
@@ -152,10 +173,12 @@ export function createAttachmentAdapter({ accept, staged, onRefused, onReadingCh
       // recognised in the staged list once the composer is holding the file — the claim and the
       // attachment have to be the same thing under the same name, or they are counted twice.
       const id = newAttachmentId()
-      claimed.add(id)
+      claimed.set(id, chatFileWeight(mediaType, file.size))
       readingBy(1)
 
       try {
+        const tooWide = await pixelLimitRefusal(file)
+        if (tooWide !== null) refuse(tooWide)
         const payload: OurAttachment = {
           id,
           name: file.name,
@@ -177,8 +200,8 @@ export function createAttachmentAdapter({ accept, staged, onRefused, onReadingCh
         }
         return attachment
       } catch (err) {
-        // THE READ ITSELF FAILED, so nothing will ever be staged under this id and holding the
-        // slot would refuse a file the citizen is entitled to attach.
+        // THE READ FAILED OR THE PICTURE WAS REFUSED, so nothing will ever be staged under this id
+        // and holding the slot would refuse a file the citizen is entitled to attach.
         claimed.delete(id)
         throw err
       } finally {
@@ -192,7 +215,7 @@ export function createAttachmentAdapter({ accept, staged, onRefused, onReadingCh
       //
       // THE COUNTING IS THE PART THAT IS NOT NOTHING. If this file was still holding a claim — it
       // is, whenever no later `add` has run to notice the composer was holding it — that claim
-      // would go on occupying a slot in the per-message cap and bytes in the text budget until
+      // would go on occupying a slot in the per-message cap and room in the chat total until
       // every read in flight had settled. The id is the one the claim was made under, because the
       // claim and the attachment are minted as the same thing under the same name.
       claimed.delete(attachment.id)

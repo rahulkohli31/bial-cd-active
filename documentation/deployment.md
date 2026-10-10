@@ -44,15 +44,19 @@ flowchart LR
   CR --> APP["Container Apps<br/>deployed application"]
 ```
 
-Three images are built by an operator from tracked Dockerfiles: the control plane, the portal edge,
-and the sandbox image. The fourth thing that runs — a deployed application — is not built from the
+Three images are built from tracked Dockerfiles: the control plane, the portal edge, and the sandbox
+image. `azure-pipelines.yml` releases production from `main` on the build host: it builds them,
+waits for an approval, migrates the database, then moves the portal, the control plane and the
+worker onto the new images. A release that needs the control plane stopped, or a migration applied
+only after the new image serves, is still run by an operator. The fourth thing that runs — a deployed application — is not built from the
 repository at all. It is built from the immutable snapshot captured when its author submitted it
 for approval, which is what makes an approved application reproducible: the thing deployed is the
 thing that was approved, not a rebuild of whatever the workspace looks like now.
 
-The sandbox image is **built and published but never deployed** by an operator. The control plane
-and the worker create sandboxes from it at runtime, and an operator's part is to point both at the
-new image by its immutable tag (see "The pool of ready sandboxes").
+The sandbox image is **built and published but never deployed**. The control plane and the worker
+create sandboxes from it at runtime, and a release points both at the new image by its immutable tag
+(see "The pool of ready sandboxes"). The pipeline names that tag after the content of the sandbox
+folder, so a release that leaves the folder unchanged moves nothing.
 
 ### The build host runs Windows, and this constrains the code
 
@@ -106,6 +110,10 @@ have, so they are the ones to start first.
 - **Permission for the platform's identity to attach that managed identity** to the container apps
   it creates. Without it, container creation fails outright for projects that switch the data on
   while everything else keeps working — a failure that looks like a platform bug and is not.
+- **Permission for the background worker's identity to attach that managed identity too**, granted
+  on that one identity rather than its resource group, before the data-connector pool of ready
+  sandboxes is switched on. Without it that pool stays empty and nothing else changes; see "The
+  pool of ready sandboxes".
 - **Permission for the platform's own identity to read users' basic profiles in the directory.**
   Without it, sharing finds only people who have signed in before, and everything else works. The
   identity caches its tokens, so restart the control plane after the grant.
@@ -121,6 +129,12 @@ have, so they are the ones to start first.
   settings can call it. The pool's endpoint is public and has no private path, so the control
   plane must be able to reach it over HTTPS. `backend/.env.example` names the setting, and it stays
   unset until the acceptance check below has passed.
+
+- **For releases through the pipeline:** an agent on the build host, inside the network; an identity
+  for the pipeline that can build, read and copy images in the registry, read the control plane's
+  settings with their secret values and change them, restart both web apps and read their container
+  logs, and update the worker in its container apps environment; and an approval environment,
+  created before the first run, because a run that finds none creates one with no approval.
 
 **Platform side:** the database server and its administrative access, the cache, the storage
 account, the registry, the container apps environment, and the build host.
@@ -151,9 +165,9 @@ setting: it needs a shared view of liveness and a shared store for the limiters.
 ### The portal and the control plane change together
 
 The edge resolves a preview's address, and who may open it, by asking the control plane, so the two
-are deployed as a pair in one quiet window. The order is the sandbox image first, which accepts both
-address shapes and is safe on its own, then the portal, then the control plane and the worker, back
-to back. A newer edge works against an older control plane, which never refuses a preview pass, so
+are deployed as a pair in one quiet window. The order is the portal, then the control plane and the
+worker, back to back, and the sandbox image moves with the control plane; it accepts both address
+shapes, so it is safe at that point. A newer edge works against an older control plane, which never refuses a preview pass, so
 previews stay open to anyone holding a link until the control plane restarts; an older edge against
 a newer control plane would show every preview as unavailable. Within one sweep of the worker
 starting, previews from before addresses carried an alias are written back and retired, and their
@@ -192,6 +206,8 @@ While the two disagree each fills from its own image, which costs at most a few 
 |---|---|---|
 | `SANDBOX__POOL_DAY_SIZE` | How many ready sandboxes to hold during the day | 0 |
 | `SANDBOX__POOL_NIGHT_SIZE` | How many to hold at night | 0 |
+| `SANDBOX__POOL_CONNECTOR_DAY_SIZE` | How many ready sandboxes made with the data identity to hold during the day, for data-connector projects | 0 |
+| `SANDBOX__POOL_CONNECTOR_NIGHT_SIZE` | How many of those to hold at night | 0 |
 | `SANDBOX__POOL_DAY_START` | When the day begins, India time, as `HH:MM` | 09:00 |
 | `SANDBOX__POOL_DAY_END` | When the day ends, India time, as `HH:MM`; the day runs up to, not including, it | 19:00 |
 | `SANDBOX__POOL_DAY_DAYS` | The days that count as the day, as comma-separated three-letter names | Monday to Friday |
@@ -203,14 +219,35 @@ no ready sandboxes in that period, and every size is 0 by default.
 
 **Capacity comes first.** Each ready sandbox takes addresses and cores in the container apps
 environment on top of the live ones, and an image swap briefly needs twice as many. Confirm the
-environment's limits cover twice the largest size plus the peak number of live sandboxes before
-raising a size.
+environment's limits cover twice the largest plain size and twice the largest connector size,
+together, plus the peak number of live sandboxes before raising a size. There is no combined cap.
 
-**Every size stays at zero until the release notes say otherwise.** A data-connector project reads
-tenant data through an identity that is attached when its container is created, and a ready
-sandbox has no project yet, so it cannot carry it. Until a release lets a connector project's claim
-obtain that identity, a connector project that claimed a ready sandbox would start its app and then
-fail to read its data.
+**A data-connector project takes a ready sandbox only from a pool of its own.** It reads tenant data
+through an identity that is attached when its container is created, so a plain ready sandbox
+cannot serve it. The connector pool's sandboxes are created with that identity and nothing of any
+project's. Filling it needs two things the plain pool does not: the worker's identity may attach
+the data identity (see "What has to exist before a production deployment"), and the worker holds
+the same
+`CONNECTOR_LAKE__*` settings as the control plane. Without either, nothing breaks for a person: each
+connector fill is refused with a warning, the worker raises that pool's below-size alarm, and a
+data-connector project's start creates its own sandbox as it always did. A grant takes effect
+within minutes with no restart; the settings reach the worker when it next starts.
+
+**Switching the connector pool on**, once both processes run the release that brought it:
+
+1. Confirm the worker's grant to attach the data identity, and the control plane's, reading the
+   scope of each as well as that it exists.
+2. Set `CONNECTOR_LAKE__*` on the worker to the control plane's values.
+3. Set both connector sizes on the control plane, then on the worker.
+4. Watch that pool's line in the worker's log until it reaches its size, then prove it with step 9
+   below.
+
+**The control plane's connector sizes are what keep an older release away.** An older release
+refuses to start while either `SANDBOX__POOL_CONNECTOR_*` setting is present, which matters because
+an older control plane would hand a ready sandbox carrying the data identity to any project. So the
+settings go on the control plane, at zero or above, before any worker size rises above zero; a
+drain sets them to zero rather than removing them; and they come off only as the last step of a
+rollback, in `runbooks/reconcile-and-reclamation.md`.
 
 **The release that introduced this is deployed in one order.** It changed how every workspace is
 named and found, and an older backend or worker meeting the newer one's records loses citizens'
@@ -227,6 +264,12 @@ owed; the procedure is in `runbooks/reconcile-and-reclamation.md`.
 ## Proving a deployment worked
 
 Work outward, and do not stop at the first green result.
+
+The release pipeline proves less than this list. It confirms the migration reached the head, that
+each web app started on the new image and answers, and that the worker runs one healthy revision of
+it. Everything from check 3 on is still done by a person afterwards. When a run fails, its log
+names the step that stopped it; the rollback commands are printed near its start, and after a
+failed attempt the first attempt's are the ones that restore the old images.
 
 **1. The control plane is up and can reach its dependencies.** The health endpoint answers `ok`
 when the database and the cache both respond, and `unavailable` with a 503 when either does not.
@@ -279,11 +322,15 @@ Attaching to a workspace that is already running writes none. A kind that shows 
 that never opens its record, which no other check here would find.
 
 **9. The pool, once a size is above zero.** Within a few minutes the ready sandboxes number the
-configured size, and the worker's per-minute pass logs each tick. A start made then appears in the
-report as having claimed a ready sandbox, its create stage shrunk to the time of the claim; a start
-made with none ready appears with the reason it created one. Through a working day that includes a
-sandbox image deploy, the below-size alarm is quiet, or the worker's log explains each one by a
-refused create, a new sandbox that never answered, or a create a restart interrupted.
+configured size, and the worker's per-minute pass logs one line for each pool each tick. A start
+made then appears in the report as having claimed a ready sandbox, its create stage shrunk to the
+time of the claim; a start made with none ready in its own pool appears with the reason it created
+one. Once the connector pool is on, open one data-connector project: its start appears as having
+claimed, and its application still reads the data a minute later, once the claim has rewritten the
+sandbox's tags. If it cannot, set the connector sizes back to zero.
+Through a working day that includes a sandbox image deploy, the below-size alarm is quiet, or the
+worker's log explains each one by a refused create, a new sandbox that never answered, or a create a
+restart interrupted.
 
 **10. BIAL Chat's analysis sessions cannot reach anything, before they are switched on.** As an
 identity holding the session-executor role, run code in a session of the pool that tries a public

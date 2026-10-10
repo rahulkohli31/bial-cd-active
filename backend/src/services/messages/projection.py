@@ -40,6 +40,7 @@ from src.core.prompt_blocks import (
     ANALYSIS_RUN_TOOL,
     APPLY_SCHEMA_CHANGE_TOOL,
     ATTACHMENT_READ_TOOL,
+    FLIGHT_DATA_ADOPT_PATH,
 )
 from src.core.redaction import redact_secrets
 from src.db.models.attachment import Attachment
@@ -260,6 +261,8 @@ class AttachmentRefItem(CamelModel):
     kind: str = ""
     name: str = ""
     media_type: str = ""
+    # Bytes as stored; zero when the row is gone.
+    size: int = 0
 
 
 class UserTextItem(CamelModel):
@@ -493,7 +496,11 @@ def _classify_command(argv: list[str]) -> tuple[str, bool]:
     head = argv[0]
     rest = argv[1:]
     joined = " ".join(argv)
-    if head in _PACKAGE_MANAGERS and any(sub in _INSTALL_SUBCOMMANDS for sub in rest[:2]):
+    # The flight-data install command runs `npm install` itself, however it is invoked: its own
+    # npm limit is sized to end inside the long bound.
+    if (
+        head in _PACKAGE_MANAGERS and any(sub in _INSTALL_SUBCOMMANDS for sub in rest[:2])
+    ) or FLIGHT_DATA_ADOPT_PATH in joined:
         return (_LBL_INSTALL, False)
     if "db:migrate" in joined or "db-migrate" in joined or "drizzle-kit migrate" in joined:
         return (_LBL_DATA_READY, False)
@@ -1479,7 +1486,9 @@ async def project_conversation(
 
     found = (
         await db.execute(
-            sa.select(Attachment.attachment_id, Attachment.name, Attachment.media_type).where(
+            sa.select(
+                Attachment.attachment_id, Attachment.name, Attachment.media_type, Attachment.size
+            ).where(
                 Attachment.user_id == user_id,
                 Attachment.attachment_id.in_(wanted),
             )
@@ -1488,7 +1497,7 @@ async def project_conversation(
     # OWNER-SCOPED, like every other read on this platform (ADR-0004). An attachment id is a
     # client-supplied string, so without the `user_id` predicate one citizen's transcript could
     # name another's file simply by carrying their id.
-    by_id = {row.attachment_id: (row.name, row.media_type) for row in found}
+    by_id = {row.attachment_id: (row.name, row.media_type, row.size) for row in found}
 
     for item in items:
         if not isinstance(item, UserTextItem):
@@ -1497,6 +1506,6 @@ async def project_conversation(
             known = by_id.get(ref.attachment_id)
             if known is None:
                 continue
-            ref.name, ref.media_type = known
+            ref.name, ref.media_type, ref.size = known
             ref.kind = chip_kind_for(ref.media_type)
     return items

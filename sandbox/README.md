@@ -119,12 +119,16 @@ a preview's alias into a `pub-` published container.
 A pool member is created with `BIAL_POOL_MEMBER=1`, which no child sees, and without the six
 per-project names: `BIAL_APP_ID`, the two Blob values, the database URL and the two `BIAL_DICE_*`.
 `POST /_sup/configure` with `{"env": {...}}` delivers those six once; until it does,
-`/_sup/health` reports `"configured": false` and `/_sup/dev/start` answers 412.
+`/_sup/health` reports `"configured": false` and `/_sup/dev/start` answers 412. A member of the
+connector pool is the one exception to "nothing of any project's" at birth: it carries the lake's
+managed identity, and so Azure's `IDENTITY_*` pair, from boot, and receives the two `BIAL_DICE_*`
+values on configure. Only a start whose project would be given the identity anyway claims one, and
+the control plane checks the identity Azure attached before it configures it.
 
 **The last four are conditional, and the condition is a security boundary.** The two `BIAL_DICE_*`
-values, the managed identity itself, and therefore Azure's `IDENTITY_*` pair are attached only
-when a lake is configured **and** the connector is switched on for this project **and** its
-owner's access has been approved by an administrator. Gating the coordinates alone would be
+values, the managed identity itself, and therefore Azure's `IDENTITY_*` pair reach a project's
+code only when a lake is configured **and** the connector is switched on for this project **and**
+its owner's access has been approved by an administrator. Gating the coordinates alone would be
 theatre: the identity is what mints the token, and a container that has one can read the whole
 flight container whether or not it was told where to look. `IDENTITY_ENDPOINT`/`IDENTITY_HEADER`
 are Azure's, injected the moment an identity is attached — they are on the allowlist because the
@@ -207,8 +211,9 @@ curl -s -XPOST localhost:8080/_sup/exec -H "Authorization: Bearer $TOK" \
 
 - `*.sh`, `Dockerfile*`, `Caddyfile`, and the template are pinned to **LF** via the root `.gitattributes`
   (`sandbox/** text eol=lf`), so a Windows checkout does not ship a `#!/bin/sh\r` shebang.
-- `Dockerfile.sandbox` runs `sed -i 's/\r$//'` on `entrypoint.sh`, `Caddyfile` and
-  `read_attachment.py` **before** `chmod`, as a belt-and-braces guard for the Windows build host.
+- `Dockerfile.sandbox` runs `sed -i 's/\r$//'` on `entrypoint.sh`, `Caddyfile`,
+  `read_attachment.py` and `adopt-flight-data.mjs` **before** `chmod`, as a belt-and-braces guard
+  for the Windows build host.
 - **No file named `.gitignore` reaches the image.** `az acr build` drops every one from the build
   context, at any depth. The workspace's ignore rules live in `platform-owned.gitignore` instead.
 

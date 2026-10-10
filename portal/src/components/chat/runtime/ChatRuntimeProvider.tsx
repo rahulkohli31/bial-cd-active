@@ -41,7 +41,7 @@ export default function ChatRuntimeProvider({
   attachmentLanes = BOTH_ATTACHMENT_LANES,
   children,
 }: ChatRuntimeProviderProps) {
-  const bound = useBoundAttachmentAdapter(attachmentLanes)
+  const bound = useBoundAttachmentAdapter(attachmentLanes, messages)
   const runtime = useChatRuntime({
     messages,
     isRunning,

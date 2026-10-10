@@ -1,13 +1,14 @@
 """What a container is told about the lake, and whether it is given the identity to read it.
 
-TWO VALUES AND ONE GRANT, AND THEY MOVE TOGETHER. The two values are labels — a URL and a client
-id — and on their own they grant nothing. The grant is the user-assigned managed identity attached
-to the container app: a container that has one can list and download the whole flight container
-whether or not it was ever told where to look. So gating the coordinates while attaching the
-identity unconditionally would be theatre, and it would hand every citizen's build on the platform
-a credential to BIAL's flight data. **The same predicate answers both**, and this module is where
-that is made structural rather than remembered: `identity_resource_id_for_env` derives the grant
-from the presence of the coordinates, so a caller cannot attach one without the other.
+TWO VALUES AND ONE GRANT. The two values are labels — a URL and a client id — and on their own
+they grant nothing. The grant is the user-assigned managed identity attached to the container app:
+a container that has one can list and download the whole flight container whether or not it was
+ever told where to look. So gating the coordinates while attaching the identity unconditionally
+would be theatre, and it would hand every citizen's build on the platform a credential to BIAL's
+flight data. **A start that hands a container the coordinates hands it the identity**, and this
+module is where that is made structural rather than remembered: `identity_resource_id_for_env`
+derives the grant from the presence of the coordinates, so a start cannot attach one without the
+other.
 
 THE NAMES ARE GENERATED FROM THE CONNECTOR'S KEY. `backend/src/` may not contain the connector's
 name (enforced by a word-boundary grep), so the container's URL variable is built here by
@@ -102,9 +103,8 @@ def identity_resource_id_for_env(app_env: dict[str, str]) -> str | None:
     access decision — a lake configured, the connector switched on for this project — is made
     ONCE, by `build_connector_env`, and its answer is the presence or absence of these names.
     Re-deriving it here would be a second place the platform decides who may read BIAL's flight
-    data, and two such places eventually disagree. Reading it back out of the env
-    dict makes "identity attached" and "coordinates present" the same fact rather than two facts
-    that have to be kept in step.
+    data, and two such places eventually disagree. Reading it back out of the env dict means a
+    start that carries the coordinates carries the identity, and one that does not, does not.
 
     Returns `None` for every container that was not given coordinates, which is every container on
     a deployment with no lake and every project with the connector off.
@@ -117,3 +117,12 @@ def identity_resource_id_for_env(app_env: dict[str, str]) -> str | None:
         if app_env.get(url_name):
             return lake.identity_resource_id
     return None
+
+
+def lake_identity_resource_id() -> str | None:
+    """The ARM resource id of the configured lake's identity, or `None` with no lake: what a
+    container made ahead of time for the connector pool is created with. A connector pool container
+    is the only kind that holds the identity without the coordinates, and only a connector
+    project's start may claim one."""
+    lake = _configured_lake()
+    return None if lake is None else lake.identity_resource_id

@@ -46,8 +46,9 @@ Keeping the two apart means the interface can be rebuilt and redeployed without 
 and that the API's container carries no toolchain it does not use at runtime.
 
 The build sandbox is not deployed by an operator. The control plane creates one — or takes a ready
-one made ahead of time — when someone starts work and deletes it when they are done; an operator
-only ever builds and publishes the image it is created from.
+one made ahead of time — when someone starts work and deletes it when they are done; a release only
+ever builds and publishes the image it is created from, and points the control plane and the worker
+at it.
 
 ```mermaid
 flowchart TD
@@ -131,11 +132,13 @@ next. The shape of that follows from what a sandbox is.
 
 **A ready container knows nothing about any project.** Generated code is untrusted, so a container
 made before anyone has asked for it holds nothing that could be turned against anyone: no
-project's identity, no storage key, no database address, no data identity. Those arrive after a
-start claims the container, over the authenticated channel the control plane already uses to drive
-every sandbox, once, into the supervisor's own environment — where the allowlist and the redaction
-that already guard every sandbox cover them with no second code path. Until they have arrived the
-container refuses to start the application.
+project's identity, no storage key, no database address. Those arrive after a start claims the
+container, over the authenticated channel the control plane already uses to drive every sandbox,
+once, into the supervisor's own environment — where the allowlist and the redaction that already
+guard every sandbox cover them with no second code path. Until they have arrived the container
+refuses to start the application. The one thing a container cannot be given later is a data
+identity, which the cloud provider attaches only at creation, so data-connector projects have a
+pool of their own, made with the one identity they all share and claimed by nothing else.
 
 **A ready container is used once.** Code has run in it. When its project leaves it is saved and
 deleted like any other sandbox and never returned to the pool, because reuse could carry one
@@ -143,7 +146,10 @@ project's files and processes into the next.
 
 **Every start goes through the one place that creates a container.** A claim there covers every
 kind of start, and when nothing ready can be claimed that same place creates a container the old
-way. The pool can make a start faster; it cannot make one fail.
+way. It decides once which pool a start may claim from, and before it hands a claimed container
+anything it checks the identity the cloud provider actually attached, not what the ledger says: a
+container carrying the wrong one is deleted and the start creates its own. The pool can make a
+start faster; it cannot make one fail.
 
 **A container's name is not its app's name.** A container made ahead has no app to be named
 after, so every lookup reads a record of which app a container serves instead of working the name
@@ -187,7 +193,8 @@ twice, and the coordination store, which can lose what it holds, is the wrong pl
 once, because nobody should wait for a periodic pass. The worker's periodic pass restores the
 count after everything else — a crash, a refused create, the end of the working day, a new sandbox
 image — and replaces ready containers on an old image with new ones before it removes the old.
-It acts only on containers the ledger holds. A container the ledger does not hold may be somebody's
+It keeps each pool on its own, so one that cannot be filled never stops the other filling. It acts
+only on containers the ledger holds. A container the ledger does not hold may be somebody's
 workspace waiting to be saved, and destroying on a guess is what the rules below forbid.
 
 **Pool work leaves room for people.** Pool creates share each process's limited capacity to talk

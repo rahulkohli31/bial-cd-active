@@ -4,6 +4,121 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.5] - 2026-10-10
+
+Building an app spends about a third fewer tokens for the same work, so a day's allowance goes
+further and builds finish sooner. Nothing is taken out of a chat's history. Most of the saving
+comes from the assistant thinking at a lower effort level while it builds. It is also asked to
+send steps that do not depend on each other in one reply, and to leave to the platform the checks
+the platform already runs. On the test account the same four builds cost 36% less (39% before
+correcting for one run that found the cache already warm) and finished in about two-thirds of the
+time.
+
+A flight-data app can open from a pool of ready workspaces of its own, made with the identity that
+reads BIAL's flight data, so it opens as quickly as any other app. The pool ships switched off. It
+fills only once its sizes are set and the worker may attach that identity; until then a flight-data
+app opens in a workspace made for it, as it does today. The pool saves the wait for Azure to make
+the workspace; installing a larger app's libraries still takes as long as on the plain pool. On the
+test account a small flight-data app opened from the pool in 8 seconds and read its data.
+
+> **Before deploying:** roll out the new sandbox image before the new backend, and set
+> `SANDBOX__IMAGE_REF` to its tag in the backend and the worker, as on every sandbox deploy. The
+> backend tells a flight-data build to run an install command that only the new image carries. On
+> an old image, including a workspace started before the image changed, the build reads the older
+> reference file and writes the data module by hand, so it keeps none of the flight-data saving.
+>
+> Run the migrations before the new backend and worker start: this release adds one, and the
+> worker reads it every minute. Leave the `SANDBOX__POOL_CONNECTOR_*` sizes unset until both run
+> this release, since an older release refuses to start while they are set.
+
+### Added
+
+- **A second pool of ready workspaces, for flight-data projects.** It has day and night sizes of
+  its own, `SANDBOX__POOL_CONNECTOR_DAY_SIZE` and `SANDBOX__POOL_CONNECTOR_NIGHT_SIZE`, which are 0
+  by default and are set to the same values on the backend and the worker. Each workspace in it is
+  made with the data identity and nothing of any project's, and only a flight-data project's start
+  takes one. A shared view of a flight-data app still opens from the plain pool, without the data.
+- **A workspace from either pool is checked against Azure before a project gets it.** It must carry
+  exactly the identity its pool requires: none for the plain pool, the data identity for the other.
+  One that does not is deleted before the project's settings reach it, the alarm
+  `sandbox_pool_claim_wrong_identity` is raised, and the project gets a workspace of its own.
+- **To fill the flight-data pool, the worker needs the right to attach the data identity and the
+  same `CONNECTOR_LAKE__*` settings as the backend.** Without either, only that pool stays empty and
+  raises its own below-size alarm; the plain pool and every app's start are unaffected.
+
+### Changed
+
+- **The start report says which pool a start could have used.** A flight-data start whose pool is
+  switched off is recorded as `connector`, and one whose pool had nothing ready as `no_ready`.
+  Before this release a flight-data start never took a ready workspace and was recorded as
+  `connector`, or as `size_zero` while the pool was off, so a report that spans this release mixes
+  the two meanings.
+- **Build chats think at medium effort, as Plan chats already do.** BIAL Chat stays at low.
+- **The assistant is asked to send steps that do not depend on each other in one reply,** in Plan,
+  Build and BIAL Chat. In Build, steps that change files or run commands now run one at a time, in
+  the order sent, so two edits to one file both land. Reads of attached files run one at a time in
+  every chat.
+- **A build leaves its checks to the platform.** The platform type-checks the app, reads its logs
+  and opens its home page after every turn that changes it. The build instructions now say so, and
+  tell the assistant not to fetch the app's own pages.
+- **Attaching or removing a file mid-chat no longer re-sends the whole chat at full price.** The
+  file tools and their rules are part of every chat from its first message, and the files attached
+  now are named in a hidden note. In the test, the message carrying the file cost 44% less in a
+  Plan chat and 63% less in BIAL Chat. In return, every BIAL Chat's first message costs a little
+  more, also where file analysis is switched off; later messages read the rules at the cached
+  price. A BIAL Chat with no file attached starts no analysis session.
+- **A flight-data build gets its data module from one command.** It installs the four packages at
+  tested versions and writes `lib/flight-data.ts`, which reads only the columns it needs, one block
+  of rows at a time. The assistant is given the module's functions and told not to open the file,
+  except to read one of them. If an app's packages need an npm flag, the
+  assistant installs the four itself and runs the command again.
+
+### Fixed
+
+- **A BIAL Chat holding a file gives a formula or a macro when asked.** Its rule against showing
+  code now covers only the Python it ran on a file.
+
+## [1.9.4] - 2026-10-09
+
+A flight-data app opens with its data again while the pool of ready workspaces is on. A ready
+workspace is made before anyone asks for it, so it cannot carry the identity that reads BIAL's
+flight data. A flight-data app that took one opened without data access and said "The flight data
+could not be read". A flight-data project now always gets a workspace of its own, made with that
+identity; every other app still opens from the pool.
+
+A picture or PDF the model cannot take no longer breaks a chat for good. The model refuses a
+picture more than 8,000 pixels wide or tall, and a reply whose files add up to more than 32 MB.
+Every later reply sends the chat's files again, so one such file ended every reply in that chat
+with "The assistant hit a problem", and Retry could not help. The file picker now refuses those
+files as they are attached, and a chat that already holds them says to start a new chat.
+
+> **Before deploying:** run the migrations before the new backend starts. This release adds one,
+> for the new start reason below.
+
+### Fixed
+
+- **A flight-data project never takes a ready workspace from the pool.** Its start creates its own
+  workspace with the data identity, so it opens as fast as it did with the pool off, and the pool
+  keeps serving every other project. The superadmin report of sandbox starts records these starts
+  with a new reason, `connector`.
+- **A picture more than 8,000 pixels on either side is refused when it is attached,** by name and
+  size: "is 9,000 × 300 pixels. Resize it to 8,000 pixels or less on each side."
+- **A chat's pictures and PDFs can add up to 20 MB.** A file that would take the chat past it is
+  refused when it is attached, and again when the message is sent: "won't fit in this chat —
+  pictures and PDFs can add up to 20 MB. Attach a smaller file or start a new chat." The count
+  includes files already in the chat, also after the chat is reopened. Word, Excel, PowerPoint
+  and CSV files are read in the analysis session, never sent to the model, and do not count. A PDF
+  is still 20 MB at most, and a picture 7 MB.
+- **A chat whose files are already too large says so:** "The files in this chat are too large.
+  Start a new chat and attach smaller files." It used to end every reply with the general sentence.
+- **BIAL Chat offers no Retry that cannot work.** After that ending, "This chat is too long" or
+  "This PDF has too many pages", the reply shows the sentence and no Retry, also when the chat is
+  reopened; it used to show "That reply did not finish." Retry after any other failure sends the
+  message's words alone, because the server already holds its files.
+- **Shorter sentences for a chat that is too long and a PDF with too many pages:** "This chat is
+  too long. Start a new chat to keep going — nothing is lost." and "This PDF has too many pages.
+  Start a new chat and attach a shorter one."
+
 ## [1.9.3] - 2026-10-09
 
 A file that cannot be opened is now refused in words that say what is wrong and what to do about

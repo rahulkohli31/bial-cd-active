@@ -28,6 +28,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _BACKEND = Path(__file__).resolve().parents[3]
 
 
@@ -41,9 +43,10 @@ def _import_in_a_fresh_interpreter(module: str) -> subprocess.CompletedProcess[s
     )
 
 
-def test_the_settings_module_imports_on_its_own() -> None:
-    """The exact import the process performs at startup, before anything else has run."""
-    result = _import_in_a_fresh_interpreter("src.settings.api")
+@pytest.mark.parametrize("module", ["src.settings.api", "src.settings.worker"])
+def test_the_settings_module_imports_on_its_own(module: str) -> None:
+    """The exact import each process performs at startup, before anything else has run."""
+    result = _import_in_a_fresh_interpreter(module)
 
     assert result.returncode == 0, (
         "importing settings closed an import cycle — most likely a new re-export in "

@@ -391,6 +391,23 @@ async def empty_sandbox_pool():
     await forget_every_pool_member()
 
 
+@pytest.fixture
+def lake_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lake configured, as production has one, whose identity is `LAKE_IDENTITY`."""
+    from src.services.lake.config import LakeConfig
+    from tests.fakes import LAKE_IDENTITY
+
+    monkeypatch.setattr(
+        settings,
+        "connector_lake",
+        LakeConfig(
+            url="https://alakeaccount.blob.core.windows.net/acontainer/AOS/reports/",
+            identity_client_id="52b74947-0621-46e2-a523-a6b466f47c33",
+            identity_resource_id=LAKE_IDENTITY,
+        ),
+    )
+
+
 async def forget_every_worker_pass() -> None:
     """Empty `worker_passes`, for the same reason `harness_counts` is emptied: a pass record is a
     historical fact written in its own committed session, so no per-test rollback reaches it.

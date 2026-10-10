@@ -4,9 +4,10 @@ The destroy pass, its staging marker and its confidence tiers are withdrawn by A
 identity tags, the durable-copy gate, the four-step destroy ordering, the liveness lease and the
 absolute ceiling this record describes remain in force.
 
-ADR-0032 amends two statements here: a container made ahead of time for the warm pool is created
+ADR-0032 amends three statements here: a container made ahead of time for the warm pool is created
 with only its kind, control-plane and pool tags, and owner, app and creation time are written when
-it is claimed; and the worker's identity now also creates containers and writes tags.
+it is claimed; the worker's identity now also creates containers and writes tags; and it may assign
+the lake's identity to the connector pool's containers, a right granted on that one identity alone.
 
 ## Context
 

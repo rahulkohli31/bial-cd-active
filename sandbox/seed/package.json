@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Verification workspace for the golden template's flight-data reference file. Nothing here ships and Dockerfile.sandbox never copies it: flight-data.ts is typechecked under the template's own strict settings and unit-tested HERE, because the template pre-installs none of the four packages it imports, then rendered into template/lib/flight-data.reference.ts as line comments by generate-reference.mjs, whose docblock is this workspace's documentation.",
+  "description": "Verification workspace for the golden template's flight-data reference file. Nothing here ships and Dockerfile.sandbox never copies it: flight-data.ts is typechecked under the template's own strict settings and unit-tested HERE, because the template pre-installs none of the four packages it imports, then rendered by generate-reference.mjs, whose docblock is this workspace's documentation, into template/lib/flight-data.reference.ts as line comments and into scripts/adopt-flight-data.mjs, the image's install command.",
   "engines": {
     "node": ">=22"
   },
@@ -20,6 +20,7 @@
   },
   "devDependencies": {
     "@types/node": "24.13.3",
+    "hyparquet-writer": "0.16.10",
     "typescript": "5.9.3",
     "vitest": "5.0.0"
   }

@@ -16,10 +16,10 @@ from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from src.api.v1.conversations.router import _clean_title
-from src.api.v1.conversations.turns import derive_title
+from src.api.v1.conversations.turns import FILE_NOTE_KIND, derive_title
 from src.db.models.conversation import ChatKind, Conversation
-from src.db.models.message import Message
-from src.services.messages.store import SeqContentionError
+from src.db.models.message import Message, MessageEntryKind
+from src.services.messages.store import SeqContentionError, append_batch
 from tests.api.v1.conversations.conftest import _headers
 from tests.factories import ConversationFactory, UserFactory
 
@@ -52,7 +52,14 @@ def _streaming_text(*chunks: str) -> FunctionModel:
     return FunctionModel(stream_function=_stream)
 
 
-async def _send(client, user, conv, text: str, attachment_texts: list[str] | None = None):
+async def _send(
+    client,
+    user,
+    conv,
+    text: str,
+    attachment_texts: list[str] | None = None,
+    attachment_ids: list[str] | None = None,
+):
     return await client.post(
         f"/v1/conversations/{conv.id}/turns",
         headers=_headers(user),
@@ -60,7 +67,7 @@ async def _send(client, user, conv, text: str, attachment_texts: list[str] | Non
             "message": {
                 "text": text,
                 "attachmentTexts": attachment_texts or [],
-                "attachmentIds": [],
+                "attachmentIds": attachment_ids or [],
             }
         },
     )
@@ -218,6 +225,54 @@ async def test_a_send_refused_at_the_append_leaves_the_chat_unnamed(
     # name survives this rollback.
     await db_session.rollback()
     assert await _title_of(db_session, conversation_id) is None
+
+
+@pytest.mark.route_rollback
+async def test_a_send_refused_after_its_file_note_leaves_the_chat_unnamed_and_the_note_standing(
+    client, db_session, set_chat_model, monkeypatch, shared_storage
+) -> None:
+    """The file note commits on its own, ahead of the naming UPDATE, so a message refused at its
+    append must still take the name with it. The note stays, and it is still true."""
+    user = await UserFactory.create(db_session)
+    conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.PLAN)
+    await db_session.commit()
+    conversation_id = conv.id
+    uploaded = await client.post(
+        "/v1/attachments",
+        headers=_headers(user),
+        json={
+            "conversationId": str(conversation_id),
+            "attachmentId": "att_csv",
+            "name": "visitors.csv",
+            "mediaType": "text/csv",
+            "base64": "YSxiCjEsMgo=",
+        },
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    set_chat_model(_streaming_text("ok"))
+
+    async def _message_contended(*args, **kwargs):
+        if kwargs["entry_kind"] is MessageEntryKind.TURN:
+            raise SeqContentionError("planted")
+        return await append_batch(*args, **kwargs)
+
+    monkeypatch.setattr("src.api.v1.conversations.turns.append_batch", _message_contended)
+
+    resp = await _send(client, user, conv, "words that never landed", attachment_ids=["att_csv"])
+    assert resp.status_code == 409, resp.text
+
+    await db_session.rollback()
+    assert await _title_of(db_session, conversation_id) is None
+    notes = (
+        await db_session.scalars(
+            sa.select(Message.payload).where(
+                Message.conversation_id == conversation_id,
+                Message.meta["kind"].astext == FILE_NOTE_KIND,
+            )
+        )
+    ).all()
+    assert len(notes) == 1
+    assert "visitors.csv" in notes[0][0]["parts"][0]["content"]
 
 
 async def test_line_breaks_and_control_characters_never_reach_the_name(

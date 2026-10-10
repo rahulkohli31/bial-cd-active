@@ -34,7 +34,7 @@ import structlog
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
-from src.core.prompt_blocks import ATTACHMENT_READ_TOOL
+from src.core.prompt_blocks import ATTACHMENT_READ_TOOL, FILE_NOTE_HEADING
 from src.core.redaction import scrub_untrusted
 from src.services.agent.read_tools import (
     ATTACHMENTS_PREFIX,
@@ -154,22 +154,19 @@ class AttachmentReader:
 
 def attachment_toolset[DepsT](
     reader_of: Callable[[RunContext[DepsT]], ReadsAttachments],
-    *,
-    sequential: bool = False,
 ) -> FunctionToolset[DepsT]:
     """The attachment capability, over whatever deps the caller resolves a reader from.
 
     A factory for the same reason `read_only_toolset` is one: WHERE the file is read is a fact
-    about the run, not about the ability. `sequential` makes each read run alone.
+    about the run, not about the ability. Each read runs alone: a reply may send several, and
+    each is a reader process sharing memory with whatever else runs where the file is.
 
     The inner tool annotates `RunContext[Any]`, matching `read_only_toolset`'s own note and for
     the same reason: pydantic-ai resolves tool annotations with `get_type_hints` at registration,
     and a PEP-695 type param of the ENCLOSING function is not in scope there under deferred
     annotations. The factory signature carries the real typing.
     """
-    toolset: FunctionToolset[DepsT] = FunctionToolset[DepsT](
-        id="attachments", sequential=sequential
-    )
+    toolset: FunctionToolset[DepsT] = FunctionToolset[DepsT](id="attachments", sequential=True)
 
     # THE NAME IS THE CONSTANT, not the spelling of this function, because the transcript's
     # label mapping matches on it from a module that cannot import this one.
@@ -206,8 +203,8 @@ def attachment_toolset[DepsT](
             # follows.
             raise ModelRetry(
                 f"`{file}` is not an attached file. Attachments are named with the "
-                f"`{ATTACHMENTS_PREFIX}` prefix you were given in this turn — pass that path. "
-                "This tool reads attachments only."
+                f"`{ATTACHMENTS_PREFIX}` prefix, as the latest {FILE_NOTE_HEADING} note lists "
+                "them — pass that path. This tool reads attachments only."
             )
         reader = reader_of(ctx)
         try:

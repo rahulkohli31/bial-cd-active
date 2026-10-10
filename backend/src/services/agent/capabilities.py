@@ -75,8 +75,8 @@ class TurnScopedSystemMessage(AbstractCapability[ChatDeps]):
     holds the reading the trigger reads. A sentence on every request inside a turn re-breaks the
     prefix at each step, which is worse than the defect it addresses.
 
-    PLAN AND BIAL CHAT ONLY. A Build turn is read by the verify after any run that wrote, so the
-    Build run is never armed with this."""
+    PLAN ONLY. BIAL Chat has no app to read, and a Build turn is read by the verify after any
+    run that wrote, so neither run is armed with this."""
 
     should_send: Callable[[], bool]
     on_sent: Callable[[], None]

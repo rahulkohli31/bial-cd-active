@@ -1,14 +1,11 @@
-"""Putting an attached file where code can read it, and telling the agent it is there.
+"""Putting an attached file where code can read it, and the listing that names it to the agent.
 
-R20/R20a AND R11a ARE ONE THING, WHICH IS WHY THEY ARE ONE MODULE. The platform places the file
-in the container and, in the same breath, names it to the agent. Either half alone is worse than
-neither: a file nobody was told about is invisible, and a path nobody wrote to is a hallucination
-the model then explains at length.
+THE TWO HALVES BELONG TOGETHER. A file nobody was told about is invisible, and a path nobody wrote
+to is a hallucination the model then explains at length.
 
 THE FAILURE THIS EXISTS TO PREVENT is not a crash. An agent asked about a spreadsheet it cannot
 see does not stop — it writes its own parser, or answers from the file's NAME, and both read as
-success. So the note is unconditional, it is exact about the path and the invocation, and it says
-plainly that the reader is the one to use.
+success. So the listing is exact about every path.
 
 WHY EVERY CODE-LANE FILE IN THE CONVERSATION IS PLACED ON EVERY TURN, rather than only the ones
 attached to this message. `/workspace/attachments` is a sibling of the app tree specifically so no
@@ -96,13 +93,11 @@ class CodeLaneAttachment:
 def one_line_name(display_name: str) -> str:
     """A citizen's file name, flattened to a single line for a prompt that quotes it.
 
-    THE LISTING RIDES THE RUN'S INSTRUCTIONS, which is the operator tier — the same channel the
-    standing guardrails sit in, and the one `agent/capabilities.py` states nothing untrusted may
-    ride. A file name is citizen-controlled text, so a name carrying newlines can close the
-    listing and open whatever it likes at that authority. Collapsing every run of whitespace and
-    control characters to one space removes the shape that makes that possible; the same 96-char
-    bound `safe_file_name` uses removes the other one, a name long enough to push the guardrails
-    out of the window.
+    THE LISTING RIDES A NOTE THE PLATFORM WRITES INTO THE CONVERSATION. A file name is
+    citizen-controlled text, so a name carrying newlines could close the listing and open lines
+    of its own that read as the platform's. Collapsing every run of whitespace and control
+    characters to one space removes the shape that makes that possible; the same 96-char bound
+    `safe_file_name` uses removes the other one, a name long enough to crowd out the list.
 
     The name is NOT otherwise rewritten: it is shown to the model so it can talk to the citizen
     about the file the citizen named, and mangling the spelling would defeat that."""
@@ -261,7 +256,7 @@ async def _ids_already_sent(
 
 @dataclass(frozen=True, slots=True)
 class AttachmentDelivery:
-    """This conversation's code-lane files, and the two things the platform owes them.
+    """This conversation's code-lane files, and the placing of them in the container.
 
     Built by the send route, which holds the database session and the object store; used by the
     turn engine, which holds the container. It carries the storage HANDLE rather than the bytes,
@@ -373,31 +368,33 @@ class AttachmentDelivery:
                 sizes[name] = int(size)
         return sizes
 
-    def listing(self) -> str:
-        """WHICH files this conversation holds and where each one is — the per-conversation half
-        of what an agent must be told.
 
-        NAMES THE FILE AND BOTH ITS PATHS. Without the path the agent looks in the app tree and
-        concludes the file was never uploaded; the rules about HOW to read one are standing text
-        and live in `agent/mode_prompts.ATTACHMENT_RULES`, emitted beside this.
+def workspace_listing(files: Sequence[CodeLaneAttachment]) -> str:
+    """WHICH files this conversation holds and where each one is — the per-conversation half
+    of what an agent must be told.
 
-        ★ EVERY FILE IS GIVEN TWO ADDRESSES, AND THE RULES' RUN LINE USES THE ON-DISK ONE.
-        `.attachments/<name>` is resolvable only by a TOOL — the read tools and
-        `read_attachment` translate it. Build has no `read_attachment`: it runs, and may edit,
-        the reader through `run_command`, and a command executes inside the app folder, where
-        `.attachments/` does not exist — so that address alone answers `missing` for a file
-        that is there. This module may not branch on the chat's kind, so rather than one
-        address per kind it gives both and says which is for what — correct on every arm, with
-        nothing to keep in step.
-        """
-        lines = [
-            "The person you are talking to attached these files to this conversation. They are "
-            "already in your workspace — you do not need to ask for them or create them.",
-            "",
-        ]
-        lines += [
-            f"- {one_line_name(file.display_name)} — {file.model_path} "
-            f"(on disk: {file.container_path}; {file.size:,} bytes)"
-            for file in self.files
-        ]
-        return "\n".join(lines)
+    NAMES THE FILE AND BOTH ITS PATHS. Without the path the agent looks in the app tree and
+    concludes the file was never uploaded. It rides the conversation's file note
+    (`agent/mode_prompts.file_note`); the rules about HOW to read one are standing text in
+    `agent/mode_prompts.ATTACHMENT_RULES`.
+
+    ★ EVERY FILE IS GIVEN TWO ADDRESSES, AND THE RULES' RUN LINE USES THE ON-DISK ONE.
+    `.attachments/<name>` is resolvable only by a TOOL — the read tools and
+    `read_attachment` translate it. Build has no `read_attachment`: it runs, and may edit,
+    the reader through `run_command`, and a command executes inside the app folder, where
+    `.attachments/` does not exist — so that address alone answers `missing` for a file
+    that is there. This module may not branch on the chat's kind, so rather than one
+    address per kind it gives both and says which is for what — correct on every arm, with
+    nothing to keep in step.
+    """
+    lines = [
+        "The person you are talking to attached these files to this conversation. They are "
+        "already in your workspace — you do not need to ask for them or create them.",
+        "",
+    ]
+    lines += [
+        f"- {one_line_name(file.display_name)} — {file.model_path} "
+        f"(on disk: {file.container_path}; {file.size:,} bytes)"
+        for file in files
+    ]
+    return "\n".join(lines)

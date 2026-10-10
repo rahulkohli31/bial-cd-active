@@ -474,12 +474,17 @@ describe('the copy table', () => {
     [
       'context_hard_limit_exceeded',
       'failed',
-      'This chat has got too long to carry on. Start a new chat to keep going — your app and everything you have built stays exactly as it is.',
+      'This chat is too long. Start a new chat to keep going — nothing is lost.',
     ],
     [
       'DOCUMENT_TOO_MANY_PAGES',
       'failed',
-      'That PDF has too many pages for the assistant to read, and it stays in this chat, so every message here will hit the same limit. Start a new chat and attach a shorter document — or split this one and attach just the part you need.',
+      'This PDF has too many pages. Start a new chat and attach a shorter one.',
+    ],
+    [
+      'attachment_too_large',
+      'failed',
+      'The files in this chat are too large. Start a new chat and attach smaller files.',
     ],
   ]
 
