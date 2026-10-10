@@ -830,6 +830,19 @@ async def test_one_read_answers_the_values_asked_for_and_the_identities_attached
     )
 
 
+async def test_an_identity_block_of_type_none_carries_no_identity() -> None:
+    """What Azure answers for a container created with no identity."""
+    cp = _bare_control_plane()
+    app = cp._envelope({"SUPERVISOR_TOKEN": "a-bearer"}, {}, identity_resource_id=None)  # noqa: SLF001
+    app.identity = aca_models.ManagedServiceIdentity(type="None")
+    _reading(cp, lambda: app)
+
+    facts = await cp.read_app(name=APP_NAME, keys=("SUPERVISOR_TOKEN",))
+
+    assert facts is not None
+    assert facts.identities == frozenset()
+
+
 def test_what_one_read_answers_never_prints_the_bearer() -> None:
     facts = ContainerFacts(env={"SUPERVISOR_TOKEN": "a-bearer"}, identities=frozenset())
 

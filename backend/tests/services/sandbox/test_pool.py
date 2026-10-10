@@ -700,11 +700,12 @@ async def test_a_claimed_container_carrying_the_wrong_identity_never_reaches_the
     )
 
 
+@pytest.mark.parametrize("carried", [LAKE_IDENTITY.lower(), LAKE_IDENTITY.upper()])
 async def test_an_identity_azure_hands_back_in_another_case_is_the_same_identity(
-    world, lake_configured
+    world, lake_configured, carried: str
 ) -> None:
     _with_a_flight_data_pool(world)
-    member = await _ready(world, project_type=CONNECTOR, identity=LAKE_IDENTITY.lower())
+    member = await _ready(world, project_type=CONNECTOR, identity=carried)
 
     handle, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4(), flight_data=True)
 
