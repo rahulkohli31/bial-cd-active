@@ -63,9 +63,8 @@ doing is a reading rather than a capability and Plan has no other route to it. N
 the exact-set assertions below stay exact: a shared tool has to appear in both, and a test that
 quietly dropped one side would pass while the two arms drifted."""
 _TOOL_BEARING_KINDS = [ChatKind.PLAN, ChatKind.BUILD]
-"""The kinds that register anything at all. `ChatKind.GENERIC` is handed no toolset by design —
-its emptiness is asserted by `test_the_generic_surface_is_empty_and_needs_no_sandbox_accessor`
-rather than skipped past here, so the absence is a claim rather than a gap."""
+"""The project kinds. `ChatKind.GENERIC` carries only its two file tools, asserted on their own
+below."""
 _WRITE_ONLY_TOOLS = {"write_file", "edit_file", "insert_lines", "declare_done"}
 _SANDBOX_ONLY_TOOLS = _WRITE_ONLY_TOOLS | {"fetch_output_slice", "apply_schema_change"}
 """`fetch_output_slice` and `apply_schema_change` are registered on `sandbox_toolset`,
@@ -342,16 +341,12 @@ async def test_the_registry_is_exhaustive_over_the_enum() -> None:
     A `match` with no fallback arm already makes an unhandled member a `NameError` at run
     time rather than a silent empty toolset — but only on the path that reaches it. This
     walks the enum, so a fourth member added without a surface fails here, loudly, instead of
-    on whichever request first carries it.
-
-    THE GENERIC SURFACE IS EMPTY BY DESIGN, and that is asserted rather than excused: it is the
-    one kind that answers from its transcript alone. Emptiness is therefore not evidence of a
-    missing arm here, which is why the arm's existence is checked by naming the member."""
+    on whichever request first carries it."""
     surfaces = {kind: set(await registered_tool_definitions(kind)) for kind in ChatKind}
     assert set(surfaces) == {ChatKind.PLAN, ChatKind.BUILD, ChatKind.GENERIC}
-    assert surfaces[ChatKind.GENERIC] == set()
-    assert all(names for kind, names in surfaces.items() if kind is not ChatKind.GENERIC)
-    assert surfaces[ChatKind.PLAN] != surfaces[ChatKind.BUILD]
+    assert surfaces[ChatKind.GENERIC] == {"read_attachment", "run_python"}
+    assert all(surfaces.values())
+    assert len({frozenset(names) for names in surfaces.values()}) == len(surfaces)
 
 
 def _never_called_workspace(_ctx: RunContext[Any]) -> ExtractedSnapshotWorkspace:
@@ -419,19 +414,22 @@ async def test_a_generic_chat_given_a_session_gets_only_the_two_analysis_tools()
 @pytest.mark.parametrize("kind", _TOOL_BEARING_KINDS, ids=[k.value for k in _TOOL_BEARING_KINDS])
 async def test_plan_and_build_ignore_an_analysis_session(kind: ChatKind) -> None:
     sandbox_of = _never_called_sandbox if kind is ChatKind.BUILD else None
+    without = toolsets_for_kind(kind, _never_called_workspace, sandbox_of)
     surface = toolsets_for_kind(
         kind, _never_called_workspace, sandbox_of, analysis_of=_never_called_analysis
     )
 
-    assert set(await _tools_of(surface)) == set(await registered_tool_definitions(kind))
+    assert set(await _tools_of(surface)) == set(await _tools_of(without))
 
 
-async def test_plans_attachment_read_still_runs_alongside_other_calls() -> None:
+async def test_plans_attachment_reads_run_one_at_a_time() -> None:
+    """Plan is told to send its reads together, and each one is a reader process beside the
+    dev server in the same container."""
     surface = toolsets_for_kind(
         ChatKind.PLAN, workspace_from_read_deps, reader_of=_reader_from_read_deps
     )
 
-    assert (await _tools_of(surface))["read_attachment"].tool_def.sequential is False
+    assert (await _tools_of(surface))["read_attachment"].tool_def.sequential is True
 
 
 async def test_the_kinds_differ_by_which_toolsets_they_are_handed_and_by_nothing_else() -> None:
@@ -480,7 +478,7 @@ async def test_a_project_that_reads_no_connected_data_is_offered_none() -> None:
     build = set(await registered_tool_definitions(ChatKind.BUILD))
     assert CONNECTOR_SCHEMA_TOOL not in plan
     assert CONNECTOR_SCHEMA_TOOL not in build
-    assert plan == _READ_TOOLS | _SHARED_TOOLS | {"present_plan_options"}
+    assert plan == _READ_TOOLS | _SHARED_TOOLS | {"present_plan_options", "read_attachment"}
     assert build == _READ_TOOLS | _SANDBOX_ONLY_TOOLS | _SHARED_TOOLS
 
 

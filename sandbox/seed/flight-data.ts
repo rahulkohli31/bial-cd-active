@@ -1,6 +1,6 @@
 import { BlobServiceClient } from '@azure/storage-blob'
 import { ManagedIdentityCredential } from '@azure/identity'
-import { cachedAsyncBuffer, parquetReadObjects } from 'hyparquet'
+import { type AsyncBuffer, parquetMetadataAsync, parquetReadObjects } from 'hyparquet'
 import { compressors } from 'hyparquet-compressors'
 
 // ── The limits your app runs inside ──────────────────────────────────────────────────────────
@@ -16,8 +16,9 @@ import { compressors } from 'hyparquet-compressors'
 // Reading every file whole, on every request, takes minutes and holds most of the workspace's
 // memory: it answers nowhere and is killed once published. The functions below stay inside these
 // limits. They read only the files that hold the current data, download only the columns you
-// name, and keep one row per flight; `sharedLoad` makes that load once for every request, and
-// `pageOf` hands the browser one page at a time. Build on them rather than a reader of your own.
+// name, one row group at a time, and keep one row per flight; `sharedLoad` makes that load once
+// for every request, and `pageOf` hands the browser one page at a time. Build on them rather than
+// a reader of your own.
 
 // ── The connection ───────────────────────────────────────────────────────────────────────────
 //
@@ -33,7 +34,8 @@ function required(name: string): string {
   if (!value) {
     throw new Error(
       `${name} is not set. The flight-data connector is not switched on for this project — ` +
-        `the app's owner switches it on in the app's settings, on the Integrations tab, then restart the dev server.`,
+        `the app's owner switches it on in the app's settings, on the Integrations tab, and the ` +
+        `change reaches the app the next time it starts.`,
     )
   }
   return value
@@ -196,14 +198,15 @@ export function ownBytes(buffer: Buffer): ArrayBuffer {
 // Name your columns. Always. And fetch only them: a parquet file stores each column in its own
 // byte ranges, so reading through ranged downloads fetches the columns you named and the file's
 // index, not the whole file. A 100 MB file read for eight columns costs a few MB.
-export async function readColumns<T>(file: LakeFile, columns: string[]): Promise<T[]> {
+function rangedFile(file: LakeFile): AsyncBuffer {
   const blob = container.getBlobClient(file.name)
-  const ranged = cachedAsyncBuffer({
+  // No cache in front of the downloads: one would keep every row group's bytes alive until the
+  // whole file had been read.
+  return {
     byteLength: file.size,
     slice: async (start: number, end: number = file.size) =>
       ownBytes(await blob.downloadToBuffer(start, end - start)),
-  })
-  return (await parquetReadObjects({ file: ranged, columns, compressors })) as T[]
+  }
 }
 
 // ── The two rules that decide whether your numbers are right ──────────────────────────────────
@@ -243,17 +246,24 @@ const asDate = (value: unknown): Date => (value instanceof Date ? value : new Da
  * Keep the row with the highest LAST_UPDATE_DATE_TIME for each key. That is the current record.
  */
 export function currentRecordsOnly<T extends Row>(rows: T[]): T[] {
-  const latest = new Map<string, { stamp: number; row: T }>()
+  const latest: Latest<T> = new Map()
+  keepLatest(latest, rows)
+  return rowsOf(latest)
+}
 
+type Latest<T> = Map<string, { stamp: number; row: T }>
+
+/** Fold `rows` into `latest`: each flight keeps its row with the highest LAST_UPDATE_DATE_TIME. */
+function keepLatest<T extends Row>(latest: Latest<T>, rows: readonly T[]): void {
   for (const row of rows) {
     const key = String(row[FLIGHT_KEY])
     const stamp = asDate(row[LOAD_TIME]).getTime()
     const held = latest.get(key)
     if (!held || stamp > held.stamp) latest.set(key, { stamp, row })
   }
-
-  return [...latest.values()].map((entry) => entry.row)
 }
+
+const rowsOf = <T>(latest: Latest<T>): T[] => [...latest.values()].map((entry) => entry.row)
 
 // MISTAKE 7 — grouping on a text column without trimming it.
 // Several text columns carry the same value twice, once padded with trailing spaces.
@@ -325,6 +335,42 @@ export function filesToRead(files: readonly LakeFile[]): LakeFile[] {
 }
 
 /**
+ * The current record of every flight in `files`, with only the columns you asked for.
+ *
+ * Each file is read one row group at a time, and each group's rows are folded in before the next
+ * group is downloaded, keeping each flight's latest row exactly as `currentRecordsOnly` does, so
+ * at most one row group's rows and one row per flight are held. A file written as a single row
+ * group is read in one piece. The file's index is read once and reused for every group.
+ */
+export async function readCurrentRecords<T extends Row>(
+  files: readonly LakeFile[],
+  columns: string[],
+): Promise<T[]> {
+  // Always include the three columns the correctness rules need, whatever the caller asked for.
+  const needed = [...new Set([...columns, FLIGHT_KEY, LOAD_TIME, FLIGHT_TIME])]
+  const latest: Latest<T> = new Map()
+  for (const file of files) {
+    const ranged = rangedFile(file)
+    const metadata = await parquetMetadataAsync(ranged)
+    let rowStart = 0
+    for (const group of metadata.row_groups) {
+      const rowEnd = rowStart + Number(group.num_rows)
+      const rows = await parquetReadObjects({
+        file: ranged,
+        metadata,
+        columns: needed,
+        rowStart,
+        rowEnd,
+        compressors,
+      })
+      keepLatest(latest, rows as T[])
+      rowStart = rowEnd
+    }
+  }
+  return rowsOf(latest)
+}
+
+/**
  * Every flight at its latest version, with only the columns you asked for.
  *
  * WHICH FLIGHTS ARE IN A DATE WINDOW IS DECIDED BY ROWS, NEVER BY FILES: the load-date trap above
@@ -332,13 +378,7 @@ export function filesToRead(files: readonly LakeFile[]): LakeFile[] {
  * this returns every current flight, and `flightsBetween` filters the window on `SIBT_SOBT_TIME`.
  */
 export async function currentFlights<T extends Row>(columns: string[]): Promise<T[]> {
-  // Always include the three columns the correctness rules need, whatever the caller asked for.
-  const needed = [...new Set([...columns, FLIGHT_KEY, LOAD_TIME, FLIGHT_TIME])]
-  const rows: T[] = []
-  for (const file of filesToRead(await listFlightFiles())) {
-    appendAll(rows, await readColumns<T>(file, needed))
-  }
-  return currentRecordsOnly(rows)
+  return readCurrentRecords<T>(filesToRead(await listFlightFiles()), columns)
 }
 
 /** Every flight scheduled between two dates, deduped, with only the columns you asked for. */

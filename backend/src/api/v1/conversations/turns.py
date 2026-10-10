@@ -17,7 +17,7 @@ import asyncio
 import unicodedata
 import uuid
 from collections.abc import AsyncIterator, Sequence
-from typing import Literal
+from typing import Final, Literal
 
 import sqlalchemy as sa
 import structlog
@@ -57,11 +57,11 @@ from src.api.v1.conversations.schemas import (
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.conversation import ChatKind, Conversation
-from src.db.models.message import MessageEntryKind, MessageVisibility
+from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.project import Project
 from src.db.models.user import User
 from src.schemas import AUTH_401, CamelModel, DailyTokenLimitBody, ErrorEnvelope, error_responses
-from src.services.agent.mode_prompts import PromptContext
+from src.services.agent.mode_prompts import PromptContext, file_note
 from src.services.attachments.materialize import (
     AttachmentDelivery,
     code_lane_attachments,
@@ -193,6 +193,39 @@ async def _app_is_switched_off(
     return switched_off
 
 
+FILE_NOTE_KIND: Final = "file_note"
+"""The `meta` kind of the hidden note that lists a conversation's attached files."""
+
+
+async def _latest_file_note(
+    db: AsyncSession, *, user_id: uuid.UUID, conversation_id: uuid.UUID
+) -> str | None:
+    """The text of the conversation's latest file note, or `None` when it has never had one.
+
+    Its own query because `load_history` never selects `meta`; filtered on the note's kind so a
+    hidden row of another kind is never read as a list of files. The text is read straight off the
+    stored JSON: it is only compared, never handed to a model."""
+    payload = await db.scalar(
+        sa.select(Message.payload)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.user_id == user_id,
+            Message.entry_kind == MessageEntryKind.SYSTEM_EVENT,
+            Message.meta["kind"].astext == FILE_NOTE_KIND,
+        )
+        .order_by(Message.seq.desc())
+        .limit(1)
+    )
+    if payload is None:
+        return None
+    (message,) = payload
+    (part,) = message["parts"]
+    content = part["content"]
+    if part["part_kind"] != "user-prompt" or not isinstance(content, str):
+        raise TypeError("a stored file note is not one text prompt")
+    return content
+
+
 # Whitespace, control characters (newline and tab among them) and the two Unicode line and
 # paragraph separators: every run of them becomes one space in a chat's name.
 _SPACE_IN_A_NAME = frozenset({"Zs", "Cc", "Zl", "Zp"})
@@ -275,8 +308,27 @@ async def start_conversation_turn(
     # them again, so the model never meets one.
     file_refs = list(dict.fromkeys(file_attachment_ids))
     title = derive_title(title_text)
+    files = attachments.files if attachments is not None else ()
+    note = file_note(conversation.kind, files)
 
     async def persist_user_turn() -> None:
+        # THE FILE NOTE FIRST, AS ITS OWN COMMIT. It is the whole current list, so it stays true
+        # if the message below is refused; and it goes on the end of the run's `history`, so the
+        # live request folds it into the prompt's user entry exactly as the stored rows replay.
+        latest = await _latest_file_note(db, user_id=user.id, conversation_id=conversation.id)
+        if note != latest and (files or latest is not None):
+            note_request = ModelRequest(parts=[UserPromptPart(content=note)])
+            await append_batch(
+                db,
+                user_id=user.id,
+                conversation_id=conversation.id,
+                messages=[note_request],
+                entry_kind=MessageEntryKind.SYSTEM_EVENT,
+                kind=conversation.kind,
+                visibility=MessageVisibility.HIDDEN,
+                meta={"kind": FILE_NOTE_KIND},
+            )
+            history.append(note_request)
         if title is not None:
             # Uncommitted until `append_batch` commits the message, so a send refused at the
             # append leaves the chat unnamed. `IS NULL` keeps a name the citizen already gave it,

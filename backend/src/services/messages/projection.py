@@ -40,6 +40,7 @@ from src.core.prompt_blocks import (
     ANALYSIS_RUN_TOOL,
     APPLY_SCHEMA_CHANGE_TOOL,
     ATTACHMENT_READ_TOOL,
+    FLIGHT_DATA_ADOPT_PATH,
 )
 from src.core.redaction import redact_secrets
 from src.db.models.attachment import Attachment
@@ -495,7 +496,11 @@ def _classify_command(argv: list[str]) -> tuple[str, bool]:
     head = argv[0]
     rest = argv[1:]
     joined = " ".join(argv)
-    if head in _PACKAGE_MANAGERS and any(sub in _INSTALL_SUBCOMMANDS for sub in rest[:2]):
+    # The flight-data install command runs `npm install` itself, however it is invoked: its own
+    # npm limit is sized to end inside the long bound.
+    if (
+        head in _PACKAGE_MANAGERS and any(sub in _INSTALL_SUBCOMMANDS for sub in rest[:2])
+    ) or FLIGHT_DATA_ADOPT_PATH in joined:
         return (_LBL_INSTALL, False)
     if "db:migrate" in joined or "db-migrate" in joined or "drizzle-kit migrate" in joined:
         return (_LBL_DATA_READY, False)

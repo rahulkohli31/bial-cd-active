@@ -222,6 +222,13 @@ def analysis_toolset[DepsT](
         """
         session = session_of(ctx)
         session.tool_calls += 1
+        # The tool is registered in every BIAL Chat so the tool list never changes; with nothing
+        # attached it starts no session.
+        if not session.files:
+            return (
+                "No file this tool can open is attached to this chat now. A PDF or picture is "
+                "not in the Python session; it reaches you directly. Answer without this tool."
+            )
         if not code.strip():
             raise ModelRetry("Pass the Python to run as `code`.")
         if len(code) > ANALYSIS_CODE_LIMIT:
@@ -252,4 +259,4 @@ def analysis_toolset[DepsT](
             return "error: unavailable"
         return _outcome(execution)
 
-    return CombinedToolset([attachment_toolset(reader_of, sequential=True), runner])
+    return CombinedToolset([attachment_toolset(reader_of), runner])

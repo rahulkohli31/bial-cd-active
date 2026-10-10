@@ -185,7 +185,7 @@ async def build_it(
         raise AppApiError(400, message, code=code)
 
     # A generic chat has no project to create a build in — and it cannot reach this line, because
-    # it is handed no toolset, so `present_plan_options` was never called in it and the card
+    # it is never handed `present_plan_options`, so that tool was never called in it and the card
     # refusal above already turned it away. Stated rather than inferred: every read below needs a
     # project, and the same refusal is the right answer if that reasoning ever stops holding.
     project_id = plan_chat.project_id

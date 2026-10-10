@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import uuid
 
 import pytest
-from pydantic_ai.messages import ModelMessage
-from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.messages import ModelMessage, ModelRequest, ToolReturnPart
+from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
+from src.core.prompt_blocks import ANALYSIS_RUN_TOOL, ATTACHMENT_READ_TOOL
 from src.db.models.conversation import ChatKind
 from src.services.orchestrator.constants import GENERIC_EFFORT
 from tests.api.v1.conversations.conftest import _headers
@@ -202,8 +204,8 @@ async def test_a_second_generic_turn_while_one_is_mid_reply_is_refused(
 async def test_a_generic_run_asks_for_the_lowest_effort(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
-    """Mutation receipt: point `_effort_for`'s generic arm at `PLAN_EFFORT` and this goes red
-    while the plan and build arms stay green."""
+    """Mutation receipt: point `_effort_for`'s generic arm at `PLAN_AND_BUILD_EFFORT` and this goes
+    red while the plan and build arms stay green."""
     user, conversation = await _generic_chat(db_session)
     seen: dict[str, object] = {}
 
@@ -225,22 +227,45 @@ async def test_a_generic_run_asks_for_the_lowest_effort(
     assert settings["anthropic_thinking"]["type"] == "adaptive"
 
 
-async def test_a_generic_run_is_handed_no_tools_at_all(
+async def test_with_no_file_the_file_tools_are_there_and_the_reply_finishes(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
+    """The two tools are registered from the first message, so a file arriving later changes
+    nothing cached. With no file, a call answers that nothing is attached without reaching the
+    analysis runtime (none is bound here), and the reply still finishes."""
     user, conversation = await _generic_chat(db_session)
-    seen: dict[str, object] = {}
+    seen: dict[str, list[str]] = {}
 
-    async def _capture(_messages: list[ModelMessage], info: AgentInfo):
-        seen["tools"] = [tool.name for tool in info.function_tools]
-        yield "ok"
+    async def _stream(messages: list[ModelMessage], info: AgentInfo):
+        seen["tools"] = sorted(tool.name for tool in info.function_tools)
+        returns = [
+            str(part.content)
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, ToolReturnPart)
+        ]
+        if not returns:
+            yield {
+                0: DeltaToolCall(
+                    name=ANALYSIS_RUN_TOOL,
+                    json_args=json.dumps({"code": "print(1)"}),
+                    tool_call_id="c0",
+                )
+            }
+            return
+        seen["returns"] = returns
+        yield "42"
 
-    set_chat_model(FunctionModel(stream_function=_capture))
+    set_chat_model(FunctionModel(stream_function=_stream))
 
-    await _post_turn(client, _headers(user), conversation)
+    resp = await _post_turn(client, _headers(user), conversation)
+    assert resp.status_code == 202, resp.text
     await _settle(_fresh_engine, conversation.id)
 
-    assert seen["tools"] == []
+    assert seen["tools"] == sorted([ATTACHMENT_READ_TOOL, ANALYSIS_RUN_TOOL])
+    assert seen["returns"][0].startswith("No file this tool can open is attached")
+    assert _fresh_engine.peek(conversation.id).status == "completed"
 
 
 async def test_reasoning_is_never_projected_into_the_transcript(

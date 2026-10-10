@@ -95,7 +95,6 @@ from src.api.v1.conversations.schemas import (
 from src.config import settings
 from src.core.error_signature import error_signature
 from src.core.integrity_types import BaselineIdentity
-from src.core.prompt_blocks import ANALYSIS_RUN_TOOL, ATTACHMENT_READ_TOOL
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.harness_counter import HarnessCounter
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
@@ -104,7 +103,7 @@ from src.db.models.user import User
 from src.services.agent.agent import ChatDeps, chat_agent, static_instruction_parts
 from src.services.agent.attachment_tools import AttachmentReader
 from src.services.agent.capabilities import TurnScopedSystemMessage
-from src.services.agent.mode_prompts import PromptContext, analysis_listing
+from src.services.agent.mode_prompts import PromptContext
 from src.services.agent.read_tools import (
     LiveSandboxWorkspace,
     ReadOnlyWorkspace,
@@ -172,13 +171,12 @@ from src.services.orchestrator.constants import (
     ADAPTIVE_THINKING,
     ANALYSIS_REQUEST_LIMIT,
     ANALYSIS_WALL_CLOCK_S,
-    BUILD_EFFORT,
     CACHE_TTL,
     CRASH_EDGE_CONSECUTIVE_POLLS,
     GENERIC_EFFORT,
     MAX_OUTPUT_TOKENS,
     MODEL_TURN_CEILING,
-    PLAN_EFFORT,
+    PLAN_AND_BUILD_EFFORT,
     READINESS_MAX_POLLS,
     READINESS_POLL_S,
     RUN_COMMAND_SLOW_TIMEOUT_S,
@@ -914,12 +912,13 @@ class _TurnState:
     sandbox: SandboxSession | None = None
     # The conversation's code-lane attachments and the store they live in, or
     # None when it holds none. Set by the send route, which is the only layer holding both the
-    # database session and the object store; used twice — once inside the attach, to put the
-    # files in the container before the agent's first read, and once at the top of the run, to
-    # tell the agent they are there. Carrying the storage HANDLE rather than the bytes is what
-    # keeps a detached turn from pinning tens of megabytes for its whole life.
+    # database session and the object store; used inside the attach, to put the files in the
+    # container before the agent's first read, and to give BIAL Chat's file session its files.
+    # The route, not the engine, tells the agent they are there. Carrying the storage HANDLE
+    # rather than the bytes is what keeps a detached turn from pinning tens of megabytes for its
+    # whole life.
     attachments: AttachmentDelivery | None = None
-    #: BIAL Chat's handle on its file session, when this reply registers the analysis tools.
+    #: BIAL Chat's handle on its file session: set on every BIAL Chat reply, None for the others.
     analysis: AnalysisSession | None = None
     write_session: BuildSession | None = None
     preview_task: asyncio.Task[None] | None = None
@@ -1012,8 +1011,8 @@ class _TurnState:
     #: request in that same turn has to reproduce, so a turn of many tool steps would re-break
     #: its own prefix at every step — strictly worse than the lapse the sentence answers.
     nudged_to_look: bool = False
-    #: How many model requests this turn has sent. Counted only on the arm that carries the
-    #: turn-scoped system message, because counting is how that arm's trigger fires.
+    #: How many model requests this turn has sent. Counted only on the Plan run, which carries
+    #: the turn-scoped system message, because counting is how its trigger fires.
     requests_sent: int = 0
 
     def read_the_app(self, reading: AppState) -> None:
@@ -1200,26 +1199,12 @@ def _reader_of(ctx: RunContext[ChatDeps]) -> AttachmentReader:
 
 
 def _analysis_of(ctx: RunContext[ChatDeps]) -> AnalysisSession:
-    """The ChatDeps accessor BIAL Chat's analysis tools resolve through. Fail-first: the tools are
-    registered only when the reply carries a session handle."""
+    """The ChatDeps accessor BIAL Chat's analysis tools resolve through. Fail-first: every BIAL
+    Chat reply carries a session handle."""
     analysis = ctx.deps.analysis
     if analysis is None:
         raise RuntimeError("analysis tool resolved on a reply with no analysis session")
     return analysis
-
-
-_ANALYSIS_TOOLS: Final = frozenset({ATTACHMENT_READ_TOOL, ANALYSIS_RUN_TOOL})
-
-
-def _has_called_analysis(history: list[ModelMessage]) -> bool:
-    """Whether the chat already holds an analysis tool call. Such a chat keeps the tools: the
-    model API refuses history carrying tool calls when no tool is defined."""
-    return any(
-        isinstance(part, ToolCallPart) and part.tool_name in _ANALYSIS_TOOLS
-        for message in history
-        if isinstance(message, ModelResponse)
-        for part in message.parts
-    )
 
 
 def _steps_of_the_cut_run(captured: list[ModelMessage]) -> list[ModelMessage]:
@@ -1268,10 +1253,8 @@ def _effort_for(kind: ChatKind) -> AnthropicEffort:
     through here — it is a different run shape with its own settings block — so this answers for
     the single-request arm only, which is where the two non-writing kinds meet."""
     match kind:
-        case ChatKind.PLAN:
-            return PLAN_EFFORT
-        case ChatKind.BUILD:
-            return BUILD_EFFORT
+        case ChatKind.PLAN | ChatKind.BUILD:
+            return PLAN_AND_BUILD_EFFORT
         case ChatKind.GENERIC:
             return GENERIC_EFFORT
 
@@ -1337,9 +1320,9 @@ class TurnEngine:
         change; only the plan-card path opts in (see the mutation guard in `_run_write`).
 
         `attachments` is the conversation's code-lane files. The ROUTE resolves them
-        because only the route holds the database session and the object store together; the
-        engine holds the container and the model's context, which is where both halves of the
-        delivery happen. None until someone attaches a spreadsheet."""
+        because only the route holds the database session and the object store together, and
+        it writes the hidden note that names them to the model; the engine places them in the
+        container or BIAL Chat's session. None until someone attaches a spreadsheet."""
         claim_conversation(conversation.id)
         try:
             await persist_user_turn()
@@ -1653,30 +1636,18 @@ class TurnEngine:
             # citizen's prompt is persisted while an injected tail is not — so next turn the
             # prompt replays without it, the bytes vanish from the middle of the history, and
             # every message after them shifts. That is a cache miss on the whole request. A fact
-            # the model needs either rides a TOOL RESULT (persisted, at the absolute tail) or the
-            # per-run INSTRUCTION, which is not part of history at all.
-            #
-            # THE ATTACHED FILES RIDE THE INSTRUCTION because their paths are a fact about THIS
-            # container: a stored transcript naming them would outlive the container it described
-            # and name paths a later one may spell differently.
+            # the model needs rides a TOOL RESULT (persisted, at the absolute tail), the per-run
+            # INSTRUCTION (not part of history at all), or a hidden row the route persists ahead of
+            # the prompt (the attached-files note).
             #
             # BIAL Chat has no container; its files go to a session of their own, and only once a
-            # tool first asks for one.
-            if state.kind is ChatKind.GENERIC and (
-                state.attachments is not None or _has_called_analysis(history)
-            ):
+            # tool first asks for one. The handle starts nothing until then.
+            if state.kind is ChatKind.GENERIC:
                 state.analysis = AnalysisSession(
                     conversation_id=state.conversation_id,
                     files=state.attachments.files if state.attachments is not None else (),
                     storage=state.attachments.storage if state.attachments is not None else None,
                     runtime=get_analysis_runtime(),
-                )
-                prompt_context = replace(
-                    prompt_context, analysis_listing=analysis_listing(state.analysis.files)
-                )
-            elif state.attachments is not None:
-                prompt_context = replace(
-                    prompt_context, attachment_listing=state.attachments.listing()
                 )
             # WHAT WAS AGREED, READ OUT OF THE CONVERSATION ITSELF. No column, no
             # table, no project field: the agreement is the arguments of the last honourable
@@ -1755,15 +1726,14 @@ class TurnEngine:
                     # that forgot it would register the tool for nobody while every registration
                     # test — which calls `toolsets_for_kind` directly — stayed green.
                     #
-                    # THE READER IS OFFERED ONLY WHEN THERE IS SOMETHING TO READ. A tool named
-                    # `read_attachment` on a chat with no attachment is an invitation to invent a
-                    # path and then explain the failure; `toolsets_for_kind` takes the accessor as
-                    # optional for exactly this, and registration is per-run.
+                    # THE FILE TOOLS ARE OFFERED FROM THE FIRST MESSAGE, file or no file: a tool
+                    # list that changed when a file arrived would rewrite everything cached after
+                    # it.
                     toolsets = toolsets_for_kind(
                         state.kind,
                         _workspace_of,
-                        reader_of=_reader_of if state.attachments is not None else None,
-                        analysis_of=_analysis_of if state.analysis is not None else None,
+                        reader_of=_reader_of,
+                        analysis_of=_analysis_of,
                         connected_systems=prompt_context.connected_systems,
                         app_state_of=_app_state_of,
                         # WHAT THE TOOL ANSWERED, HEARD BY THE TURN. The change notice and the
@@ -1794,15 +1764,20 @@ class TurnEngine:
                         # nothing; with one it lands after the last of these, so everything
                         # ahead of the marker is byte-identical for every citizen.
                         instructions=static_instruction_parts(state.kind),
-                        # THE TURN-SCOPED SYSTEM MESSAGE, ON THIS ARM ONLY. A Plan chat cannot
+                        # THE TURN-SCOPED SYSTEM MESSAGE, FOR PLAN ONLY. A Plan chat cannot
                         # change the app, but it answers questions about one that other chats
-                        # keep changing, and nothing else on this arm reads the app.
-                        capabilities=[
-                            TurnScopedSystemMessage(
-                                should_send=state.another_request_and_still_no_reading,
-                                on_sent=state.note_the_nudge,
-                            )
-                        ],
+                        # keep changing, and nothing else on this arm reads the app. BIAL Chat
+                        # has no app to read.
+                        capabilities=(
+                            [
+                                TurnScopedSystemMessage(
+                                    should_send=state.another_request_and_still_no_reading,
+                                    on_sent=state.note_the_nudge,
+                                )
+                            ]
+                            if state.kind is ChatKind.PLAN
+                            else []
+                        ),
                         output_type=output_type,
                         usage=turn_usage,
                         event_stream_handler=self._event_handler(state),
@@ -2140,7 +2115,7 @@ class TurnEngine:
         db: AsyncSession,
         run: Awaitable[T],
     ) -> T:
-        """Await `run`, held to the wall clock when this reply works on files.
+        """Await `run`, held to the wall clock on every BIAL Chat reply.
 
         Its request ceiling rides the run's own `usage_limits`. Either ceiling keeps the steps
         taken so far, then ends the reply in the ceiling sentence; the bill follows on the
@@ -2885,7 +2860,7 @@ class TurnEngine:
             model_settings=AnthropicModelSettings(
                 max_tokens=MAX_OUTPUT_TOKENS,
                 anthropic_thinking=ADAPTIVE_THINKING,
-                anthropic_effort=BUILD_EFFORT,
+                anthropic_effort=PLAN_AND_BUILD_EFFORT,
                 anthropic_cache_instructions=CACHE_TTL,
                 anthropic_cache_tool_definitions=CACHE_TTL,
                 anthropic_cache=CACHE_TTL,

@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import get_args
 
+import pytest
 import sqlalchemy as sa
 from pydantic_ai.messages import (
     BinaryContent,
@@ -36,6 +37,7 @@ from sqlalchemy import event
 
 from src.api.v1.build_sessions.schemas import ErrorSource
 from src.api.v1.conversations.schemas import DiagnosticFrame
+from src.core.prompt_blocks import FLIGHT_DATA_ADOPT_PATH
 from src.core.redaction import redact_secrets
 from src.db.models.attachment import Attachment
 from src.db.models.conversation import ChatKind
@@ -65,6 +67,7 @@ from src.services.messages.projection import (
     _friendly_area,
     _user_text_and_refs,
     classify_tool_call,
+    command_needs_the_long_timeout,
     command_only_inspects,
     label_when_settled,
     long_operation_line,
@@ -952,6 +955,23 @@ def test_classify_command_maps_the_pinned_commands() -> None:
     assert _classify_argv(["tsc", "--noEmit"])[0] == "Making sure everything fits together"
     assert _classify_argv(["npm", "run", "build"])[0] == "Making sure everything fits together"
     assert _classify_argv(["npm", "run", "lint"])[0] == "Tidying things up"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["node", FLIGHT_DATA_ADOPT_PATH],
+        [FLIGHT_DATA_ADOPT_PATH],
+        ["bash", "-lc", f"cd /workspace/app && node {FLIGHT_DATA_ADOPT_PATH}"],
+    ],
+    ids=["node", "direct", "shell"],
+)
+def test_the_flight_data_install_command_is_an_install(argv: list[str]) -> None:
+    """It runs `npm install` itself and stops npm inside the long bound, so every way of running
+    it takes that bound; any other `node` script keeps the short one."""
+    assert _classify_argv(argv) == ("Setting up the tools your app needs", False)
+    assert command_needs_the_long_timeout(argv) is True
+    assert command_needs_the_long_timeout(["node", "scripts/seed.mjs"]) is False
 
 
 def test_classify_command_shows_reads_and_hides_only_housekeeping() -> None:
